@@ -404,3 +404,62 @@ fn per_branch_flow_accepts_thin_light_branch() {
     // 1.8-2A (needs ~1.6mm): both fine, unlike net-total-vs-narrowest.
     assert!(cap.raw.unwrap() >= 1.0, "worst ratio {:?}", cap.raw);
 }
+
+/// Static-inference `component:<refdes>` port entries drive the flow solve.
+#[test]
+fn flow_maps_static_component_ports() {
+    use serde_json::json;
+    let board_src = r#"(kicad_pcb
+  (layers (0 "F.Cu" signal) (2 "B.Cu" signal))
+  (net 0 "")
+  (net 1 "VCC")
+  (net 2 "GNDX")
+  (footprint "lib:SRC" (layer "F.Cu") (at 0 0)
+    (property "Reference" "U1" (at 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net 1 "VCC")))
+  (footprint "lib:R" (layer "F.Cu") (at 15 0)
+    (property "Reference" "R9" (at 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 0.5 0.5) (layers "F.Cu") (net 1 "VCC")))
+  (segment (start 0 0) (end 15 0) (width 1.0) (layer "F.Cu") (net 1))
+)"#;
+
+    let module = ModuleRef::new("test.zen", "root");
+    let mut sch = Schematic::new();
+    let src_ref = InstanceRef::new(module.clone(), vec!["src".into(), "U1".into()]);
+    let mut src = Instance::component(module.clone());
+    src.set_reference_designator("U1");
+    sch.add_instance(src_ref.clone(), src);
+
+    let current_ports = json!([
+        {"port": "component:R9", "role": "sink", "amps": 0.5},
+        {"port": "src.VOUT", "role": "source", "amps": 0.5},
+    ]);
+    let mut vcc = net(
+        "Power",
+        1,
+        "VCC",
+        &[
+            (
+                "current_sink_static",
+                AttributeValue::String("0.5A".to_string()),
+            ),
+            (
+                "current_source_total",
+                AttributeValue::String("0.5A".to_string()),
+            ),
+            ("current_ports", AttributeValue::Json(current_ports)),
+        ],
+    );
+    vcc.ports = vec![src_ref.append("1".to_string())];
+    sch.add_net(vcc);
+    sch.add_net(net("Ground", 2, "GNDX", &[]));
+
+    let report = score(board_src, &sch);
+    let cap = metric(&report, "power_integrity", "trace_current_capacity");
+    assert!(cap.applicable);
+    assert!(
+        cap.note.as_deref().unwrap_or("").contains("per-branch"),
+        "static component port mapped into the flow solve, note: {:?}",
+        cap.note
+    );
+}

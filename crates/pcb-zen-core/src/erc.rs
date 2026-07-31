@@ -145,12 +145,14 @@ impl<'a> SchematicErcContext<'a> {
     }
 }
 
-/// Checks io()-declared current budgets:
-/// - error when a net's summed `source_current` cannot cover its summed
-///   `sink_current`;
-/// - warning for nets with no declared or inferable current, once the design
-///   has opted into current declarations anywhere (a design with zero
-///   declarations stays silent);
+/// Checks current budgets from io() declarations and static DC inference:
+/// - error when a net's effective sources (declared + statically inferred
+///   through typed passives) cannot cover its effective sinks;
+/// - warning for nets whose current can neither be declared nor inferred,
+///   once the design has opted into current accounting anywhere (a design
+///   with zero declarations and no voltage-driven passives stays silent);
+/// - warning for resistive subnetworks with no voltage reference to infer
+///   from (`erc.current_budget.uninferable`);
 /// - warning when io() `signal` declarations on one net disagree.
 struct CurrentBudgetPass;
 
@@ -177,10 +179,26 @@ impl ErcNet<'_> {
 
 impl SchematicErcPass for CurrentBudgetPass {
     fn run(&self, ctx: &SchematicErcContext<'_>, diagnostics: &mut Diagnostics) {
+        use rust_decimal::prelude::ToPrimitive;
+
+        let amps = |net: &pcb_sch::Net, key: &str| -> Option<f64> {
+            net.properties
+                .get(key)
+                .and_then(pcb_sch::AttributeValue::physical)
+                .and_then(|p| p.nominal.to_f64())
+        };
+
+        // Opt-in: any io() current declaration, or any net covered by the
+        // static DC inference (voltage-driven passives).
         let any_current_declared = ctx.nets.iter().any(|net| {
             net.net.properties.contains_key("current_sink_total")
                 || net.net.properties.contains_key("current_source_total")
         });
+        let any_static_solved = ctx
+            .nets
+            .iter()
+            .any(|net| net.net.properties.contains_key("current_sink_static"));
+        let opted_in = any_current_declared || any_static_solved;
 
         for net in &ctx.nets {
             let net_kind = net.net.kind.as_str();
@@ -188,22 +206,31 @@ impl SchematicErcPass for CurrentBudgetPass {
                 continue;
             }
 
-            let sink_total = net
-                .net
-                .properties
-                .get("current_sink_total")
-                .and_then(pcb_sch::AttributeValue::physical);
-            let source_total = net
-                .net
-                .properties
-                .get("current_source_total")
-                .and_then(pcb_sch::AttributeValue::physical);
+            let declared_sink = amps(net.net, "current_sink_total");
+            let declared_source = amps(net.net, "current_source_total");
+            let static_sink = amps(net.net, "current_sink_static");
+            let static_source = amps(net.net, "current_source_static");
+            let has_voltage = net.net.properties.contains_key("voltage");
+            let uninferable = matches!(
+                net.net.properties.get("current_static_uninferable"),
+                Some(pcb_sch::AttributeValue::Boolean(true))
+            );
+
+            let combine = |declared: Option<f64>, inferred: Option<f64>| match (declared, inferred)
+            {
+                (None, None) => None,
+                (a, b) => Some(a.unwrap_or(0.0) + b.unwrap_or(0.0)),
+            };
+            let sink_total = combine(declared_sink, static_sink);
+            let source_total = combine(declared_source, static_source);
 
             match (sink_total, source_total) {
-                (Some(sink), Some(source)) => {
-                    if source.nominal < sink.nominal {
+                // A declared-voltage rail is a supply by definition: only an
+                // explicitly declared source budget can be exceeded.
+                (Some(sink), Some(source)) if declared_source.is_some() || !has_voltage => {
+                    if source + 1e-12 < sink {
                         let body = format!(
-                            "Net '{}' current budget exceeded: declared sources supply {} but sinks draw {}",
+                            "Net '{}' current budget exceeded: sources supply {:.6}A but sinks draw {:.6}A (declared + statically inferred)",
                             net.display_name(),
                             source,
                             sink,
@@ -219,9 +246,24 @@ impl SchematicErcPass for CurrentBudgetPass {
                         );
                     }
                 }
-                (None, None) if any_current_declared => {
+                (None, None) if uninferable && opted_in => {
                     let body = format!(
-                        "Net '{}' has no declared or inferable current: no connected io() declares sink_current or source_current",
+                        "Net '{}' current cannot be inferred: its resistive network cannot be solved from declared data (declare voltage= on the driving rails, or sink_current/source_current on an io())",
+                        net.display_name(),
+                    );
+                    diagnostics.diagnostics.push(
+                        Diagnostic::categorized(
+                            &net.diagnostic_path(),
+                            &body,
+                            "erc.current_budget.uninferable",
+                            EvalSeverity::Warning,
+                        )
+                        .with_span(net.diagnostic_span()),
+                    );
+                }
+                (None, None) if opted_in && !has_voltage => {
+                    let body = format!(
+                        "Net '{}' has no declared or inferable current: no connected io() declares sink_current or source_current, and no DC path allows inferring it",
                         net.display_name(),
                     );
                     diagnostics.diagnostics.push(

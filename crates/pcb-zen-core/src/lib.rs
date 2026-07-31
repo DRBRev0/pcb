@@ -8,6 +8,7 @@ use semver::Version;
 
 pub mod config;
 pub mod convert;
+pub mod dc;
 pub mod diagnostics;
 pub mod erc;
 mod file_provider;

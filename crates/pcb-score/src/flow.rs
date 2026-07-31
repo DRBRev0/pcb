@@ -35,6 +35,14 @@ pub struct Injection {
     pub amps: f64,
 }
 
+fn pad_copper_layer(pad: &crate::board::Pad) -> String {
+    pad.layers
+        .iter()
+        .find(|l| l.ends_with(".Cu"))
+        .cloned()
+        .unwrap_or_else(|| "F.Cu".to_string())
+}
+
 /// Map the netlist's `current_ports` of `net_name` onto board pads.
 ///
 /// Each port label is a module path (`"ldo.VIN"` declares the io `VIN` of
@@ -84,33 +92,36 @@ pub fn map_port_currents(
 
     let mut injections: Vec<Injection> = Vec::new();
     for port in ports {
-        // "a.b.PARAM" -> module instance path ["a", "b"]; a root-level port
-        // ("PARAM") owns the whole design.
-        let module_path: Vec<&str> = {
-            let mut segments: Vec<&str> = port.port.split('.').collect();
-            segments.pop();
-            segments
-        };
-        // Pads of components inside the declaring module subtree.
         let mut pads: Vec<(Point, String)> = Vec::new();
-        for (component_path, refdes) in &pin_owners {
-            let in_subtree = component_path.len() > module_path.len()
-                && component_path
-                    .iter()
-                    .zip(module_path.iter())
-                    .all(|(a, b)| a == b);
-            if !in_subtree {
-                continue;
-            }
-            if let Some(footprint) = board.footprints.iter().find(|f| &f.reference == refdes) {
+        if let Some(refdes) = port.port.strip_prefix("component:") {
+            // Statically inferred entry: inject at that component's pads.
+            if let Some(footprint) = board.footprints.iter().find(|f| f.reference == refdes) {
                 for pad in footprint.pads.iter().filter(|p| p.net == Some(net_id)) {
-                    let layer = pad
-                        .layers
+                    pads.push((pad.at, pad_copper_layer(pad)));
+                }
+            }
+        } else {
+            // "a.b.PARAM" -> module instance path ["a", "b"]; a root-level
+            // port ("PARAM") owns the whole design. The physical attachment
+            // points are the pads of components inside that module subtree.
+            let module_path: Vec<&str> = {
+                let mut segments: Vec<&str> = port.port.split('.').collect();
+                segments.pop();
+                segments
+            };
+            for (component_path, refdes) in &pin_owners {
+                let in_subtree = component_path.len() > module_path.len()
+                    && component_path
                         .iter()
-                        .find(|l| l.ends_with(".Cu"))
-                        .cloned()
-                        .unwrap_or_else(|| "F.Cu".to_string());
-                    pads.push((pad.at, layer));
+                        .zip(module_path.iter())
+                        .all(|(a, b)| a == b);
+                if !in_subtree {
+                    continue;
+                }
+                if let Some(footprint) = board.footprints.iter().find(|f| &f.reference == refdes) {
+                    for pad in footprint.pads.iter().filter(|p| p.net == Some(net_id)) {
+                        pads.push((pad.at, pad_copper_layer(pad)));
+                    }
                 }
             }
         }

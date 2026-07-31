@@ -523,6 +523,24 @@ and runs two ERC checks:
   anywhere, any net with no declared or inferable current is flagged. Designs
   with zero current declarations stay silent. Ground nets are exempt.
 
+#### Static current inference through passives
+
+Typed two-pin passives link nets with a known DC impedance: resistors
+contribute `1/R`, inductors and ferrite beads behave as near-shorts, and
+capacitors are open at DC (`1/jCw` with `w = 0`), so their static current is
+known to be zero. Combined with declared net voltages (`Power(voltage=...)`,
+`Ground` at 0V) this lets the ERC solve simple resistive structures without
+hand-written current declarations — a voltage divider from a declared 5V rail
+reports its exact static draw on the rail. Declared `sink_current` values act
+as worst-case draws in the solve; declared `source_current` values are supply
+capacities, never flows.
+
+The inferred values land on nets as `current_sink_static` /
+`current_source_static` and count toward the budget check
+(`erc.current_budget`). When a resistive subnetwork cannot be solved — no
+declared voltage reference, or a rail that sources current without declaring
+its voltage — its nets get the `erc.current_budget.uninferable` warning.
+
 `signal` classifies what the driving module emits. Per net, an explicit
 `Net(..., signal=...)` declaration wins; otherwise agreeing io() declarations
 apply, and disagreeing ones raise the `erc.signal_conflict` warning. Nets whose

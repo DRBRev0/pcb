@@ -79,6 +79,13 @@ pub struct NetInfo {
     /// Peer net name for DiffPair members, with this net's role ("p"/"n").
     pub diff_pair_peer: Option<String>,
     pub diff_pair_role: Option<String>,
+    /// io()-declared currents only.
+    pub sink_declared_amps: Option<f64>,
+    pub source_declared_amps: Option<f64>,
+    /// Statically inferred (DC passives) currents only.
+    pub sink_static_amps: Option<f64>,
+    pub source_static_amps: Option<f64>,
+    /// Effective totals: declared + statically inferred.
     pub sink_total_amps: Option<f64>,
     pub source_total_amps: Option<f64>,
     pub current_ports: Vec<PortCurrent>,
@@ -152,8 +159,18 @@ pub fn classify_nets(schematic: &Schematic) -> BTreeMap<String, NetInfo> {
                 }
                 "diff_pair_role" => info.diff_pair_role = value.string().map(str::to_string),
                 "matched_group" => info.matched_group = value.string().map(str::to_string),
-                "current_sink_total" => info.sink_total_amps = physical_amps(value),
-                "current_source_total" => info.source_total_amps = physical_amps(value),
+                "current_sink_total" => {
+                    info.sink_declared_amps = physical_amps(value);
+                }
+                "current_source_total" => {
+                    info.source_declared_amps = physical_amps(value);
+                }
+                "current_sink_static" => {
+                    info.sink_static_amps = physical_amps(value);
+                }
+                "current_source_static" => {
+                    info.source_static_amps = physical_amps(value);
+                }
                 "current_ports" => {
                     if let AttributeValue::Json(serde_json::Value::Array(entries)) = value {
                         for entry in entries {
@@ -175,6 +192,14 @@ pub fn classify_nets(schematic: &Schematic) -> BTreeMap<String, NetInfo> {
                 _ => {}
             }
         }
+
+        // Effective totals: io()-declared plus statically inferred currents.
+        let combine = |declared: Option<f64>, inferred: Option<f64>| match (declared, inferred) {
+            (None, None) => None,
+            (a, b) => Some(a.unwrap_or(0.0) + b.unwrap_or(0.0)),
+        };
+        info.sink_total_amps = combine(info.sink_declared_amps, info.sink_static_amps);
+        info.source_total_amps = combine(info.source_declared_amps, info.source_static_amps);
 
         // Implied classes, weakest last: Power/Ground are static; an
         // impedance target implies at least high_speed.

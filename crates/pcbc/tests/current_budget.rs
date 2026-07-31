@@ -384,3 +384,199 @@ Pair(name="P2", A=d2, B=d3)
         .expect("D2");
     assert_eq!(d2["properties"]["matched_group"]["String"], "lane1");
 }
+
+const DIVIDER_ZEN: &str = r#"
+Resistor = Module("@stdlib/generics/Resistor.zen")
+
+VIN = io(Net)
+OUT = io(Net)
+GND = io(Ground)
+
+Resistor(name="RTOP", value="10kOhm", package="0402", P1=VIN, P2=OUT)
+Resistor(name="RBOT", value="10kOhm", package="0402", P1=OUT, P2=GND)
+"#;
+
+#[test]
+fn test_static_inference_on_divider() {
+    // A divider from a declared 5V rail to ground: the 250uA static draw is
+    // inferred with no hand-written current declarations.
+    let full_output = Sandbox::new()
+        .with_workspace()
+        .write("divider.zen", DIVIDER_ZEN)
+        .write(
+            "board.zen",
+            r#"
+Divider = Module("./divider.zen")
+
+vcc = Net("VCC", voltage="5V")
+mid = Net("MID")
+gnd = Ground("GND")
+
+Divider(name="DIV", VIN=vcc, OUT=mid, GND=gnd)
+"#,
+        )
+        .run("pcbc", ["build", "board.zen", "--netlist"])
+        .stdout_capture()
+        .stderr_capture()
+        .read()
+        .expect("build --netlist should succeed");
+
+    let json_start = full_output.find('{').expect("JSON in netlist output");
+    let netlist: serde_json::Value =
+        serde_json::from_str(&full_output[json_start..]).expect("netlist output should be JSON");
+    let nets = netlist["nets"].as_object().expect("nets object");
+
+    let (_, vcc) = nets
+        .iter()
+        .find(|(name, _)| name.contains("VCC"))
+        .expect("VCC net");
+    // 5V across 20k: 250uA drawn from the rail.
+    assert_eq!(
+        vcc["properties"]["current_sink_static"]["String"],
+        "0.00025A"
+    );
+    assert_eq!(vcc["properties"]["current_source_static"]["String"], "0A");
+    let ports = vcc["properties"]["current_ports"]["Json"]
+        .as_array()
+        .expect("current_ports on VCC");
+    assert!(
+        ports.iter().any(
+            |p| p["port"].as_str().unwrap_or("").starts_with("component:") && p["role"] == "sink"
+        ),
+        "static component entry present: {ports:?}"
+    );
+
+    // The mid node passes the current through: 250uA in, 250uA out.
+    let (_, mid) = nets
+        .iter()
+        .find(|(name, _)| name.contains("MID"))
+        .expect("MID net");
+    assert_eq!(
+        mid["properties"]["current_sink_static"]["String"],
+        "0.00025A"
+    );
+    assert_eq!(
+        mid["properties"]["current_source_static"]["String"],
+        "0.00025A"
+    );
+}
+
+#[test]
+fn test_static_draw_exceeding_declared_budget_errors() {
+    // The rail declares a 100uA source budget but the divider statically
+    // draws 250uA: budget error without any declared sink.
+    let output = Sandbox::new()
+        .with_workspace()
+        .write("divider.zen", DIVIDER_ZEN)
+        .write(
+            "source.zen",
+            r#"
+Capacitor = Module("@stdlib/generics/Capacitor.zen")
+
+OUT = io(Net, source_current="100uA", direction="output")
+GND = io(Ground)
+
+Capacitor(name="CS", value="1uF", package="0402", P1=OUT, P2=GND)
+"#,
+        )
+        .write(
+            "board.zen",
+            r#"
+Divider = Module("./divider.zen")
+Source = Module("./source.zen")
+
+vcc = Net("VCC", voltage="5V")
+mid = Net("MID")
+gnd = Ground("GND")
+
+Source(name="PSU", OUT=vcc, GND=gnd)
+Divider(name="DIV", VIN=vcc, OUT=mid, GND=gnd)
+"#,
+        )
+        .snapshot_run("pcbc", ["build", "board.zen"]);
+    assert_snapshot!("static_budget_exceeded", output);
+}
+
+#[test]
+fn test_uninferable_resistive_network_warns() {
+    // A resistor between two nets with no voltage reference anywhere in the
+    // subnetwork: the current cannot be inferred. The design opts into
+    // current accounting through the solved divider elsewhere.
+    let output = Sandbox::new()
+        .with_workspace()
+        .write("divider.zen", DIVIDER_ZEN)
+        .write(
+            "link.zen",
+            r#"
+Resistor = Module("@stdlib/generics/Resistor.zen")
+
+A = io(Net)
+B = io(Net)
+
+Resistor(name="RL", value="1kOhm", package="0402", P1=A, P2=B)
+"#,
+        )
+        .write(
+            "board.zen",
+            r#"
+Divider = Module("./divider.zen")
+Link = Module("./link.zen")
+
+vcc = Net("VCC", voltage="5V")
+mid = Net("MID")
+gnd = Ground("GND")
+floating_a = Net("FLOAT_A")
+floating_b = Net("FLOAT_B")
+
+Divider(name="DIV", VIN=vcc, OUT=mid, GND=gnd)
+Link(name="LNK", A=floating_a, B=floating_b)
+"#,
+        )
+        .snapshot_run("pcbc", ["build", "board.zen"]);
+    assert_snapshot!("static_uninferable_warning", output);
+}
+
+#[test]
+fn test_capacitor_only_net_is_known_zero() {
+    // A decoupling-only net: capacitors draw no DC current, so the net's
+    // static current is known to be zero (jCw -> open at DC).
+    let full_output = Sandbox::new()
+        .with_workspace()
+        .write(
+            "cap.zen",
+            r#"
+Capacitor = Module("@stdlib/generics/Capacitor.zen")
+
+A = io(Net)
+GND = io(Ground)
+
+Capacitor(name="C1", value="100nF", package="0402", P1=A, P2=GND)
+"#,
+        )
+        .write(
+            "board.zen",
+            r#"
+Cap = Module("./cap.zen")
+
+quiet = Net("QUIET")
+gnd = Ground("GND")
+
+Cap(name="CD", A=quiet, GND=gnd)
+"#,
+        )
+        .run("pcbc", ["build", "board.zen", "--netlist"])
+        .stdout_capture()
+        .stderr_capture()
+        .read()
+        .expect("build --netlist should succeed");
+
+    let json_start = full_output.find('{').expect("JSON in netlist output");
+    let netlist: serde_json::Value =
+        serde_json::from_str(&full_output[json_start..]).expect("netlist output should be JSON");
+    let nets = netlist["nets"].as_object().expect("nets object");
+    let (_, quiet) = nets
+        .iter()
+        .find(|(name, _)| name.contains("QUIET"))
+        .expect("QUIET net");
+    assert_eq!(quiet["properties"]["current_sink_static"]["String"], "0A");
+}

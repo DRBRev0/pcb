@@ -1,0 +1,21 @@
+---
+source: crates/pcbc/tests/current_budget.rs
+expression: output
+---
+Command: pcbc build board.zen
+Exit Code: 0
+
+--- STDOUT ---
+
+--- STDERR ---
+Warning: Net 'FLOAT_B' current cannot be inferred: its resistive network cannot be solved from declared data (declare voltage= on the driving rails, or sink_current/source_current on an io())
+   ╭─[ <TEMP_DIR>/board.zen:9:14 ]
+ 9 │floating_b = Net("FLOAT_B")
+   │                    ╰─────── Net 'FLOAT_B' current cannot be inferred: its resistive network cannot be solved from declared data (declare voltage= on the driving rails, or sink_current/source_current on an io())
+
+Warning: Net 'FLOAT_A' current cannot be inferred: its resistive network cannot be solved from declared data (declare voltage= on the driving rails, or sink_current/source_current on an io())
+   ╭─[ <TEMP_DIR>/board.zen:8:14 ]
+ 8 │floating_a = Net("FLOAT_A")
+   │                    ╰─────── Net 'FLOAT_A' current cannot be inferred: its resistive network cannot be solved from declared data (declare voltage= on the driving rails, or sink_current/source_current on an io())
+
+✓ board.zen (3 components)

@@ -8,16 +8,16 @@ Exit Code: 1
 --- STDOUT ---
 
 --- STDERR ---
-Error: Net 'VBUS' current budget exceeded: declared sources supply 100mA but sinks draw 600mA
+Error: Net 'VBUS' current budget exceeded: sources supply 0.100000A but sinks draw 0.600000A (declared + statically inferred)
    ╭─[ <TEMP_DIR>/board.zen:5:8 ]
    │
  5 │ vbus = Net("VBUS")
    │        ─────┬─────  
-   │             ╰─────── Net 'VBUS' current budget exceeded: declared sources supply 100mA but sinks draw 600mA
+   │             ╰─────── Net 'VBUS' current budget exceeded: sources supply 0.100000A but sinks draw 0.600000A (declared + statically inferred)
 ───╯
 
 Stack trace (most recent call last):
-    <TEMP_DIR>/board.zen:5:8 (Net 'VBUS' current budget exceeded: declared sources supply 100mA but sinks draw 600mA)
+    <TEMP_DIR>/board.zen:5:8 (Net 'VBUS' current budget exceeded: sources supply 0.100000A but sinks draw 0.600000A (declared + statically inferred))
 
 ✗ board.zen: Build failed
 Error: Build failed with errors

@@ -344,6 +344,10 @@ impl ModuleConverter {
 
         self.schematic.assign_reference_designators();
 
+        // Static (DC worst-case) current inference over typed passives:
+        // needs reference designators and the fully-built nets.
+        crate::dc::annotate_static_currents(&mut self.schematic);
+
         // Validate moved directives, collect warnings, and filter out problematic ones
         let (mut diagnostics, mut filtered_moved_paths) =
             self.validate_and_filter_moved_directives();

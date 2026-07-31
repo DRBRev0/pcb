@@ -8,9 +8,9 @@ Exit Code: 0
 --- STDOUT ---
 
 --- STDERR ---
-Warning: Net 'NO_CURRENT_INFO' has no declared or inferable current: no connected io() declares sink_current or source_current
+Warning: Net 'NO_CURRENT_INFO' current cannot be inferred: its resistive network cannot be solved from declared data (declare voltage= on the driving rails, or sink_current/source_current on an io())
    ╭─[ <TEMP_DIR>/board.zen:8:9 ]
  8 │other = Net("NO_CURRENT_INFO")
-   │                   ╰─────────── Net 'NO_CURRENT_INFO' has no declared or inferable current: no connected io() declares sink_current or source_current
+   │                   ╰─────────── Net 'NO_CURRENT_INFO' current cannot be inferred: its resistive network cannot be solved from declared data (declare voltage= on the driving rails, or sink_current/source_current on an io())
 
 ✓ board.zen (4 components)
