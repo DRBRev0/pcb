@@ -103,3 +103,58 @@ pub fn gen_sim(schematic: &Schematic, out: &mut impl Write) -> Result<()> {
 
     Ok(())
 }
+
+/// Generate a static (DC operating point) test setup from the design's own
+/// declarations: every `Ground` net and every net with a declared `voltage`
+/// becomes a voltage source, and every declared `sink_current` total becomes
+/// a DC current load. Together with the components' SPICE models this forms
+/// the worst-case static testbench for the current-budget study — the SPICE
+/// counterpart of the ERC's built-in DC inference.
+pub fn gen_static_setup(schematic: &Schematic) -> Result<String> {
+    use rust_decimal::prelude::ToPrimitive;
+    use std::fmt::Write as _;
+
+    let nominal = |value: &AttributeValue| -> Option<f64> {
+        value.physical().and_then(|p| p.nominal.to_f64())
+    };
+
+    let mut nets: Vec<&pcb_sch::Net> = schematic.nets.values().collect();
+    nets.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut out = String::new();
+    writeln!(out, "* Static operating-point sources (generated)")?;
+    let mut v_index = 0usize;
+    let mut i_index = 0usize;
+    for net in &nets {
+        let voltage = if net.kind == "Ground" {
+            Some(
+                net.properties
+                    .get("voltage")
+                    .and_then(nominal)
+                    .unwrap_or(0.0),
+            )
+        } else {
+            net.properties.get("voltage").and_then(nominal)
+        };
+        if let Some(volts) = voltage {
+            writeln!(out, "Vstatic{v_index} {} 0 DC {volts}", net.name)?;
+            v_index += 1;
+        }
+        if let Some(sink) = net
+            .properties
+            .get("current_sink_total")
+            .and_then(nominal)
+            .filter(|amps| *amps > 0.0)
+        {
+            writeln!(out, "Istatic{i_index} {} 0 DC {sink}", net.name)?;
+            i_index += 1;
+        }
+    }
+    if v_index == 0 {
+        anyhow::bail!(
+            "No declared voltages: declare voltage= on the driving rails (or use Ground) to generate a static testbench"
+        );
+    }
+    writeln!(out, ".control\nop\nprint all\n.endc\n.end")?;
+    Ok(out)
+}

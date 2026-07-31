@@ -1,20 +1,28 @@
 //! Static (DC worst-case) current inference over declared passives.
 //!
-//! Typed two-pin passives link nets with a known DC impedance: resistors
-//! contribute `1/R`, inductors and ferrite beads are near-shorts, and
-//! capacitors are open (their `jCw` impedance is infinite at DC, so their
-//! current is known to be zero). Combined with declared net voltages
-//! (`Power(voltage=...)`, `Ground` = 0V) and io()-declared currents, this
-//! lets the ERC compute currents through simple resistive structures — a
-//! voltage divider needs no hand-written `sink_current` — and warn when a
-//! resistive path has no voltage reference to infer from.
+//! Typed two-pin passives link nets with a known DC element model:
+//! - resistors contribute `1/R` (multi-element parts bridging two nets count
+//!   one element per pin pair);
+//! - inductors and ferrite beads are near-shorts;
+//! - capacitors and TVS diodes are open (their static current is known to be
+//!   zero);
+//! - diodes/rectifiers/LEDs conduct only anode->cathode above their forward
+//!   voltage, and Zeners additionally conduct cathode->anode above their
+//!   breakdown voltage. Orientation comes from the component's SPICE net
+//!   order (`nets=[A, K]`), so it is generic for any part with a SpiceModel.
+//!
+//! Combined with declared net voltages (`Power(voltage=...)`, `Ground` = 0V)
+//! and io()-declared currents, this solves simple source/impedance
+//! structures — a divider or a Zener clamp needs no hand-written
+//! `sink_current` — and warns when a subnetwork has no voltage reference to
+//! infer from. Nonlinear elements are handled by piecewise-linear state
+//! iteration (off / forward / breakdown) to a fixpoint.
 //!
 //! Results land as net properties:
-//! - `current_sink_static` / `current_source_static`: amps the resistive
-//!   network draws from / feeds into the net ("0A" marks a known-zero net,
-//!   e.g. capacitor-only attachments);
-//! - `current_static_uninferable`: set when the net belongs to a resistive
-//!   subnetwork with no voltage reference;
+//! - `current_sink_static` / `current_source_static`: amps the passive
+//!   network draws from / feeds into the net ("0A" marks a known-zero net);
+//! - `current_static_uninferable`: set when the net belongs to a subnetwork
+//!   that cannot be solved from declared data;
 //! - `current_ports` gains `{"port": "component:<refdes>", ...}` entries so
 //!   layout-level flow analysis can inject at the passive's pads.
 
@@ -27,25 +35,62 @@ use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 const CURRENT_EPS: f64 = 1e-9;
 /// DC resistance modelling an inductor / ferrite bead (1 mOhm).
 const SHORT_OHMS: f64 = 1e-3;
+/// On-state series resistance of a conducting diode (ohms).
+const DIODE_ON_OHMS: f64 = 1.0;
+/// Default forward voltages when the component does not declare one.
+const DIODE_VF: f64 = 0.7;
+const LED_VF: f64 = 2.0;
+/// Piecewise-linear state iteration cap.
+const MAX_STATE_ITERATIONS: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum DcModel {
     /// Conductance in siemens.
     Conductive(f64),
-    /// No DC current (capacitors).
+    /// Anode->cathode conduction above `vf`; optional cathode->anode
+    /// breakdown above `vz` (Zener).
+    Diode { vf: f64, vz: Option<f64> },
+    /// No DC current (capacitors, TVS in normal operation).
     Open,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum EdgeKind {
+    Linear,
+    Diode { vf: f64, vz: Option<f64> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiodeState {
+    Off,
+    Forward,
+    Breakdown,
 }
 
 struct DcEdge {
     refdes: String,
+    /// For diodes, `net_a` is the anode and `net_b` the cathode.
     net_a: String,
     net_b: String,
     conductance: f64,
+    kind: EdgeKind,
+}
+
+/// One linearized stamp: `i = g * (V_from - V_to - emf)` flowing from->to.
+struct Stamp {
+    from: usize,
+    to: usize,
+    g: f64,
+    emf: f64,
 }
 
 fn attr_nominal(value: &AttributeValue) -> Option<f64> {
     use rust_decimal::prelude::ToPrimitive;
     value.physical().and_then(|p| p.nominal.to_f64())
+}
+
+fn instance_volts(instance: &pcb_sch::Instance, key: &str) -> Option<f64> {
+    instance.attributes.get(key).and_then(attr_nominal)
 }
 
 fn dc_model(instance: &pcb_sch::Instance) -> Option<DcModel> {
@@ -59,7 +104,32 @@ fn dc_model(instance: &pcb_sch::Instance) -> Option<DcModel> {
             (ohms > 0.0).then(|| DcModel::Conductive(1.0 / ohms))
         }
         "inductor" | "ferrite_bead" => Some(DcModel::Conductive(1.0 / SHORT_OHMS)),
-        "capacitor" => Some(DcModel::Open),
+        "capacitor" | "tvs" => Some(DcModel::Open),
+        "diode" | "rectifier" => Some(DcModel::Diode {
+            vf: instance_volts(instance, "forward_voltage").unwrap_or(DIODE_VF),
+            vz: None,
+        }),
+        "led" => Some(DcModel::Diode {
+            vf: instance_volts(instance, "forward_voltage").unwrap_or(LED_VF),
+            vz: None,
+        }),
+        "zener" => Some(DcModel::Diode {
+            vf: instance_volts(instance, "forward_voltage").unwrap_or(DIODE_VF),
+            vz: Some(instance_volts(instance, "zener_voltage")?),
+        }),
+        _ => None,
+    }
+}
+
+/// Anode/cathode net names from the component's SPICE net order
+/// (`SpiceModel(nets=[A, K])`).
+fn spice_net_order(instance: &pcb_sch::Instance) -> Option<Vec<String>> {
+    match instance.attributes.get(crate::attrs::MODEL_NETS)? {
+        AttributeValue::Array(nets) => Some(
+            nets.iter()
+                .filter_map(|v| v.string().map(str::to_string))
+                .collect(),
+        ),
         _ => None,
     }
 }
@@ -90,19 +160,34 @@ fn format_amps(amps: f64) -> String {
     format!("{}A", (amps * 1e9).round() / 1e9)
 }
 
-/// Solve one connected resistive component with Dirichlet (fixed-voltage)
-/// nodes. Returns node voltages, or `None` if no node is fixed.
+/// Current through `edge` given node voltages (NaN = floating) and state.
+fn edge_current(edge: &DcEdge, state: DiodeState, va: f64, vb: f64) -> f64 {
+    if va.is_nan() || vb.is_nan() {
+        return 0.0;
+    }
+    match edge.kind {
+        EdgeKind::Linear => (va - vb) * edge.conductance,
+        EdgeKind::Diode { vf, vz } => match state {
+            DiodeState::Off => 0.0,
+            DiodeState::Forward => ((va - vb - vf) / DIODE_ON_OHMS).max(0.0),
+            DiodeState::Breakdown => {
+                let vz = vz.unwrap_or(f64::INFINITY);
+                -((vb - va - vz) / DIODE_ON_OHMS).max(0.0)
+            }
+        },
+    }
+}
+
+/// Solve one connected subnetwork with Dirichlet (fixed-voltage) nodes and
+/// piecewise-linear diode states. Returns node voltages (NaN for nodes left
+/// floating by off diodes) and the final per-edge states, or `None` when the
+/// subnetwork cannot be solved (no reference, singular, or no fixpoint).
 fn solve_component(
     nets: &[String],
     fixed: &HashMap<&str, f64>,
     sink_injections: &HashMap<&str, f64>,
     edges: &[&DcEdge],
-) -> Option<HashMap<String, f64>> {
-    let index: HashMap<&str, usize> = nets
-        .iter()
-        .enumerate()
-        .map(|(i, name)| (name.as_str(), i))
-        .collect();
+) -> Option<(HashMap<String, f64>, Vec<DiodeState>)> {
     let unknown: Vec<&str> = nets
         .iter()
         .map(String::as_str)
@@ -116,68 +201,169 @@ fn solve_component(
         .enumerate()
         .map(|(i, name)| (*name, i))
         .collect();
-
     let n = unknown.len();
-    let mut voltages: HashMap<String, f64> = fixed
-        .iter()
-        .filter(|(name, _)| index.contains_key(*name))
-        .map(|(name, v)| ((*name).to_string(), *v))
-        .collect();
-    if n == 0 {
-        return Some(voltages);
-    }
 
-    // Nodal equations for unknown nodes: sum_j g_ij (V_i - V_j) = -sink_i.
-    // Declared sinks are worst-case actual draws and inject at their node;
-    // declared sources are capacities, never flows (nets that source current
-    // without a declared voltage exclude their subnetwork before this).
-    let mut matrix = vec![vec![0.0f64; n]; n];
-    let mut rhs: Vec<f64> = unknown
-        .iter()
-        .map(|name| -sink_injections.get(name).copied().unwrap_or(0.0))
-        .collect();
-    for edge in edges {
-        let (a, b, g) = (edge.net_a.as_str(), edge.net_b.as_str(), edge.conductance);
-        match (unknown_index.get(a), unknown_index.get(b)) {
-            (Some(&ia), Some(&ib)) => {
-                matrix[ia][ia] += g;
-                matrix[ib][ib] += g;
-                matrix[ia][ib] -= g;
-                matrix[ib][ia] -= g;
-            }
-            (Some(&ia), None) => {
-                matrix[ia][ia] += g;
-                rhs[ia] += g * fixed[b];
-            }
-            (None, Some(&ib)) => {
-                matrix[ib][ib] += g;
-                rhs[ib] += g * fixed[a];
-            }
-            (None, None) => {}
-        }
-    }
-
-    // Gaussian elimination with partial pivoting.
-    let mut aug: Vec<Vec<f64>> = matrix
-        .into_iter()
-        .zip(&rhs)
-        .map(|(mut row, b)| {
-            row.push(*b);
-            row
+    let node_voltage = |name: &str, solution: &[f64]| -> f64 {
+        fixed.get(name).copied().unwrap_or_else(|| {
+            unknown_index
+                .get(name)
+                .map(|&i| solution[i])
+                .unwrap_or(f64::NAN)
         })
-        .collect();
+    };
+
+    let mut states: Vec<DiodeState> = vec![DiodeState::Off; edges.len()];
+    let mut solution: Vec<f64> = vec![f64::NAN; n];
+
+    for _ in 0..MAX_STATE_ITERATIONS {
+        // Linearized stamps for the current states.
+        let mut stamps: Vec<Stamp> = Vec::new();
+        // Node indexing: unknowns 0..n, fixed nodes virtual index n + k.
+        let fixed_list: Vec<(&str, f64)> = nets
+            .iter()
+            .filter_map(|name| fixed.get(name.as_str()).map(|v| (name.as_str(), *v)))
+            .collect();
+        let fixed_index: HashMap<&str, usize> = fixed_list
+            .iter()
+            .enumerate()
+            .map(|(k, (name, _))| (*name, n + k))
+            .collect();
+        let index_of = |name: &str| -> Option<usize> {
+            unknown_index
+                .get(name)
+                .copied()
+                .or_else(|| fixed_index.get(name).copied())
+        };
+        let voltage_of_fixed = |idx: usize| fixed_list[idx - n].1;
+
+        for (edge, state) in edges.iter().zip(&states) {
+            let (Some(a), Some(b)) = (index_of(&edge.net_a), index_of(&edge.net_b)) else {
+                continue;
+            };
+            match (edge.kind, state) {
+                (EdgeKind::Linear, _) => stamps.push(Stamp {
+                    from: a,
+                    to: b,
+                    g: edge.conductance,
+                    emf: 0.0,
+                }),
+                (EdgeKind::Diode { .. }, DiodeState::Off) => {}
+                (EdgeKind::Diode { vf, .. }, DiodeState::Forward) => stamps.push(Stamp {
+                    from: a,
+                    to: b,
+                    g: 1.0 / DIODE_ON_OHMS,
+                    emf: vf,
+                }),
+                (EdgeKind::Diode { vz, .. }, DiodeState::Breakdown) => stamps.push(Stamp {
+                    from: b,
+                    to: a,
+                    g: 1.0 / DIODE_ON_OHMS,
+                    emf: vz.unwrap_or(0.0),
+                }),
+            }
+        }
+
+        // Unknown nodes with no stamp in the current state are floating
+        // (attached only through off diodes): exclude them from the system.
+        let mut attached = vec![false; n];
+        for stamp in &stamps {
+            if stamp.from < n {
+                attached[stamp.from] = true;
+            }
+            if stamp.to < n {
+                attached[stamp.to] = true;
+            }
+        }
+        let solved_nodes: Vec<usize> = (0..n).filter(|&i| attached[i]).collect();
+        let dense_index: HashMap<usize, usize> = solved_nodes
+            .iter()
+            .enumerate()
+            .map(|(dense, &node)| (node, dense))
+            .collect();
+        let dim = solved_nodes.len();
+
+        let mut matrix = vec![vec![0.0f64; dim]; dim];
+        let mut rhs: Vec<f64> = solved_nodes
+            .iter()
+            .map(|&node| -sink_injections.get(unknown[node]).copied().unwrap_or(0.0))
+            .collect();
+        for stamp in &stamps {
+            // i = g (V_from - V_to - emf), leaving `from`, entering `to`.
+            let from_dense = (stamp.from < n).then(|| dense_index[&stamp.from]);
+            let to_dense = (stamp.to < n).then(|| dense_index[&stamp.to]);
+            match (from_dense, to_dense) {
+                (Some(f), Some(t)) => {
+                    matrix[f][f] += stamp.g;
+                    matrix[t][t] += stamp.g;
+                    matrix[f][t] -= stamp.g;
+                    matrix[t][f] -= stamp.g;
+                    rhs[f] += stamp.g * stamp.emf;
+                    rhs[t] -= stamp.g * stamp.emf;
+                }
+                (Some(f), None) => {
+                    matrix[f][f] += stamp.g;
+                    rhs[f] += stamp.g * (voltage_of_fixed(stamp.to) + stamp.emf);
+                }
+                (None, Some(t)) => {
+                    matrix[t][t] += stamp.g;
+                    rhs[t] += stamp.g * (voltage_of_fixed(stamp.from) - stamp.emf);
+                }
+                (None, None) => {}
+            }
+        }
+
+        let dense_solution = gauss_solve(matrix, rhs)?;
+        solution = vec![f64::NAN; n];
+        for (&node, value) in solved_nodes.iter().zip(&dense_solution) {
+            solution[node] = *value;
+        }
+
+        // Re-evaluate diode states from the solved voltages.
+        let mut next_states = states.clone();
+        for (idx, edge) in edges.iter().enumerate() {
+            let EdgeKind::Diode { vf, vz } = edge.kind else {
+                continue;
+            };
+            let va = node_voltage(&edge.net_a, &solution);
+            let vb = node_voltage(&edge.net_b, &solution);
+            next_states[idx] = if va - vb > vf + 1e-9 {
+                DiodeState::Forward
+            } else if vz.map(|vz| vb - va > vz + 1e-9).unwrap_or(false) {
+                DiodeState::Breakdown
+            } else {
+                DiodeState::Off
+            };
+        }
+        if next_states == states {
+            let voltages: HashMap<String, f64> = nets
+                .iter()
+                .map(|name| (name.clone(), node_voltage(name, &solution)))
+                .collect();
+            return Some((voltages, states));
+        }
+        states = next_states;
+    }
+    None // state oscillation: no fixpoint found
+}
+
+/// Dense Gaussian elimination with partial pivoting.
+fn gauss_solve(mut matrix: Vec<Vec<f64>>, rhs: Vec<f64>) -> Option<Vec<f64>> {
+    let n = matrix.len();
+    for (row, b) in matrix.iter_mut().zip(&rhs) {
+        row.push(*b);
+    }
     for col in 0..n {
         let pivot = (col..n).max_by(|&x, &y| {
-            aug[x][col]
+            matrix[x][col]
                 .abs()
-                .partial_cmp(&aug[y][col].abs())
+                .partial_cmp(&matrix[y][col].abs())
                 .unwrap_or(std::cmp::Ordering::Equal)
         })?;
-        if aug[pivot][col].abs() < 1e-15 {
+        if matrix[pivot][col].abs() < 1e-15 {
             return None;
         }
-        aug.swap(col, pivot);
-        let (pivot_rows, rest) = aug.split_at_mut(col + 1);
+        matrix.swap(col, pivot);
+        let (pivot_rows, rest) = matrix.split_at_mut(col + 1);
         let pivot_row = &pivot_rows[col];
         for row in rest.iter_mut() {
             let factor = row[col] / pivot_row[col];
@@ -191,16 +377,13 @@ fn solve_component(
     }
     let mut solution = vec![0.0f64; n];
     for row in (0..n).rev() {
-        let mut sum = aug[row][n];
+        let mut sum = matrix[row][n];
         for (k, v) in solution.iter().enumerate().take(n).skip(row + 1) {
-            sum -= aug[row][k] * v;
+            sum -= matrix[row][k] * v;
         }
-        solution[row] = sum / aug[row][row];
+        solution[row] = sum / matrix[row][row];
     }
-    for (name, v) in unknown.iter().zip(solution) {
-        voltages.insert((*name).to_string(), v);
-    }
-    Some(voltages)
+    Some(solution)
 }
 
 /// Run the DC inference and annotate `schematic` nets in place.
@@ -226,8 +409,9 @@ pub fn annotate_static_currents(schematic: &mut Schematic) {
 
     // Two-pin passives with a DC model.
     let mut edges: Vec<DcEdge> = Vec::new();
-    // Nets whose non-conductive attachments are all capacitors.
-    let mut capacitor_nets: BTreeSet<String> = BTreeSet::new();
+    // Nets whose non-conductive attachments are all known-open (capacitors,
+    // TVS in normal operation).
+    let mut open_nets: BTreeSet<String> = BTreeSet::new();
     // Nets attached to anything we cannot model (IC pins, untyped parts).
     let mut opaque_nets: BTreeSet<String> = BTreeSet::new();
 
@@ -242,8 +426,11 @@ pub fn annotate_static_currents(schematic: &mut Schematic) {
         if instance.kind != InstanceKind::Component {
             continue;
         }
-        let model = dc_model(instance);
-        match model {
+        let refdes = instance
+            .reference_designator
+            .clone()
+            .unwrap_or_else(|| component_ref.instance_path.join("."));
+        match dc_model(instance) {
             Some(DcModel::Conductive(conductance)) if nets.len() == 2 => {
                 let mut it = nets.iter();
                 let (net_a, pins_a) = it.next().unwrap();
@@ -253,32 +440,50 @@ pub fn annotate_static_currents(schematic: &mut Schematic) {
                 // per pin pair.
                 let elements = (*pins_a.min(pins_b)).max(1) as f64;
                 edges.push(DcEdge {
-                    refdes: instance
-                        .reference_designator
-                        .clone()
-                        .unwrap_or_else(|| component_ref.instance_path.join(".")),
+                    refdes,
                     net_a: net_a.clone(),
                     net_b: net_b.clone(),
                     conductance: conductance * elements,
+                    kind: EdgeKind::Linear,
                 });
             }
-            Some(DcModel::Open) => capacitor_nets.extend(nets.keys().cloned()),
+            Some(DcModel::Diode { vf, vz }) if nets.len() == 2 => {
+                // Orientation from the SPICE net order (nets=[A, K]).
+                match spice_net_order(instance) {
+                    Some(order)
+                        if order.len() == 2
+                            && nets.contains_key(&order[0])
+                            && nets.contains_key(&order[1]) =>
+                    {
+                        edges.push(DcEdge {
+                            refdes,
+                            net_a: order[0].clone(),
+                            net_b: order[1].clone(),
+                            conductance: 1.0 / DIODE_ON_OHMS,
+                            kind: EdgeKind::Diode { vf, vz },
+                        });
+                    }
+                    // Unknown orientation: cannot model the one-way element.
+                    _ => opaque_nets.extend(nets.keys().cloned()),
+                }
+            }
+            Some(DcModel::Open) => open_nets.extend(nets.keys().cloned()),
             // Conductive parts touching 3+ nets (resistor networks as a
             // single component) have unknown internal pin pairing: opaque.
-            Some(DcModel::Conductive(_)) if nets.len() > 2 => {
+            Some(DcModel::Conductive(_) | DcModel::Diode { .. }) if nets.len() > 2 => {
                 opaque_nets.extend(nets.keys().cloned())
             }
             // A passive shorting its own pins carries no inter-net current.
-            Some(DcModel::Conductive(_)) => {}
+            Some(DcModel::Conductive(_) | DcModel::Diode { .. }) => {}
             None => opaque_nets.extend(nets.keys().cloned()),
         }
     }
 
-    if edges.is_empty() && capacitor_nets.is_empty() {
+    if edges.is_empty() && open_nets.is_empty() {
         return;
     }
 
-    // Union-find over conductive edges to isolate connected subnetworks.
+    // Union-find over element edges to isolate connected subnetworks.
     let mut graph_nets: BTreeSet<&str> = BTreeSet::new();
     for edge in &edges {
         graph_nets.insert(edge.net_a.as_str());
@@ -322,7 +527,7 @@ pub fn annotate_static_currents(schematic: &mut Schematic) {
         .map(|net| (net.name.as_str(), declared_amps(net, "current_sink_total")))
         .collect();
     // Unknown-voltage nets that source current are active rails: their
-    // voltage is set by a supply, not by the resistive network, so any
+    // voltage is set by a supply, not by the passive network, so any
     // subnetwork containing one cannot be solved from declared data.
     let active_unfixed: BTreeSet<&str> = schematic
         .nets
@@ -333,13 +538,13 @@ pub fn annotate_static_currents(schematic: &mut Schematic) {
         })
         .map(|net| net.name.as_str())
         .collect();
+
     // Solve every subnetwork; accumulate per-net static currents and
     // per-edge port entries.
     let mut sink_static: BTreeMap<String, f64> = BTreeMap::new();
     let mut source_static: BTreeMap<String, f64> = BTreeMap::new();
     let mut port_entries: BTreeMap<String, Vec<(String, bool, f64)>> = BTreeMap::new();
     let mut uninferable: BTreeSet<String> = BTreeSet::new();
-    let mut any_solved = false;
 
     for nets in groups.values() {
         let group_edges: Vec<&DcEdge> = edges
@@ -353,11 +558,10 @@ pub fn annotate_static_currents(schematic: &mut Schematic) {
             solve_component(nets, &fixed, &sink_injections, &group_edges)
         };
         match solved {
-            Some(voltages) => {
-                any_solved = true;
-                for edge in &group_edges {
+            Some((voltages, states)) => {
+                for (edge, state) in group_edges.iter().zip(&states) {
                     let (va, vb) = (voltages[&edge.net_a], voltages[&edge.net_b]);
-                    let current = (va - vb) * edge.conductance;
+                    let current = edge_current(edge, *state, va, vb);
                     if current.abs() < CURRENT_EPS {
                         continue;
                     }
@@ -391,19 +595,17 @@ pub fn annotate_static_currents(schematic: &mut Schematic) {
         }
     }
 
-    // Capacitor-only nets: every attachment is a known passive, so the
-    // static current is known to be zero.
-    for net_name in &capacitor_nets {
+    // Open-only nets: every attachment is a known passive with zero DC
+    // current, so the static current is known to be zero.
+    for net_name in &open_nets {
         if !opaque_nets.contains(net_name)
             && !graph_nets.contains(net_name.as_str())
             && !uninferable.contains(net_name)
         {
-            any_solved = true;
             sink_static.entry(net_name.clone()).or_default();
             source_static.entry(net_name.clone()).or_default();
         }
     }
-    let _ = any_solved;
 
     // Write results back onto the nets.
     for net in schematic.nets.values_mut() {

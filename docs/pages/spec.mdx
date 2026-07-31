@@ -525,15 +525,27 @@ and runs two ERC checks:
 
 #### Static current inference through passives
 
-Typed two-pin passives link nets with a known DC impedance: resistors
+Typed two-pin passives link nets with a known DC element model: resistors
 contribute `1/R`, inductors and ferrite beads behave as near-shorts, and
-capacitors are open at DC (`1/jCw` with `w = 0`), so their static current is
-known to be zero. Combined with declared net voltages (`Power(voltage=...)`,
-`Ground` at 0V) this lets the ERC solve simple resistive structures without
-hand-written current declarations — a voltage divider from a declared 5V rail
-reports its exact static draw on the rail. Declared `sink_current` values act
-as worst-case draws in the solve; declared `source_current` values are supply
+capacitors and TVS diodes are open at DC (`1/jCw` with `w = 0`), so their
+static current is known to be zero. Diodes, rectifiers and LEDs conduct only
+anode-to-cathode above their `forward_voltage` (defaults: 0.7V, LEDs 2V), and
+Zeners additionally conduct cathode-to-anode above their `zener_voltage`;
+orientation comes from the component's SPICE net order (`nets=[A, K]`), so
+any part with a SpiceModel is handled generically. Combined with declared net
+voltages (`Power(voltage=...)`, `Ground` at 0V) this lets the ERC solve
+source/impedance structures without hand-written current declarations — a
+voltage divider or a Zener clamp from a declared rail reports its exact
+static draw. Nonlinear elements are resolved by piecewise-linear state
+iteration (off / forward / breakdown). Declared `sink_current` values act as
+worst-case draws in the solve; declared `source_current` values are supply
 capacities, never flows.
+
+`pcb sim <file.zen> --static` generates the equivalent SPICE testbench from
+the same declarations — every declared-voltage net becomes a DC source, every
+declared sink a DC load, instantiated against the components' real SPICE
+models with a `.op` analysis — so the built-in inference can be cross-checked
+in ngspice (`--netlist` prints the deck without running it).
 
 The inferred values land on nets as `current_sink_static` /
 `current_source_static` and count toward the budget check

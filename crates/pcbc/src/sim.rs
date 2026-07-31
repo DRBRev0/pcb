@@ -39,6 +39,11 @@ pub struct SimArgs {
     #[arg(long = "netlist")]
     pub netlist: bool,
 
+    /// Generate the static operating-point testbench from the design's
+    /// declared voltages and currents instead of requiring a sim setup.
+    #[arg(long = "static")]
+    pub static_op: bool,
+
     /// Show full ngspice output on success
     #[arg(short, long)]
     pub verbose: bool,
@@ -66,8 +71,14 @@ fn simulate_one(
 
     let has_inline_setup = has_sim_setup(&schematic);
 
+    if args.static_op {
+        if has_inline_setup || args.setup.is_some() {
+            anyhow::bail!(
+                "{file_name}: --static generates its own sources and cannot be combined with an inline sim setup or --setup"
+            );
+        }
     // Only simulate files that have inline sim setup (or an explicit --setup file)
-    if !has_inline_setup && args.setup.is_none() {
+    } else if !has_inline_setup && args.setup.is_none() {
         eprintln!("  {}", format!("{file_name}: No sim setup").dimmed(),);
         return Ok(false);
     }
@@ -94,6 +105,12 @@ fn simulate_one(
     if let Some(setup_path) = &args.setup {
         let mut setup = String::new();
         File::open(setup_path)?.read_to_string(&mut setup)?;
+        writeln!(buf, "{setup}")?;
+    }
+
+    if args.static_op {
+        let setup = pcb_sim::gen_static_setup(&schematic)
+            .map_err(|e| anyhow::anyhow!("{file_name}: {e}"))?;
         writeln!(buf, "{setup}")?;
     }
 

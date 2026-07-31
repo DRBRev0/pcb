@@ -8,6 +8,7 @@ authors = { workspace = true }
 description = "Spice simulation setup from PCB schematic"
 
 [dependencies]
+rust_decimal = { workspace = true }
 anyhow = { workspace = true }
 pcb-sch = { workspace = true }
 pcb-command-runner = { workspace = true }

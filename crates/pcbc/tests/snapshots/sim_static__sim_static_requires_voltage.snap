@@ -1,0 +1,11 @@
+---
+source: crates/pcbc/tests/sim_static.rs
+expression: output
+---
+Command: pcbc sim board.zen --static --netlist
+Exit Code: 1
+
+--- STDOUT ---
+
+--- STDERR ---
+Error: board.zen: No declared voltages: declare voltage= on the driving rails (or use Ground) to generate a static testbench

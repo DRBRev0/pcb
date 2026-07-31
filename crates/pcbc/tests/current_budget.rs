@@ -580,3 +580,113 @@ Cap(name="CD", A=quiet, GND=gnd)
         .expect("QUIET net");
     assert_eq!(quiet["properties"]["current_sink_static"]["String"], "0A");
 }
+
+fn static_netlist_nets(board: &str, extra_files: &[(&str, &str)]) -> serde_json::Value {
+    let mut sandbox = Sandbox::new().with_workspace();
+    for (name, content) in extra_files {
+        sandbox.write(name, content);
+    }
+    let full_output = sandbox
+        .write("board.zen", board)
+        .run("pcbc", ["build", "board.zen", "--netlist"])
+        .stdout_capture()
+        .stderr_capture()
+        .read()
+        .expect("build --netlist should succeed");
+    let json_start = full_output.find('{').expect("JSON in netlist output");
+    serde_json::from_str::<serde_json::Value>(&full_output[json_start..])
+        .expect("netlist output should be JSON")["nets"]
+        .clone()
+}
+
+fn static_sink_amps(nets: &serde_json::Value, net_name: &str) -> f64 {
+    let (_, net) = nets
+        .as_object()
+        .expect("nets object")
+        .iter()
+        .find(|(name, _)| name.contains(net_name))
+        .unwrap_or_else(|| panic!("{net_name} present"));
+    net["properties"]["current_sink_static"]["String"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{net_name} has current_sink_static"))
+        .trim_end_matches('A')
+        .parse()
+        .expect("amps parse")
+}
+
+const DIODE_LOAD_ZEN: &str = r#"
+Resistor = Module("@stdlib/generics/Resistor.zen")
+Rectifier = Module("@stdlib/generics/Rectifier.zen")
+
+VIN = io(Net)
+GND = io(Ground)
+
+mid = Net("DMID")
+Rectifier(name="D1", reverse_voltage="100V", forward_voltage="0.7V", package="DO-214AC", A=VIN, K=mid)
+Resistor(name="RL", value="1kOhm", package="0402", P1=mid, P2=GND)
+"#;
+
+#[test]
+fn test_diode_conducts_only_forward() {
+    // Forward: 5V -> anode; (5 - 0.7) / (1k + 1) = 4.2957mA flows.
+    let nets = static_netlist_nets(
+        r#"
+Load = Module("./load.zen")
+
+vcc = Net("VCC", voltage="5V")
+gnd = Ground("GND")
+
+Load(name="L", VIN=vcc, GND=gnd)
+"#,
+        &[("load.zen", DIODE_LOAD_ZEN)],
+    );
+    let amps = static_sink_amps(&nets, "VCC");
+    assert!(
+        (amps - 0.0042957).abs() < 1e-5,
+        "forward diode current, got {amps}"
+    );
+
+    // Reversed: cathode to the rail; the diode blocks, everything is a
+    // known zero (not uninferable).
+    let blocked = static_netlist_nets(
+        r#"
+Load = Module("./load.zen")
+
+vneg = Net("VNEG", voltage="-5V")
+gnd = Ground("GND")
+
+Load(name="L", VIN=vneg, GND=gnd)
+"#,
+        &[("load.zen", DIODE_LOAD_ZEN)],
+    );
+    let amps = static_sink_amps(&blocked, "VNEG");
+    assert!(amps.abs() < 1e-9, "blocked diode draws nothing, got {amps}");
+}
+
+#[test]
+fn test_zener_clamp_current_is_inferred() {
+    // 12V --1k--> ZNET --[zener 5.1V, K=ZNET A=GND]--> GND.
+    // Breakdown: I = (12 - 5.1) / (1k + 1) = 6.888mA drawn from the rail.
+    let nets = static_netlist_nets(
+        r#"
+Resistor = Module("@stdlib/generics/Resistor.zen")
+Zener = Module("@stdlib/generics/Zener.zen")
+
+vin = Net("V12", voltage="12V")
+znet = Net("ZNET")
+gnd = Ground("GND")
+
+Resistor(name="R1", value="1kOhm", package="0402", P1=vin, P2=znet)
+Zener(name="DZ", zener_voltage="5.1V", package="SOD-123", A=gnd, K=znet)
+"#,
+        &[],
+    );
+    let amps = static_sink_amps(&nets, "V12");
+    assert!(
+        (amps - 0.0068931).abs() < 1e-5,
+        "zener clamp current, got {amps}"
+    );
+    // The clamp node passes the current through.
+    let znet = static_sink_amps(&nets, "ZNET");
+    assert!((znet - 0.0068931).abs() < 1e-5, "got {znet}");
+}
