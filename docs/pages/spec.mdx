@@ -198,8 +198,13 @@ GND = Ground()  # inferred from assignment; voltage defaults to 0V
 nc = NotConnected()
 ```
 
-`Net(name_or_net=None, voltage=None, impedance=None)` accepts a positional-only
-name string or existing net to cast. `Power` and `Ground` also accept `voltage`.
+`Net(name_or_net=None, voltage=None, impedance=None, signal=None)` accepts a
+positional-only name string or existing net to cast. `Power` and `Ground` also
+accept `voltage`. `signal` declares the net's switching/sensitivity class
+(`SignalType` from the prelude, or one of the strings `"static"`, `"digital"`,
+`"clock"`, `"high_speed"`, `"switching_power"`, `"analog"`, `"rf"`); it
+overrides any io()-declared class and drives routing analysis (crosstalk
+aggressor/victim classification, EMI exposure) without net-name heuristics.
 Additional connected net types (`Analog`, `Pwm`, `Gpio`) are available from
 `@stdlib/interfaces.zen`. `NotConnected` is reserved for the open-net
 constructor; `builtin.net_type("NotConnected")` is invalid.
@@ -468,7 +473,7 @@ Declare a net or interface input for a module. This defines the module's electri
 
 `io`, `input`, and `output` are prelude symbols re-exported from `@stdlib/io.zen`. The low-level builtin is `builtin.io(...)`.
 
-**Signature:** `io(name, typ_or_template, checks=None, optional=False, help=None, direction=None)` or `io(typ_or_template, checks=None, optional=False, help=None, direction=None)`
+**Signature:** `io(name, typ_or_template, checks=None, optional=False, help=None, direction=None, sink_current=None, source_current=None, signal=None)` or `io(typ_or_template, checks=None, optional=False, help=None, direction=None, sink_current=None, source_current=None, signal=None)`
 
 - `name`: Optional explicit input name (conventionally UPPERCASE). If omitted, `io()` must be assigned to a top-level variable and that variable name is used.
 - `typ_or_template`: A net type (`Net`, `Power`, `Ground`, etc.), an interface factory (`Spi`, `Uart`, etc.), a net template value, or an interface template value.
@@ -477,6 +482,9 @@ Declare a net or interface input for a module. This defines the module's electri
   the input. The default is `False`.
 - `help`: Help text for documentation and signatures.
 - `direction`: Optional signature metadata. Must be `"input"` or `"output"` when provided.
+- `sink_current`: Optional maximum current this module draws through the connection (e.g. `"300mA"` or `Current("300mA")`). Net-typed io only.
+- `source_current`: Optional maximum current this module can supply through the connection. Net-typed io only.
+- `signal`: Optional switching/sensitivity class this module emits on the connection, one of `"static"`, `"digital"`, `"clock"`, `"high_speed"`, `"switching_power"`, `"analog"`, `"rf"`. Most meaningful with `direction="output"`. Net-typed io only.
 
 ```python
 VCC = io(Power)
@@ -500,6 +508,33 @@ For example, `io(Power(voltage="1.8V - 3.6V"))` requires any supplied `Power` ne
 
 Use `direction` only for one-way signal or power flow. Leave shared rails such
 as `GND` as plain `io()` declarations.
+
+#### Current budgets and signal classes
+
+`sink_current` and `source_current` declare, per connection, how much current a
+module draws or can supply. The toolchain aggregates them per net into the
+`current_sink_total` / `current_source_total` / `current_ports` net properties
+and runs two ERC checks:
+
+- `erc.current_budget` (error): a net's summed `source_current` cannot cover
+  its summed `sink_current`.
+- `erc.current_budget.undeclared` (warning): once a design declares currents
+  anywhere, any net with no declared or inferable current is flagged. Designs
+  with zero current declarations stay silent. Ground nets are exempt.
+
+`signal` classifies what the driving module emits. Per net, an explicit
+`Net(..., signal=...)` declaration wins; otherwise agreeing io() declarations
+apply, and disagreeing ones raise the `erc.signal_conflict` warning. Nets whose
+type is `Power`/`Ground` are implicitly `static`; nets with an impedance target
+are treated as at least `high_speed` by analysis passes. Many stdlib interfaces
+pre-declare classes on their nets (e.g. `Spi.CLK` is `clock`).
+
+```python
+VBUS_IN = io(Power, sink_current="500mA")
+VOUT = io(Power, direction="output", source_current="2A")
+SW = io(Net, direction="output", signal="switching_power")
+VSENSE = io(Net, signal="analog")
+```
 
 When the explicit `name` matches the assigned variable name, omitting it is the preferred style and emits no redundancy advice.
 

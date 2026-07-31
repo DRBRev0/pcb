@@ -1,0 +1,16 @@
+---
+source: crates/pcbc/tests/current_budget.rs
+expression: output
+---
+Command: pcbc build board.zen
+Exit Code: 0
+
+--- STDOUT ---
+
+--- STDERR ---
+Warning: Net 'X' has conflicting io() signal declarations: clock, digital
+   ╭─[ <TEMP_DIR>/board.zen:5:5 ]
+ 5 │x = Net("X")
+   │        ╰──── Net 'X' has conflicting io() signal declarations: clock, digital
+
+✓ board.zen (2 components)

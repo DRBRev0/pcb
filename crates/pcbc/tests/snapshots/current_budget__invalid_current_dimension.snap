@@ -1,0 +1,24 @@
+---
+source: crates/pcbc/tests/current_budget.rs
+expression: output
+---
+Command: pcbc build board.zen
+Exit Code: 1
+
+--- STDOUT ---
+
+--- STDERR ---
+Error: io() `sink_current` must be in amperes, got `5V`
+   ╭─[ <TEMP_DIR>/board.zen:2:5 ]
+   │
+ 2 │ X = io(Net, sink_current="5V")
+   │     ─────────────┬────────────  
+   │                  ╰────────────── io() `sink_current` must be in amperes, got `5V`
+───╯
+
+Stack trace (most recent call last):
+    <TEMP_DIR>/board.zen:2:5 (io() `sink_current` must be in amperes, got `5V`)
+      ╰─ io (called from <TEMP_DIR>/board.zen:2:5-31)
+
+✗ board.zen: Build failed
+Error: Build failed with errors

@@ -1,0 +1,24 @@
+---
+source: crates/pcbc/tests/current_budget.rs
+expression: output
+---
+Command: pcbc build board.zen
+Exit Code: 1
+
+--- STDOUT ---
+
+--- STDERR ---
+Error: `signal` must be one of static, digital, clock, high_speed, switching_power, analog, rf
+   ╭─[ <TEMP_DIR>/board.zen:2:5 ]
+   │
+ 2 │ x = Net("X", signal="warp_speed")
+   │     ──────────────┬──────────────  
+   │                   ╰──────────────── `signal` must be one of static, digital, clock, high_speed, switching_power, analog, rf
+───╯
+
+Stack trace (most recent call last):
+    <TEMP_DIR>/board.zen:2:5 (`signal` must be one of static, digital, clock, high_speed, switching_power, analog, rf)
+      ╰─ Net (called from <TEMP_DIR>/board.zen:2:5-34)
+
+✗ board.zen: Build failed
+Error: Build failed with errors

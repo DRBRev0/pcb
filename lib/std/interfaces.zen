@@ -1,10 +1,24 @@
 load("units.zen", "Voltage", "Impedance")
 
+# Declared switching/sensitivity class of a net. Drives routing analysis
+# (crosstalk aggressor/victim classification, EMI exposure) without relying on
+# net-name heuristics.
+SignalType = enum(
+    "static",
+    "digital",
+    "clock",
+    "high_speed",
+    "switching_power",
+    "analog",
+    "rf",
+)
+
 Net = builtin.net_type(
     "Net",
     symbol=Symbol,
     voltage=field(Voltage | None, default=None),
     impedance=field(Impedance | None, default=None),
+    signal=field(SignalType | str | None, default=None),
 )
 
 Power = builtin.net_type(
@@ -32,13 +46,13 @@ DiffPair = interface(
 )
 
 Can = interface(
-    CAN_H=Net(),
-    CAN_L=Net(),
+    CAN_H=Net(signal="digital"),
+    CAN_L=Net(signal="digital"),
 )
 
 CanTtl = interface(
-    TX=Net(),
-    RX=Net(),
+    TX=Net(signal="digital"),
+    RX=Net(signal="digital"),
 )
 
 Csi = interface(
@@ -50,77 +64,77 @@ Csi = interface(
 )
 
 Dvp8 = interface(
-    XCLK=Net(),
-    PCLK=Net(),
-    HREF=Net(),
-    VSYNC=Net(),
-    D0=Net(),
-    D1=Net(),
-    D2=Net(),
-    D3=Net(),
-    D4=Net(),
-    D5=Net(),
-    D6=Net(),
-    D7=Net(),
+    XCLK=Net(signal="clock"),
+    PCLK=Net(signal="clock"),
+    HREF=Net(signal="digital"),
+    VSYNC=Net(signal="digital"),
+    D0=Net(signal="digital"),
+    D1=Net(signal="digital"),
+    D2=Net(signal="digital"),
+    D3=Net(signal="digital"),
+    D4=Net(signal="digital"),
+    D5=Net(signal="digital"),
+    D6=Net(signal="digital"),
+    D7=Net(signal="digital"),
 )
 
 Dvp10 = interface(
-    XCLK=Net(),
-    PCLK=Net(),
-    HREF=Net(),
-    VSYNC=Net(),
-    D0=Net(),
-    D1=Net(),
-    D2=Net(),
-    D3=Net(),
-    D4=Net(),
-    D5=Net(),
-    D6=Net(),
-    D7=Net(),
-    D8=Net(),
-    D9=Net(),
+    XCLK=Net(signal="clock"),
+    PCLK=Net(signal="clock"),
+    HREF=Net(signal="digital"),
+    VSYNC=Net(signal="digital"),
+    D0=Net(signal="digital"),
+    D1=Net(signal="digital"),
+    D2=Net(signal="digital"),
+    D3=Net(signal="digital"),
+    D4=Net(signal="digital"),
+    D5=Net(signal="digital"),
+    D6=Net(signal="digital"),
+    D7=Net(signal="digital"),
+    D8=Net(signal="digital"),
+    D9=Net(signal="digital"),
 )
 
 Dvp12 = interface(
-    XCLK=Net(),
-    PCLK=Net(),
-    HREF=Net(),
-    VSYNC=Net(),
-    D0=Net(),
-    D1=Net(),
-    D2=Net(),
-    D3=Net(),
-    D4=Net(),
-    D5=Net(),
-    D6=Net(),
-    D7=Net(),
-    D8=Net(),
-    D9=Net(),
-    D10=Net(),
-    D11=Net(),
+    XCLK=Net(signal="clock"),
+    PCLK=Net(signal="clock"),
+    HREF=Net(signal="digital"),
+    VSYNC=Net(signal="digital"),
+    D0=Net(signal="digital"),
+    D1=Net(signal="digital"),
+    D2=Net(signal="digital"),
+    D3=Net(signal="digital"),
+    D4=Net(signal="digital"),
+    D5=Net(signal="digital"),
+    D6=Net(signal="digital"),
+    D7=Net(signal="digital"),
+    D8=Net(signal="digital"),
+    D9=Net(signal="digital"),
+    D10=Net(signal="digital"),
+    D11=Net(signal="digital"),
 )
 
 Dvp16 = interface(
-    XCLK=Net(),
-    PCLK=Net(),
-    HREF=Net(),
-    VSYNC=Net(),
-    D0=Net(),
-    D1=Net(),
-    D2=Net(),
-    D3=Net(),
-    D4=Net(),
-    D5=Net(),
-    D6=Net(),
-    D7=Net(),
-    D8=Net(),
-    D9=Net(),
-    D10=Net(),
-    D11=Net(),
-    D12=Net(),
-    D13=Net(),
-    D14=Net(),
-    D15=Net(),
+    XCLK=Net(signal="clock"),
+    PCLK=Net(signal="clock"),
+    HREF=Net(signal="digital"),
+    VSYNC=Net(signal="digital"),
+    D0=Net(signal="digital"),
+    D1=Net(signal="digital"),
+    D2=Net(signal="digital"),
+    D3=Net(signal="digital"),
+    D4=Net(signal="digital"),
+    D5=Net(signal="digital"),
+    D6=Net(signal="digital"),
+    D7=Net(signal="digital"),
+    D8=Net(signal="digital"),
+    D9=Net(signal="digital"),
+    D10=Net(signal="digital"),
+    D11=Net(signal="digital"),
+    D12=Net(signal="digital"),
+    D13=Net(signal="digital"),
+    D14=Net(signal="digital"),
+    D15=Net(signal="digital"),
 )
 
 
@@ -195,36 +209,36 @@ Hdmi = interface(
 )
 
 I2c = interface(
-    SDA=Net(),
-    SCL=Net(),
+    SDA=Net(signal="digital"),
+    SCL=Net(signal="clock"),
 )
 
 I2s = interface(
-    BCLK=Net(),
-    LRCLK=Net(),
-    SDATA=Net(),
-    MCLK=Net(),
+    BCLK=Net(signal="clock"),
+    LRCLK=Net(signal="clock"),
+    SDATA=Net(signal="digital"),
+    MCLK=Net(signal="clock"),
 )
 
 I2sBidirectional = interface(
-    BCLK=Net(),
-    LRCLK=Net(),
-    SDATA_IN=Net(),
-    SDATA_OUT=Net(),
-    MCLK=Net(),
+    BCLK=Net(signal="clock"),
+    LRCLK=Net(signal="clock"),
+    SDATA_IN=Net(signal="digital"),
+    SDATA_OUT=Net(signal="digital"),
+    MCLK=Net(signal="clock"),
 )
 
 I3c = interface(
-    SDA=Net(),
-    SCL=Net(),
+    SDA=Net(signal="digital"),
+    SCL=Net(signal="clock"),
 )
 
 Jtag = interface(
-    TDI=Net(),
-    TDO=Net(),
-    TCK=Net(),
-    TMS=Net(),
-    TRST=Net(),
+    TDI=Net(signal="digital"),
+    TDO=Net(signal="digital"),
+    TCK=Net(signal="clock"),
+    TMS=Net(signal="digital"),
+    TRST=Net(signal="digital"),
 )
 
 Lcd = interface(
@@ -266,8 +280,8 @@ Lvds = interface(
 )
 
 Mdio = interface(
-    MDC=Net(),
-    MDIO=Net(),
+    MDC=Net(signal="clock"),
+    MDIO=Net(signal="digital"),
 )
 
 Mdi = interface(
@@ -278,21 +292,21 @@ Mdi = interface(
 )
 
 Mii = interface(
-    TXD0=Net(),
-    TXD1=Net(),
-    TXD2=Net(),
-    TXD3=Net(),
-    TX_EN=Net(),
-    TX_CLK=Net(),
-    RXD0=Net(),
-    RXD1=Net(),
-    RXD2=Net(),
-    RXD3=Net(),
-    RX_DV=Net(),
-    RX_CLK=Net(),
-    RX_ER=Net(),
-    COL=Net(),
-    CRS=Net(),
+    TXD0=Net(signal="digital"),
+    TXD1=Net(signal="digital"),
+    TXD2=Net(signal="digital"),
+    TXD3=Net(signal="digital"),
+    TX_EN=Net(signal="digital"),
+    TX_CLK=Net(signal="clock"),
+    RXD0=Net(signal="digital"),
+    RXD1=Net(signal="digital"),
+    RXD2=Net(signal="digital"),
+    RXD3=Net(signal="digital"),
+    RX_DV=Net(signal="digital"),
+    RX_CLK=Net(signal="clock"),
+    RX_ER=Net(signal="digital"),
+    COL=Net(signal="digital"),
+    CRS=Net(signal="digital"),
 )
 
 Mipi = interface(
@@ -304,7 +318,7 @@ Mipi = interface(
 )
 
 OneWire = interface(
-    DQ=Net(),
+    DQ=Net(signal="digital"),
 )
 
 Opamp = interface(
@@ -314,8 +328,8 @@ Opamp = interface(
 )
 
 OscPair = interface(
-    XIN=Net(),
-    XOUT=Net(),
+    XIN=Net(signal="clock"),
+    XOUT=Net(signal="clock"),
 )
 
 Pcie = interface(
@@ -453,49 +467,49 @@ QLink = interface(
 )
 
 Qspi = interface(
-    CS=Net(impedance=Impedance(50)),
-    CLK=Net(impedance=Impedance(50)),
-    IO0=Net(impedance=Impedance(50)),
-    IO1=Net(impedance=Impedance(50)),
-    IO2=Net(impedance=Impedance(50)),
-    IO3=Net(impedance=Impedance(50)),
+    CS=Net(impedance=Impedance(50), signal="digital"),
+    CLK=Net(impedance=Impedance(50), signal="clock"),
+    IO0=Net(impedance=Impedance(50), signal="digital"),
+    IO1=Net(impedance=Impedance(50), signal="digital"),
+    IO2=Net(impedance=Impedance(50), signal="digital"),
+    IO3=Net(impedance=Impedance(50), signal="digital"),
 )
 
 Rgmii = interface(
-    TXD0=Net(impedance=Impedance(50)),
-    TXD1=Net(impedance=Impedance(50)),
-    TXD2=Net(impedance=Impedance(50)),
-    TXD3=Net(impedance=Impedance(50)),
-    TX_CTL=Net(impedance=Impedance(50)),
-    TXC=Net(impedance=Impedance(50)),
-    RXD0=Net(impedance=Impedance(50)),
-    RXD1=Net(impedance=Impedance(50)),
-    RXD2=Net(impedance=Impedance(50)),
-    RXD3=Net(impedance=Impedance(50)),
-    RX_CTL=Net(impedance=Impedance(50)),
-    RXC=Net(impedance=Impedance(50)),
+    TXD0=Net(impedance=Impedance(50), signal="digital"),
+    TXD1=Net(impedance=Impedance(50), signal="digital"),
+    TXD2=Net(impedance=Impedance(50), signal="digital"),
+    TXD3=Net(impedance=Impedance(50), signal="digital"),
+    TX_CTL=Net(impedance=Impedance(50), signal="digital"),
+    TXC=Net(impedance=Impedance(50), signal="clock"),
+    RXD0=Net(impedance=Impedance(50), signal="digital"),
+    RXD1=Net(impedance=Impedance(50), signal="digital"),
+    RXD2=Net(impedance=Impedance(50), signal="digital"),
+    RXD3=Net(impedance=Impedance(50), signal="digital"),
+    RX_CTL=Net(impedance=Impedance(50), signal="digital"),
+    RXC=Net(impedance=Impedance(50), signal="clock"),
 )
 
 Rmii = interface(
-    TXD0=Net(),
-    TXD1=Net(),
-    TX_EN=Net(),
-    RXD0=Net(),
-    RXD1=Net(),
-    CRS_DV=Net(),
-    RX_ER=Net(),
-    REF_CLK=Net(),
+    TXD0=Net(signal="digital"),
+    TXD1=Net(signal="digital"),
+    TX_EN=Net(signal="digital"),
+    RXD0=Net(signal="digital"),
+    RXD1=Net(signal="digital"),
+    CRS_DV=Net(signal="digital"),
+    RX_ER=Net(signal="digital"),
+    REF_CLK=Net(signal="clock"),
 )
 
 Rs232 = interface(
-    TX=Net("TX"),
-    RX=Net("RX"),
-    RTS=Net("RTS"),
-    CTS=Net("CTS"),
-    DTR=Net("DTR"),
-    DSR=Net("DSR"),
-    DCD=Net("DCD"),
-    RI=Net("RI"),
+    TX=Net("TX", signal="digital"),
+    RX=Net("RX", signal="digital"),
+    RTS=Net("RTS", signal="digital"),
+    CTS=Net("CTS", signal="digital"),
+    DTR=Net("DTR", signal="digital"),
+    DSR=Net("DSR", signal="digital"),
+    DCD=Net("DCD", signal="digital"),
+    RI=Net("RI", signal="digital"),
 )
 
 Rs422 = interface(
@@ -513,25 +527,25 @@ Sata = interface(
 )
 
 Sdio = interface(
-    CLK=Net(impedance=Impedance(50)),
-    CMD=Net(impedance=Impedance(50)),
-    DAT0=Net(impedance=Impedance(50)),
-    DAT1=Net(impedance=Impedance(50)),
-    DAT2=Net(impedance=Impedance(50)),
-    DAT3=Net(impedance=Impedance(50)),
+    CLK=Net(impedance=Impedance(50), signal="clock"),
+    CMD=Net(impedance=Impedance(50), signal="digital"),
+    DAT0=Net(impedance=Impedance(50), signal="digital"),
+    DAT1=Net(impedance=Impedance(50), signal="digital"),
+    DAT2=Net(impedance=Impedance(50), signal="digital"),
+    DAT3=Net(impedance=Impedance(50), signal="digital"),
 )
 
 Sdmmc = interface(
-    CLK=Net(impedance=Impedance(50)),
-    CMD=Net(impedance=Impedance(50)),
-    DAT0=Net(impedance=Impedance(50)),
-    DAT1=Net(impedance=Impedance(50)),
-    DAT2=Net(impedance=Impedance(50)),
-    DAT3=Net(impedance=Impedance(50)),
-    DAT4=Net(impedance=Impedance(50)),
-    DAT5=Net(impedance=Impedance(50)),
-    DAT6=Net(impedance=Impedance(50)),
-    DAT7=Net(impedance=Impedance(50)),
+    CLK=Net(impedance=Impedance(50), signal="clock"),
+    CMD=Net(impedance=Impedance(50), signal="digital"),
+    DAT0=Net(impedance=Impedance(50), signal="digital"),
+    DAT1=Net(impedance=Impedance(50), signal="digital"),
+    DAT2=Net(impedance=Impedance(50), signal="digital"),
+    DAT3=Net(impedance=Impedance(50), signal="digital"),
+    DAT4=Net(impedance=Impedance(50), signal="digital"),
+    DAT5=Net(impedance=Impedance(50), signal="digital"),
+    DAT6=Net(impedance=Impedance(50), signal="digital"),
+    DAT7=Net(impedance=Impedance(50), signal="digital"),
 )
 
 Lpddr4Channel = interface(
@@ -672,33 +686,33 @@ Sdram32 = interface(
 SmBus = I2c
 
 Spi = interface(
-    CS=Net(),
-    MISO=Net(),
-    MOSI=Net(),
-    CLK=Net(),
+    CS=Net(signal="digital"),
+    MISO=Net(signal="digital"),
+    MOSI=Net(signal="digital"),
+    CLK=Net(signal="clock"),
 )
 
 Spmi = interface(
-    CLK=Net(impedance=Impedance(50)),
-    DATA=Net(impedance=Impedance(50)),
+    CLK=Net(impedance=Impedance(50), signal="clock"),
+    DATA=Net(impedance=Impedance(50), signal="digital"),
 )
 
 Swd = interface(
-    SWDIO=Net(),
-    SWCLK=Net(),
+    SWDIO=Net(signal="digital"),
+    SWCLK=Net(signal="clock"),
 )
 
 Uart = interface(
-    TX=Net(),
-    RX=Net(),
+    TX=Net(signal="digital"),
+    RX=Net(signal="digital"),
 )
 
 Usart = interface(
-    TX=Net(),
-    RX=Net(),
-    CK=Net(),
-    RTS=Net(),
-    CTS=Net(),
+    TX=Net(signal="digital"),
+    RX=Net(signal="digital"),
+    CK=Net(signal="clock"),
+    RTS=Net(signal="digital"),
+    CTS=Net(signal="digital"),
 )
 
 

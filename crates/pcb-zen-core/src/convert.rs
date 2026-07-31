@@ -267,6 +267,9 @@ impl ModuleConverter {
         // Propagate impedance from DiffPair interfaces to P/N nets (before creating Net objects)
         propagate_diffpair_impedance(&mut self.net_to_info, &module_tree);
 
+        // Aggregate io()-declared currents and signal classes onto their nets.
+        propagate_io_attributes(&mut self.net_to_info, &module_tree);
+
         // Create Net objects directly using the accumulated NetInfo.
         for (net_id, net_info) in &self.net_to_info {
             if net_info.kind.as_deref() == Some("NotConnected") && net_info.ports.is_empty() {
@@ -1163,6 +1166,146 @@ fn collect_net_ids_into(value: Value, net_ids: &mut HashSet<NetId>) {
     }
 }
 
+/// Aggregate io()-declared `sink_current`/`source_current`/`signal` attributes
+/// onto the nets those io() parameters are connected to.
+///
+/// Net properties produced:
+/// - `current_sink_total` / `current_source_total`: summed currents ("0.5A").
+/// - `current_ports`: JSON array of `{port, role, amps}` entries, one per
+///   declaring io() connection, for per-branch current flow analysis.
+/// - `signal`: the declared class when io() declarations agree and the net
+///   itself does not already declare one (net-level `signal` wins).
+/// - `signal_conflict`: sorted list of conflicting io() classes, when
+///   disagreeing declarations prevent resolution.
+fn propagate_io_attributes(
+    net_info: &mut HashMap<NetId, NetInfo>,
+    tree: &BTreeMap<ModulePath, FrozenModuleValue>,
+) {
+    use rust_decimal::Decimal;
+    use rust_decimal::prelude::ToPrimitive;
+
+    #[derive(Default)]
+    struct NetIoAgg {
+        sinks: Vec<(String, Decimal)>,
+        sources: Vec<(String, Decimal)>,
+        signals: Vec<String>,
+    }
+
+    let mut aggregates: HashMap<NetId, NetIoAgg> = HashMap::new();
+
+    for (module_path, module) in tree {
+        for param in module.signature().iter().filter(|p| !p.is_config) {
+            if param.sink_current.is_none()
+                && param.source_current.is_none()
+                && param.signal.is_none()
+            {
+                continue;
+            }
+            let Some(actual_value) = param.actual_value else {
+                continue;
+            };
+
+            let port_label = if module_path.is_root() {
+                param.name.clone()
+            } else {
+                format!("{module_path}.{}", param.name)
+            };
+
+            let sink = param
+                .sink_current
+                .and_then(|v| v.to_value().downcast_ref::<PhysicalValue>().copied());
+            let source = param
+                .source_current
+                .and_then(|v| v.to_value().downcast_ref::<PhysicalValue>().copied());
+
+            for net_id in collect_net_ids_from_value(actual_value.to_value()) {
+                let agg = aggregates.entry(net_id).or_default();
+                if let Some(sink) = sink {
+                    agg.sinks.push((port_label.clone(), sink.nominal));
+                }
+                if let Some(source) = source {
+                    agg.sources.push((port_label.clone(), source.nominal));
+                }
+                if let Some(signal) = param.signal {
+                    agg.signals.push(signal.as_str().to_string());
+                }
+            }
+        }
+    }
+
+    let current_attr =
+        |total: Decimal| -> AttributeValue { AttributeValue::String(format!("{total}A")) };
+
+    for (net_id, agg) in aggregates {
+        let info = net_info.entry(net_id).or_default();
+
+        if !agg.sinks.is_empty() {
+            let total: Decimal = agg.sinks.iter().map(|(_, amps)| amps).sum();
+            info.properties
+                .insert("current_sink_total".to_string(), current_attr(total));
+        }
+        if !agg.sources.is_empty() {
+            let total: Decimal = agg.sources.iter().map(|(_, amps)| amps).sum();
+            info.properties
+                .insert("current_source_total".to_string(), current_attr(total));
+        }
+
+        if !agg.sinks.is_empty() || !agg.sources.is_empty() {
+            let mut ports: Vec<(String, &'static str, Decimal)> = agg
+                .sinks
+                .iter()
+                .map(|(port, amps)| (port.clone(), "sink", *amps))
+                .chain(
+                    agg.sources
+                        .iter()
+                        .map(|(port, amps)| (port.clone(), "source", *amps)),
+                )
+                .collect();
+            ports.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+            let ports_json: Vec<JsonValue> = ports
+                .into_iter()
+                .map(|(port, role, amps)| {
+                    let mut map = JsonMap::new();
+                    map.insert("port".to_string(), JsonValue::String(port));
+                    map.insert("role".to_string(), JsonValue::String(role.to_string()));
+                    map.insert(
+                        "amps".to_string(),
+                        JsonNumber::from_f64(amps.to_f64().unwrap_or_default())
+                            .map(JsonValue::Number)
+                            .unwrap_or(JsonValue::Null),
+                    );
+                    JsonValue::Object(map)
+                })
+                .collect();
+            info.properties.insert(
+                "current_ports".to_string(),
+                AttributeValue::Json(JsonValue::Array(ports_json)),
+            );
+        }
+
+        if !agg.signals.is_empty() {
+            let mut unique: Vec<String> = agg.signals.clone();
+            unique.sort();
+            unique.dedup();
+            // A net-level `signal` declaration always wins over io() ones.
+            if info.properties.contains_key("signal") {
+                continue;
+            }
+            if unique.len() == 1 {
+                info.properties.insert(
+                    "signal".to_string(),
+                    AttributeValue::String(unique.into_iter().next().unwrap()),
+                );
+            } else {
+                info.properties.insert(
+                    "signal_conflict".to_string(),
+                    AttributeValue::Array(unique.into_iter().map(AttributeValue::String).collect()),
+                );
+            }
+        }
+    }
+}
+
 /// Propagate impedance from DiffPair interfaces to P/N nets
 fn propagate_diffpair_impedance(
     net_info: &mut HashMap<NetId, NetInfo>,
@@ -1183,28 +1326,38 @@ fn propagate_from_value(value: Value, net_info: &mut HashMap<NetId, NetInfo>) {
         return;
     };
 
-    // Try to extract DiffPair impedance: interface must have impedance, P, and N fields
+    // A DiffPair-shaped interface has P and N net fields; record the pairing
+    // (and its impedance, when set) on both nets.
     let fields = interface.fields();
-    if let (Some(impedance_val), Some(p), Some(n)) = (
-        fields.get("impedance").filter(|v| !v.is_none()),
+    if let (Some(p), Some(n)) = (
         fields
             .get("P")
             .and_then(|v| v.downcast_ref::<FrozenNetValue>()),
         fields
             .get("N")
             .and_then(|v| v.downcast_ref::<FrozenNetValue>()),
-    ) && let Ok(attr) = to_attribute_value(*impedance_val)
+    ) && fields.contains_key("impedance")
     {
-        net_info
-            .entry(p.id())
-            .or_default()
-            .properties
-            .insert("differential_impedance".to_string(), attr.clone());
-        net_info
-            .entry(n.id())
-            .or_default()
-            .properties
-            .insert("differential_impedance".to_string(), attr);
+        let impedance_attr = fields
+            .get("impedance")
+            .filter(|v| !v.is_none())
+            .and_then(|v| to_attribute_value(*v).ok());
+
+        for (net, peer, role) in [(p, n, "p"), (n, p, "n")] {
+            let info = net_info.entry(net.id()).or_default();
+            if let Some(attr) = &impedance_attr {
+                info.properties
+                    .insert("differential_impedance".to_string(), attr.clone());
+            }
+            info.properties.insert(
+                "diff_pair_peer".to_string(),
+                AttributeValue::Number(peer.id() as f64),
+            );
+            info.properties.insert(
+                "diff_pair_role".to_string(),
+                AttributeValue::String(role.to_string()),
+            );
+        }
     }
 
     // Recursively check all nested interface fields

@@ -1,0 +1,23 @@
+---
+source: crates/pcbc/tests/current_budget.rs
+expression: output
+---
+Command: pcbc build board.zen
+Exit Code: 1
+
+--- STDOUT ---
+
+--- STDERR ---
+Error: Net 'VBUS' current budget exceeded: declared sources supply 100mA but sinks draw 600mA
+   ╭─[ <TEMP_DIR>/board.zen:5:8 ]
+   │
+ 5 │ vbus = Net("VBUS")
+   │        ─────┬─────  
+   │             ╰─────── Net 'VBUS' current budget exceeded: declared sources supply 100mA but sinks draw 600mA
+───╯
+
+Stack trace (most recent call last):
+    <TEMP_DIR>/board.zen:5:8 (Net 'VBUS' current budget exceeded: declared sources supply 100mA but sinks draw 600mA)
+
+✗ board.zen: Build failed
+Error: Build failed with errors

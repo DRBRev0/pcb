@@ -145,6 +145,124 @@ impl<'a> SchematicErcContext<'a> {
     }
 }
 
+/// Checks io()-declared current budgets:
+/// - error when a net's summed `source_current` cannot cover its summed
+///   `sink_current`;
+/// - warning for nets with no declared or inferable current, once the design
+///   has opted into current declarations anywhere (a design with zero
+///   declarations stays silent);
+/// - warning when io() `signal` declarations on one net disagree.
+struct CurrentBudgetPass;
+
+impl ErcNet<'_> {
+    fn diagnostic_path(&self) -> String {
+        self.metadata
+            .as_ref()
+            .map(|metadata| metadata.path.clone())
+            .unwrap_or_default()
+    }
+
+    fn diagnostic_span(&self) -> Option<ResolvedSpan> {
+        self.metadata.as_ref().and_then(|metadata| metadata.span)
+    }
+
+    fn display_name(&self) -> &str {
+        self.metadata
+            .as_ref()
+            .map(|metadata| metadata.display_name.as_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(self.net.name.as_str())
+    }
+}
+
+impl SchematicErcPass for CurrentBudgetPass {
+    fn run(&self, ctx: &SchematicErcContext<'_>, diagnostics: &mut Diagnostics) {
+        let any_current_declared = ctx.nets.iter().any(|net| {
+            net.net.properties.contains_key("current_sink_total")
+                || net.net.properties.contains_key("current_source_total")
+        });
+
+        for net in &ctx.nets {
+            let net_kind = net.net.kind.as_str();
+            if matches!(net_kind, "NotConnected" | "Ground") {
+                continue;
+            }
+
+            let sink_total = net
+                .net
+                .properties
+                .get("current_sink_total")
+                .and_then(pcb_sch::AttributeValue::physical);
+            let source_total = net
+                .net
+                .properties
+                .get("current_source_total")
+                .and_then(pcb_sch::AttributeValue::physical);
+
+            match (sink_total, source_total) {
+                (Some(sink), Some(source)) => {
+                    if source.nominal < sink.nominal {
+                        let body = format!(
+                            "Net '{}' current budget exceeded: declared sources supply {} but sinks draw {}",
+                            net.display_name(),
+                            source,
+                            sink,
+                        );
+                        diagnostics.diagnostics.push(
+                            Diagnostic::categorized(
+                                &net.diagnostic_path(),
+                                &body,
+                                "erc.current_budget",
+                                EvalSeverity::Error,
+                            )
+                            .with_span(net.diagnostic_span()),
+                        );
+                    }
+                }
+                (None, None) if any_current_declared => {
+                    let body = format!(
+                        "Net '{}' has no declared or inferable current: no connected io() declares sink_current or source_current",
+                        net.display_name(),
+                    );
+                    diagnostics.diagnostics.push(
+                        Diagnostic::categorized(
+                            &net.diagnostic_path(),
+                            &body,
+                            "erc.current_budget.undeclared",
+                            EvalSeverity::Warning,
+                        )
+                        .with_span(net.diagnostic_span()),
+                    );
+                }
+                _ => {}
+            }
+
+            if let Some(pcb_sch::AttributeValue::Array(values)) =
+                net.net.properties.get("signal_conflict")
+            {
+                let classes: Vec<&str> = values
+                    .iter()
+                    .filter_map(pcb_sch::AttributeValue::string)
+                    .collect();
+                let body = format!(
+                    "Net '{}' has conflicting io() signal declarations: {}",
+                    net.display_name(),
+                    classes.join(", "),
+                );
+                diagnostics.diagnostics.push(
+                    Diagnostic::categorized(
+                        &net.diagnostic_path(),
+                        &body,
+                        "erc.signal_conflict",
+                        EvalSeverity::Warning,
+                    )
+                    .with_span(net.diagnostic_span()),
+                );
+            }
+        }
+    }
+}
+
 impl SchematicErcPass for PinNoConnectPass {
     fn run(&self, ctx: &SchematicErcContext<'_>, diagnostics: &mut Diagnostics) {
         for net in &ctx.nets {
@@ -187,7 +305,7 @@ impl SchematicErcPass for PinNoConnectPass {
 pub fn run_schematic_erc(eval_output: &EvalOutput, schematic: &Schematic) -> Diagnostics {
     let ctx = SchematicErcContext::build(eval_output, schematic);
     let mut diagnostics = Diagnostics::default();
-    let passes: [&dyn SchematicErcPass; 1] = [&PinNoConnectPass];
+    let passes: [&dyn SchematicErcPass; 2] = [&PinNoConnectPass, &CurrentBudgetPass];
 
     for pass in passes {
         pass.run(&ctx, &mut diagnostics);

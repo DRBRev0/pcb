@@ -91,7 +91,7 @@ pub fn generate_net_id() -> NetId {
 
 fn builtin_optional_net_fields(type_name: &str) -> &'static [&'static str] {
     match type_name {
-        "Net" => &["voltage", "impedance"],
+        "Net" => &["voltage", "impedance", "signal"],
         "Power" => &["voltage"],
         _ => &[],
     }
@@ -825,6 +825,28 @@ impl<'v, V: ValueLike<'v>> NetTypeGen<V> {
                     }
                 }
             }
+        }
+
+        // Validate the built-in `signal` field against the known signal classes,
+        // whether provided as a `SignalType` enum value or a plain string.
+        if is_builtin_optional_net_field(&self.type_name, "signal")
+            && let Some(signal_val) = properties.get("signal")
+        {
+            let signal_str = if let Some(enum_val) =
+                signal_val.downcast_ref::<crate::lang::r#enum::EnumValue>()
+            {
+                enum_val.value().to_owned()
+            } else if let Some(s) = signal_val.unpack_str() {
+                s.to_owned()
+            } else {
+                return Err(starlark::Error::new_other(anyhow::anyhow!(
+                    "Net `signal` must be a SignalType or string, got {}",
+                    signal_val.get_type()
+                )));
+            };
+            signal_str
+                .parse::<crate::lang::signal_type::SignalType>()
+                .map_err(starlark::Error::new_other)?;
         }
 
         if let Some(symbol_val) = properties.get("symbol")

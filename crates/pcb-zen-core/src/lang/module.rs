@@ -9,6 +9,7 @@ use crate::lang::component::FrozenComponentValue;
 use crate::lang::electrical_check::FrozenElectricalCheck;
 use crate::lang::r#enum::{EnumType, EnumValue};
 use crate::lang::io_direction::IoDirection;
+use crate::lang::signal_type::SignalType;
 use crate::lang::test_bench::FrozenTestBenchValue;
 use crate::lang::type_conversion::try_implicit_type_conversion;
 use allocative::Allocative;
@@ -294,6 +295,12 @@ pub struct ParameterMetadataGen<V: ValueLifetimeless> {
     pub help: Option<String>,
     /// Optional direction metadata for io() parameters.
     pub direction: Option<IoDirection>,
+    /// Maximum current drawn through this io() connection, if declared.
+    pub sink_current: Option<V>,
+    /// Maximum current supplied through this io() connection, if declared.
+    pub source_current: Option<V>,
+    /// Declared switching/sensitivity class emitted on this io() connection.
+    pub signal: Option<SignalType>,
     /// The actual value returned by io() or config()
     pub actual_value: Option<V>,
     /// Source span for the `io()`/`config()` declaration when available.
@@ -343,6 +350,9 @@ impl<'v, V: ValueLike<'v>> ParameterMetadataGen<V> {
             is_config,
             help,
             direction,
+            sink_current: None,
+            source_current: None,
+            signal: None,
             actual_value: None,
             declaration_span,
             declaration_call_stack,
@@ -387,6 +397,9 @@ pub(crate) struct ParameterMetadataInput<'v> {
     pub(crate) is_config: bool,
     pub(crate) help: Option<String>,
     pub(crate) direction: Option<IoDirection>,
+    pub(crate) sink_current: Option<Value<'v>>,
+    pub(crate) source_current: Option<Value<'v>>,
+    pub(crate) signal: Option<SignalType>,
     pub(crate) actual_value: Value<'v>,
 }
 
@@ -419,6 +432,9 @@ pub(crate) fn record_parameter_metadata<'v>(
             metadata.is_config,
             metadata.help.clone(),
             metadata.direction,
+            metadata.sink_current,
+            metadata.source_current,
+            metadata.signal,
             Some(metadata.actual_value),
             declaration_site.span,
             declaration_site.call_stack.clone(),
@@ -683,6 +699,9 @@ impl<'v, V: ValueLike<'v>> ModuleValueGen<V> {
         is_config: bool,
         help: Option<String>,
         direction: Option<IoDirection>,
+        sink_current: Option<V>,
+        source_current: Option<V>,
+        signal: Option<SignalType>,
         actual_value: Option<V>,
         declaration_span: Option<ResolvedSpan>,
         declaration_call_stack: starlark::eval::CallStack,
@@ -701,6 +720,9 @@ impl<'v, V: ValueLike<'v>> ModuleValueGen<V> {
                 declaration_span,
                 declaration_call_stack,
             );
+            param.sink_current = sink_current;
+            param.source_current = source_current;
+            param.signal = signal;
             param.actual_value = actual_value;
             self.signature.push(param);
         }

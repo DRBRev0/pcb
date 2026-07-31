@@ -1,0 +1,16 @@
+---
+source: crates/pcbc/tests/current_budget.rs
+expression: output
+---
+Command: pcbc build board.zen
+Exit Code: 0
+
+--- STDOUT ---
+
+--- STDERR ---
+Warning: Net 'NO_CURRENT_INFO' has no declared or inferable current: no connected io() declares sink_current or source_current
+   ╭─[ <TEMP_DIR>/board.zen:8:9 ]
+ 8 │other = Net("NO_CURRENT_INFO")
+   │                   ╰─────────── Net 'NO_CURRENT_INFO' has no declared or inferable current: no connected io() declares sink_current or source_current
+
+✓ board.zen (4 components)

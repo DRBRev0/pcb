@@ -8,16 +8,19 @@ def input(
     default=None,
     optional=False,
     help=None,
+    sink_current=None,
+    source_current=None,
+    signal=None,
 ):
     name = name_or_typ if typ != None else None
     typ = typ if typ != None else name_or_typ
     if name != None:
         if checks != None:
-            return io(name, typ, checks, default=default, optional=optional, help=help, direction="input")
-        return io(name, typ, default=default, optional=optional, help=help, direction="input")
+            return io(name, typ, checks, default=default, optional=optional, help=help, direction="input", sink_current=sink_current, source_current=source_current, signal=signal)
+        return io(name, typ, default=default, optional=optional, help=help, direction="input", sink_current=sink_current, source_current=source_current, signal=signal)
     if checks != None:
-        return io(typ, checks, default=default, optional=optional, help=help, direction="input")
-    return io(typ, default=default, optional=optional, help=help, direction="input")
+        return io(typ, checks, default=default, optional=optional, help=help, direction="input", sink_current=sink_current, source_current=source_current, signal=signal)
+    return io(typ, default=default, optional=optional, help=help, direction="input", sink_current=sink_current, source_current=source_current, signal=signal)
 
 
 def output(
@@ -27,13 +30,16 @@ def output(
     default=None,
     optional=False,
     help=None,
+    sink_current=None,
+    source_current=None,
+    signal=None,
 ):
     name = name_or_typ if typ != None else None
     typ = typ if typ != None else name_or_typ
     if name != None:
         if checks != None:
-            return io(name, typ, checks, default=default, optional=optional, help=help, direction="output")
-        return io(name, typ, default=default, optional=optional, help=help, direction="output")
+            return io(name, typ, checks, default=default, optional=optional, help=help, direction="output", sink_current=sink_current, source_current=source_current, signal=signal)
+        return io(name, typ, default=default, optional=optional, help=help, direction="output", sink_current=sink_current, source_current=source_current, signal=signal)
     if checks != None:
-        return io(typ, checks, default=default, optional=optional, help=help, direction="output")
-    return io(typ, default=default, optional=optional, help=help, direction="output")
+        return io(typ, checks, default=default, optional=optional, help=help, direction="output", sink_current=sink_current, source_current=source_current, signal=signal)
+    return io(typ, default=default, optional=optional, help=help, direction="output", sink_current=sink_current, source_current=source_current, signal=signal)

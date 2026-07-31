@@ -14,7 +14,8 @@ use starlark::{
 };
 
 use crate::lang::{
-    error::CategorizedDiagnostic, evaluator_ext::EvaluatorExt, io_direction::IoDirection,
+    r#enum::EnumValue, error::CategorizedDiagnostic, evaluator_ext::EvaluatorExt,
+    io_direction::IoDirection, signal_type::SignalType,
 };
 
 use super::context::ContextValue;
@@ -42,6 +43,9 @@ struct DeclArgs<'v> {
     optional: Option<bool>,
     help: Option<String>,
     direction: Option<IoDirection>,
+    sink_current: Option<Value<'v>>,
+    source_current: Option<Value<'v>>,
+    signal: Option<SignalType>,
 }
 
 #[derive(Debug, Clone)]
@@ -215,6 +219,51 @@ fn none_if_none(value: Value<'_>) -> Option<Value<'_>> {
     (!value.is_none()).then_some(value)
 }
 
+/// Unpack an io() current argument (`sink_current` / `source_current`) into a
+/// current-dimensioned `PhysicalValue` allocated on the heap. Accepts either a
+/// physical value (e.g. `Current("500mA")`) or a string spec (e.g. `"500mA"`).
+fn unpack_current_arg<'v>(
+    value: Value<'v>,
+    function: &str,
+    parameter: &str,
+    heap: Heap<'v>,
+) -> starlark::Result<Value<'v>> {
+    let physical = if let Some(physical) = value.downcast_ref::<PhysicalValue>() {
+        *physical
+    } else if let Some(spec) = value.unpack_str() {
+        spec.parse::<PhysicalValue>().map_err(|e| {
+            starlark::Error::new_other(anyhow::anyhow!(
+                "{function}() `{parameter}` is not a valid current: {e}"
+            ))
+        })?
+    } else {
+        return Err(starlark::Error::new_other(anyhow::anyhow!(
+            "{function}() `{parameter}` must be a current (e.g. \"500mA\"), got {}",
+            value.get_type()
+        )));
+    };
+
+    if physical.unit != pcb_sch::physical::PhysicalUnitDims::CURRENT {
+        return Err(starlark::Error::new_other(anyhow::anyhow!(
+            "{function}() `{parameter}` must be in amperes, got `{physical}`"
+        )));
+    }
+
+    Ok(heap.alloc(physical))
+}
+
+/// Unpack an io() `signal` argument as a string. Accepts either a string or a
+/// stdlib `SignalType` enum value.
+fn unpack_signal_str(value: Value<'_>, function: &str) -> starlark::Result<Option<String>> {
+    if value.is_none() {
+        return Ok(None);
+    }
+    if let Some(enum_val) = value.downcast_ref::<EnumValue>() {
+        return Ok(Some(enum_val.value().to_owned()));
+    }
+    unpack_string_arg(value, function, "signal").map(Some)
+}
+
 fn parse_decl_args<'v>(
     kind: ParamKind,
     args: &Arguments<'v, '_>,
@@ -234,6 +283,9 @@ fn parse_decl_args<'v>(
     let mut optional = None;
     let mut help = None;
     let mut direction = None;
+    let mut sink_current = None;
+    let mut source_current = None;
+    let mut signal = None;
 
     for (arg_name, value) in args.names_map()? {
         match arg_name.as_str() {
@@ -246,6 +298,19 @@ fn parse_decl_args<'v>(
                 direction = IoDirection::parse_optional(
                     unpack_optional_string_arg(value, function, "direction")?.as_deref(),
                 )?
+            }
+            "sink_current" if kind.allows_direction() => {
+                sink_current = none_if_none(value)
+                    .map(|value| unpack_current_arg(value, function, arg_name.as_str(), heap))
+                    .transpose()?
+            }
+            "source_current" if kind.allows_direction() => {
+                source_current = none_if_none(value)
+                    .map(|value| unpack_current_arg(value, function, arg_name.as_str(), heap))
+                    .transpose()?
+            }
+            "signal" if kind.allows_direction() => {
+                signal = SignalType::parse_optional(unpack_signal_str(value, function)?.as_deref())?
             }
             other => {
                 return Err(starlark::Error::new_other(anyhow::anyhow!(
@@ -299,6 +364,9 @@ fn parse_decl_args<'v>(
             optional,
             help,
             direction,
+            sink_current,
+            source_current,
+            signal,
         },
     ))
 }
@@ -443,6 +511,9 @@ fn resolve_config<'v>(
             is_config: true,
             help: args.help.clone(),
             direction: None,
+            sink_current: None,
+            source_current: None,
+            signal: None,
             actual_value: value,
         },
         declaration_site,
@@ -464,6 +535,17 @@ fn resolve_io<'v>(
     if !matches!(type_name, "NetType" | "InterfaceFactory") {
         return Err(anyhow::anyhow!(
             "builtin.io() requires a Net or interface type, got {type_name}."
+        )
+        .into());
+    }
+
+    // Current/signal declarations describe a single electrical connection, so
+    // they are only meaningful on net-shaped io() parameters.
+    if type_name != "NetType"
+        && (args.sink_current.is_some() || args.source_current.is_some() || args.signal.is_some())
+    {
+        return Err(anyhow::anyhow!(
+            "io() `sink_current`, `source_current` and `signal` are only supported on Net-typed io parameters, not interfaces."
         )
         .into());
     }
@@ -523,6 +605,9 @@ fn resolve_io<'v>(
             is_config: false,
             help: args.help.clone(),
             direction: args.direction,
+            sink_current: args.sink_current,
+            source_current: args.source_current,
+            signal: args.signal,
             actual_value: value,
         },
         declaration_site,
