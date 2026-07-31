@@ -141,6 +141,9 @@ impl<'a> SchematicErcContext<'a> {
             });
         }
 
+        // Deterministic diagnostic order regardless of net-map iteration.
+        nets.sort_by(|a, b| a.net.name.cmp(&b.net.name));
+
         Self { nets }
     }
 }
