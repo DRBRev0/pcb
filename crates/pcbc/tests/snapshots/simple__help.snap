@@ -36,6 +36,7 @@ Commands:
   scan        Scan datasheets from local PDFs or URLs
   component   Access the component API
   search      Search for electronic components
+  score       Score the routing quality of a board layout
   simulate    Run SPICE simulations
   ipc2581     IPC-2581 parser and inspection tool
   gerber      Gerber X2 parser and rendering tool

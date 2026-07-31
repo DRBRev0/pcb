@@ -1,0 +1,20 @@
+[package]
+name = "pcb-score"
+version = { workspace = true }
+edition = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+authors = { workspace = true }
+description = "Routing quality scoring for PCB layouts"
+
+[dependencies]
+anyhow = { workspace = true }
+pcb-kicad = { workspace = true }
+pcb-sch = { workspace = true }
+pcb-sexpr = { workspace = true }
+rust_decimal = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]

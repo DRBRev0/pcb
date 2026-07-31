@@ -10,6 +10,11 @@ and this project adheres to Semantic Versioning (https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- Added `pcb score <FILE.zen>`: routing quality scoring of a board layout. Hard gates (100% connectivity, zero DRC errors) plus a weighted composite over ~50 metrics across routing efficiency, signal integrity, crosstalk, EMI/EMC, power integrity, ESD protection, thermal, manufacturability, placement and aesthetics. Outputs a stable JSON schema (`-f json`) and a human summary; `--skip-drc` provides a fast geometry-only mode for autorouting inner loops, and `--weights` overrides category weights. Net/component classification is fully declarative (Zener `signal`, io() currents, impedance targets, `type` attributes) — metrics without declarations report themselves as not applicable instead of guessing from names. The analysis engine lives in the new `pcb-score` crate.
+
+- Added `sink_current` and `source_current` parameters to `io()` to declare per-connection current budgets. They aggregate per net (`current_sink_total`, `current_source_total`, `current_ports` properties) and feed a new blocking ERC check (`erc.current_budget`) that verifies declared sources cover declared sinks, plus a warning (`erc.current_budget.undeclared`) for nets with no declared or inferable current once a design uses current declarations.
+- Added a `signal` net field and `io()` parameter declaring a net's switching/sensitivity class (`static`, `digital`, `clock`, `high_speed`, `switching_power`, `analog`, `rf`), with a new `SignalType` prelude enum. Net-level declarations override io()-level ones; conflicting io() declarations raise the `erc.signal_conflict` warning. Many stdlib interfaces now pre-declare classes on their nets (e.g. `Spi.CLK` is `clock`).
+- DiffPair-shaped interfaces now record pairing identity on their nets (`diff_pair_peer`, `diff_pair_role` properties), alongside the existing `differential_impedance`.
 - Added `pcb auth git configure` and `pcb auth git unconfigure` to manage host-specific global Git credential configuration for DiodeHub.
 - PCB now authenticates its own DiodeHub Git operations without requiring global Git configuration.
 

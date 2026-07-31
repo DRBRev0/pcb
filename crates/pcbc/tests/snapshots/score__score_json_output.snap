@@ -1,0 +1,557 @@
+---
+source: crates/pcbc/tests/score.rs
+expression: "serde_json::to_string_pretty(&report).unwrap()"
+---
+{
+  "board": {
+    "components": 2,
+    "copper_layers": 2,
+    "nets": 2,
+    "path": "<PATH>",
+    "sha256": "<SHA256>"
+  },
+  "categories": [
+    {
+      "id": "drc",
+      "label": "DRC hygiene",
+      "metrics": [
+        {
+          "applicable": false,
+          "id": "drc_warning_count",
+          "note": "DRC was not run (--skip-drc or kicad-cli unavailable)",
+          "weight": 1.0
+        },
+        {
+          "applicable": false,
+          "id": "drc_exclusion_count",
+          "note": "DRC was not run (--skip-drc or kicad-cli unavailable)",
+          "weight": 1.0
+        },
+        {
+          "applicable": false,
+          "id": "schematic_parity",
+          "note": "DRC was not run (--skip-drc or kicad-cli unavailable)",
+          "weight": 1.0
+        }
+      ],
+      "score": null,
+      "weight": 10.0
+    },
+    {
+      "id": "routing_efficiency",
+      "label": "Routing efficiency",
+      "metrics": [
+        {
+          "applicable": true,
+          "id": "detour_factor",
+          "normalized": 0.5594,
+          "raw": 1.8007,
+          "unit": "ratio",
+          "weight": 4.0,
+          "worst": [
+            {
+              "label": "P1",
+              "value": 1.8243
+            },
+            {
+              "label": "P2",
+              "value": 1.7771
+            }
+          ]
+        },
+        {
+          "applicable": true,
+          "id": "total_wire_length",
+          "normalized": 0.5594,
+          "raw": 10.8042,
+          "unit": "mm",
+          "weight": 2.0
+        },
+        {
+          "applicable": true,
+          "id": "via_count_per_net",
+          "normalized": 0.6065,
+          "raw": 1.0,
+          "unit": "count",
+          "weight": 3.0,
+          "worst": [
+            {
+              "label": "P1",
+              "value": 1.0
+            },
+            {
+              "label": "P2",
+              "value": 1.0
+            }
+          ]
+        },
+        {
+          "applicable": true,
+          "id": "unnecessary_layer_usage",
+          "normalized": 1.0,
+          "raw": 0.0,
+          "unit": "ratio",
+          "weight": 2.0
+        },
+        {
+          "applicable": true,
+          "id": "segment_fragmentation",
+          "normalized": 1.0,
+          "raw": 0.0,
+          "unit": "ratio",
+          "weight": 1.0
+        },
+        {
+          "applicable": true,
+          "id": "meander_score",
+          "normalized": 1.0,
+          "raw": 0.0,
+          "unit": "count",
+          "weight": 2.0
+        },
+        {
+          "applicable": true,
+          "id": "stub_length",
+          "normalized": 1.0,
+          "raw": 0.0,
+          "unit": "mm",
+          "weight": 2.0
+        },
+        {
+          "applicable": true,
+          "id": "routing_layer_balance",
+          "normalized": 0.9973,
+          "raw": 0.0027,
+          "unit": "gini",
+          "weight": 1.0
+        }
+      ],
+      "score": 0.7749,
+      "weight": 20.0
+    },
+    {
+      "id": "signal_integrity",
+      "label": "Signal integrity",
+      "metrics": [
+        {
+          "applicable": false,
+          "id": "impedance_compliance",
+          "note": "no single-ended impedance targets declared",
+          "weight": 4.0
+        },
+        {
+          "applicable": false,
+          "id": "diffpair_skew",
+          "note": "no differential pairs declared (DiffPair interfaces)",
+          "weight": 2.0
+        },
+        {
+          "applicable": false,
+          "id": "diffpair_gap_consistency",
+          "note": "no differential pairs declared (DiffPair interfaces)",
+          "weight": 2.0
+        },
+        {
+          "applicable": false,
+          "id": "diffpair_decoupled_length",
+          "note": "no differential pairs declared (DiffPair interfaces)",
+          "weight": 2.0
+        },
+        {
+          "applicable": false,
+          "id": "stub_length_hs",
+          "note": "no high-speed nets declared",
+          "weight": 2.0
+        },
+        {
+          "applicable": false,
+          "id": "via_stub_proxy",
+          "note": "needs high-speed nets and more than two copper layers",
+          "weight": 1.0
+        },
+        {
+          "applicable": false,
+          "id": "reference_plane_continuity",
+          "note": "no high-speed nets declared",
+          "weight": 3.0
+        },
+        {
+          "applicable": false,
+          "id": "reference_change_stitching",
+          "note": "no layer changes on high-speed nets",
+          "weight": 2.0
+        },
+        {
+          "applicable": false,
+          "id": "length_matching_groups",
+          "note": "no matched groups declared (requires a future `matched_group` declaration)",
+          "weight": 2.0
+        },
+        {
+          "applicable": false,
+          "id": "corner_discipline_hs",
+          "note": "no high-speed nets declared",
+          "weight": 1.0
+        }
+      ],
+      "score": null,
+      "weight": 20.0
+    },
+    {
+      "id": "crosstalk",
+      "label": "Crosstalk",
+      "metrics": [
+        {
+          "applicable": true,
+          "id": "three_w_compliance",
+          "normalized": 1.0,
+          "note": "no parallel adjacencies found",
+          "raw": 1.0,
+          "unit": "ratio",
+          "weight": 3.0
+        },
+        {
+          "applicable": false,
+          "id": "parallel_coupling",
+          "note": "no aggressor/victim pairs declared (`signal` classes)",
+          "weight": 2.0
+        },
+        {
+          "applicable": false,
+          "id": "broadside_coupling",
+          "note": "no aggressor/victim pairs declared (`signal` classes)",
+          "weight": 2.0
+        },
+        {
+          "applicable": false,
+          "id": "sensitive_net_isolation",
+          "note": "no aggressor/victim pairs declared (`signal` classes)",
+          "weight": 2.0
+        },
+        {
+          "applicable": false,
+          "id": "crosstalk_hotspot_count",
+          "note": "no aggressor/victim pairs declared (`signal` classes)",
+          "weight": 2.0
+        }
+      ],
+      "score": 1.0,
+      "weight": 12.0
+    },
+    {
+      "id": "emi",
+      "label": "EMI / EMC",
+      "metrics": [
+        {
+          "applicable": false,
+          "id": "loop_area_proxy",
+          "note": "no high-speed nets declared",
+          "weight": 3.0
+        },
+        {
+          "applicable": false,
+          "id": "edge_clearance",
+          "note": "no board outline (Edge.Cuts) found",
+          "weight": 2.0
+        },
+        {
+          "applicable": false,
+          "id": "edge_stitching_density",
+          "note": "needs an outline and reference planes",
+          "weight": 1.0
+        },
+        {
+          "applicable": false,
+          "id": "stitching_via_density",
+          "note": "no high-speed nets declared",
+          "weight": 1.0
+        },
+        {
+          "applicable": false,
+          "id": "plane_slot_crossings",
+          "note": "needs high-speed nets and reference plane fills",
+          "weight": 2.0
+        },
+        {
+          "applicable": false,
+          "id": "outer_layer_hs_exposure",
+          "note": "two-layer board: no inner layers available",
+          "weight": 1.0
+        },
+        {
+          "applicable": false,
+          "id": "connector_shield_grounding",
+          "note": "no connectors declared (type=\"connector\")",
+          "weight": 1.0
+        }
+      ],
+      "score": null,
+      "weight": 10.0
+    },
+    {
+      "id": "power_integrity",
+      "label": "Power integrity",
+      "metrics": [
+        {
+          "applicable": false,
+          "id": "trace_current_capacity",
+          "note": "no io() current declarations on any net",
+          "weight": 4.0
+        },
+        {
+          "applicable": false,
+          "id": "current_budget_margin",
+          "note": "no net declares both source and sink currents",
+          "weight": 1.0
+        },
+        {
+          "applicable": false,
+          "id": "power_net_width_consistency",
+          "note": "no routed Power-kind nets",
+          "weight": 1.0
+        },
+        {
+          "applicable": false,
+          "id": "decoupling_loop",
+          "note": "no declared capacitors bridging Power and Ground",
+          "weight": 2.0
+        },
+        {
+          "applicable": false,
+          "id": "plane_coverage",
+          "note": "no board outline (Edge.Cuts) found",
+          "weight": 1.0
+        },
+        {
+          "applicable": false,
+          "id": "power_via_count",
+          "note": "no power nets crossing layers",
+          "weight": 1.0
+        },
+        {
+          "applicable": false,
+          "id": "power_gnd_plane_pairing",
+          "note": "two-layer board",
+          "weight": 1.0
+        }
+      ],
+      "score": null,
+      "weight": 10.0
+    },
+    {
+      "id": "esd",
+      "label": "ESD protection",
+      "metrics": [
+        {
+          "applicable": false,
+          "id": "tvs_proximity",
+          "note": "no TVS components declared (type=\"tvs\")",
+          "weight": 1.0
+        },
+        {
+          "applicable": false,
+          "id": "protection_topology",
+          "note": "no TVS components declared (type=\"tvs\")",
+          "weight": 1.0
+        },
+        {
+          "applicable": false,
+          "id": "esd_return_path",
+          "note": "no TVS components declared (type=\"tvs\")",
+          "weight": 1.0
+        },
+        {
+          "applicable": false,
+          "id": "unprotected_connector_lines",
+          "note": "no TVS components declared (type=\"tvs\")",
+          "weight": 1.0
+        },
+        {
+          "applicable": false,
+          "id": "guard_structures",
+          "note": "no TVS components declared (type=\"tvs\")",
+          "weight": 1.0
+        }
+      ],
+      "score": null,
+      "weight": 5.0
+    },
+    {
+      "id": "thermal",
+      "label": "Thermal",
+      "metrics": [
+        {
+          "applicable": false,
+          "id": "thermal_via_fill",
+          "note": "no exposed/thermal pads (large SMD pads) found",
+          "weight": 1.0
+        },
+        {
+          "applicable": false,
+          "id": "heat_spreading_layers",
+          "note": "no exposed/thermal pads (large SMD pads) found",
+          "weight": 1.0
+        }
+      ],
+      "score": null,
+      "weight": 4.0
+    },
+    {
+      "id": "dfm",
+      "label": "Manufacturability",
+      "metrics": [
+        {
+          "applicable": true,
+          "id": "annular_ring_margin",
+          "normalized": 1.0,
+          "raw": 0.15,
+          "unit": "mm",
+          "weight": 2.0
+        },
+        {
+          "applicable": true,
+          "id": "drill_margin",
+          "normalized": 1.0,
+          "raw": 0.3,
+          "unit": "mm",
+          "weight": 1.0
+        },
+        {
+          "applicable": false,
+          "id": "via_aspect_ratio",
+          "note": "board thickness unknown (no stackup)",
+          "weight": 1.0
+        },
+        {
+          "applicable": true,
+          "id": "via_in_pad",
+          "normalized": 1.0,
+          "raw": 0.0,
+          "unit": "count",
+          "weight": 1.0
+        },
+        {
+          "applicable": true,
+          "id": "min_track_width_margin",
+          "normalized": 1.0,
+          "raw": 0.2,
+          "unit": "mm",
+          "weight": 1.0
+        },
+        {
+          "applicable": true,
+          "id": "acid_traps",
+          "normalized": 1.0,
+          "raw": 0.0,
+          "unit": "count",
+          "weight": 1.0
+        }
+      ],
+      "score": 1.0,
+      "weight": 5.0
+    },
+    {
+      "id": "placement",
+      "label": "Placement",
+      "metrics": [
+        {
+          "applicable": true,
+          "id": "airwire_crossings",
+          "normalized": 1.0,
+          "raw": 0.0,
+          "unit": "count_per_net",
+          "weight": 2.0
+        },
+        {
+          "applicable": false,
+          "id": "connector_edge_placement",
+          "note": "no board outline (Edge.Cuts) found",
+          "weight": 1.0
+        },
+        {
+          "applicable": false,
+          "id": "component_density",
+          "note": "needs an outline and placed footprints",
+          "weight": 1.0
+        },
+        {
+          "applicable": true,
+          "id": "pin_density_hotspots",
+          "normalized": 1.0,
+          "raw": 3.0,
+          "unit": "pads_per_cm2_window",
+          "weight": 1.0
+        }
+      ],
+      "score": 1.0,
+      "weight": 2.0
+    },
+    {
+      "id": "aesthetics",
+      "label": "Aesthetics",
+      "metrics": [
+        {
+          "applicable": true,
+          "id": "angle_discipline",
+          "normalized": 1.0,
+          "raw": 1.0,
+          "unit": "ratio",
+          "weight": 2.0
+        },
+        {
+          "applicable": true,
+          "id": "width_consistency",
+          "normalized": 1.0,
+          "raw": 1.0,
+          "unit": "ratio",
+          "weight": 1.0
+        },
+        {
+          "applicable": true,
+          "id": "grid_adherence",
+          "normalized": 1.0,
+          "raw": 1.0,
+          "unit": "ratio",
+          "weight": 0.5
+        },
+        {
+          "applicable": true,
+          "id": "orphan_copper",
+          "normalized": 1.0,
+          "raw": 0.0,
+          "unit": "count",
+          "weight": 1.0
+        }
+      ],
+      "score": 1.0,
+      "weight": 2.0
+    }
+  ],
+  "fitness": 97.2549,
+  "gates": {
+    "connectivity": {
+      "connected_nets": 2,
+      "drc_unconnected_items": null,
+      "passed": true,
+      "ratio": 1.0,
+      "total_nets": 2
+    },
+    "drc_errors": {
+      "by_kind": {},
+      "count": 0,
+      "passed": true
+    },
+    "passed": true
+  },
+  "generator": {
+    "tool": "pcb-score",
+    "version": "0.4.13"
+  },
+  "inputs": {
+    "drc_ran": false,
+    "netlist_available": true
+  },
+  "quality": 89.0195,
+  "schema_version": 1,
+  "score": 89.0195
+}

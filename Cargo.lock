@@ -4943,6 +4943,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "pcb-score"
+version = "0.4.13"
+dependencies = [
+ "anyhow",
+ "pcb-kicad",
+ "pcb-sch",
+ "pcb-sexpr",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+]
+
+[[package]]
 name = "pcb-sexpr"
 version = "0.4.13"
 dependencies = [
@@ -5152,6 +5166,7 @@ dependencies = [
  "pcb-kicad",
  "pcb-layout",
  "pcb-sch",
+ "pcb-score",
  "pcb-sexpr",
  "pcb-sim",
  "pcb-test-utils",
