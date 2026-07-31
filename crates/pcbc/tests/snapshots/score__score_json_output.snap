@@ -184,7 +184,7 @@ expression: "serde_json::to_string_pretty(&report).unwrap()"
         {
           "applicable": false,
           "id": "length_matching_groups",
-          "note": "no matched groups declared (requires a future `matched_group` declaration)",
+          "note": "no matched groups declared (io(..., matched_group=...))",
           "weight": 2.0
         },
         {
