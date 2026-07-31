@@ -205,8 +205,8 @@ fn solve_component(
 
 /// Run the DC inference and annotate `schematic` nets in place.
 pub fn annotate_static_currents(schematic: &mut Schematic) {
-    // Component -> distinct attached nets.
-    let mut component_nets: HashMap<InstanceRef, BTreeSet<String>> = HashMap::new();
+    // Component -> attached nets, with the number of pins on each net.
+    let mut component_nets: HashMap<InstanceRef, BTreeMap<String, usize>> = HashMap::new();
     for net in schematic.nets.values() {
         for port_ref in &net.ports {
             if port_ref.instance_path.len() < 2 {
@@ -216,10 +216,11 @@ pub fn annotate_static_currents(schematic: &mut Schematic) {
                 port_ref.module.clone(),
                 port_ref.instance_path[..port_ref.instance_path.len() - 1].to_vec(),
             );
-            component_nets
+            *component_nets
                 .entry(component_ref)
                 .or_default()
-                .insert(net.name.clone());
+                .entry(net.name.clone())
+                .or_default() += 1;
         }
     }
 
@@ -231,7 +232,7 @@ pub fn annotate_static_currents(schematic: &mut Schematic) {
     let mut opaque_nets: BTreeSet<String> = BTreeSet::new();
 
     // Stable iteration order for deterministic edge lists.
-    let mut component_list: Vec<(&InstanceRef, &BTreeSet<String>)> =
+    let mut component_list: Vec<(&InstanceRef, &BTreeMap<String, usize>)> =
         component_nets.iter().collect();
     component_list.sort_by_key(|(component_ref, _)| component_ref.instance_path.join("."));
     for (component_ref, nets) in component_list {
@@ -245,22 +246,31 @@ pub fn annotate_static_currents(schematic: &mut Schematic) {
         match model {
             Some(DcModel::Conductive(conductance)) if nets.len() == 2 => {
                 let mut it = nets.iter();
-                let net_a = it.next().unwrap().clone();
-                let net_b = it.next().unwrap().clone();
+                let (net_a, pins_a) = it.next().unwrap();
+                let (net_b, pins_b) = it.next().unwrap();
+                // A multi-element part bridging the same two nets (e.g. a
+                // resistor array wired in parallel) contributes one element
+                // per pin pair.
+                let elements = (*pins_a.min(pins_b)).max(1) as f64;
                 edges.push(DcEdge {
                     refdes: instance
                         .reference_designator
                         .clone()
                         .unwrap_or_else(|| component_ref.instance_path.join(".")),
-                    net_a,
-                    net_b,
-                    conductance,
+                    net_a: net_a.clone(),
+                    net_b: net_b.clone(),
+                    conductance: conductance * elements,
                 });
             }
-            Some(DcModel::Open) => capacitor_nets.extend(nets.iter().cloned()),
+            Some(DcModel::Open) => capacitor_nets.extend(nets.keys().cloned()),
+            // Conductive parts touching 3+ nets (resistor networks as a
+            // single component) have unknown internal pin pairing: opaque.
+            Some(DcModel::Conductive(_)) if nets.len() > 2 => {
+                opaque_nets.extend(nets.keys().cloned())
+            }
             // A passive shorting its own pins carries no inter-net current.
             Some(DcModel::Conductive(_)) => {}
-            None => opaque_nets.extend(nets.iter().cloned()),
+            None => opaque_nets.extend(nets.keys().cloned()),
         }
     }
 
