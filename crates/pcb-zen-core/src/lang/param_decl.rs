@@ -46,6 +46,7 @@ struct DeclArgs<'v> {
     sink_current: Option<Value<'v>>,
     source_current: Option<Value<'v>>,
     signal: Option<SignalType>,
+    matched_group: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -286,6 +287,7 @@ fn parse_decl_args<'v>(
     let mut sink_current = None;
     let mut source_current = None;
     let mut signal = None;
+    let mut matched_group = None;
 
     for (arg_name, value) in args.names_map()? {
         match arg_name.as_str() {
@@ -311,6 +313,9 @@ fn parse_decl_args<'v>(
             }
             "signal" if kind.allows_direction() => {
                 signal = SignalType::parse_optional(unpack_signal_str(value, function)?.as_deref())?
+            }
+            "matched_group" if kind.allows_direction() => {
+                matched_group = unpack_optional_string_arg(value, function, "matched_group")?
             }
             other => {
                 return Err(starlark::Error::new_other(anyhow::anyhow!(
@@ -367,6 +372,7 @@ fn parse_decl_args<'v>(
             sink_current,
             source_current,
             signal,
+            matched_group,
         },
     ))
 }
@@ -514,6 +520,7 @@ fn resolve_config<'v>(
             sink_current: None,
             source_current: None,
             signal: None,
+            matched_group: None,
             actual_value: value,
         },
         declaration_site,
@@ -542,10 +549,13 @@ fn resolve_io<'v>(
     // Current/signal declarations describe a single electrical connection, so
     // they are only meaningful on net-shaped io() parameters.
     if type_name != "NetType"
-        && (args.sink_current.is_some() || args.source_current.is_some() || args.signal.is_some())
+        && (args.sink_current.is_some()
+            || args.source_current.is_some()
+            || args.signal.is_some()
+            || args.matched_group.is_some())
     {
         return Err(anyhow::anyhow!(
-            "io() `sink_current`, `source_current` and `signal` are only supported on Net-typed io parameters, not interfaces."
+            "io() `sink_current`, `source_current`, `signal` and `matched_group` are only supported on Net-typed io parameters, not interfaces."
         )
         .into());
     }
@@ -608,6 +618,7 @@ fn resolve_io<'v>(
             sink_current: args.sink_current,
             source_current: args.source_current,
             signal: args.signal,
+            matched_group: args.matched_group.clone(),
             actual_value: value,
         },
         declaration_site,

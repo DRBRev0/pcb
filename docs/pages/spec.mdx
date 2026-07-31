@@ -198,7 +198,7 @@ GND = Ground()  # inferred from assignment; voltage defaults to 0V
 nc = NotConnected()
 ```
 
-`Net(name_or_net=None, voltage=None, impedance=None, signal=None)` accepts a
+`Net(name_or_net=None, voltage=None, impedance=None, signal=None, matched_group=None)` accepts a
 positional-only name string or existing net to cast. `Power` and `Ground` also
 accept `voltage`. `signal` declares the net's switching/sensitivity class
 (`SignalType` from the prelude, or one of the strings `"static"`, `"digital"`,
@@ -473,7 +473,7 @@ Declare a net or interface input for a module. This defines the module's electri
 
 `io`, `input`, and `output` are prelude symbols re-exported from `@stdlib/io.zen`. The low-level builtin is `builtin.io(...)`.
 
-**Signature:** `io(name, typ_or_template, checks=None, optional=False, help=None, direction=None, sink_current=None, source_current=None, signal=None)` or `io(typ_or_template, checks=None, optional=False, help=None, direction=None, sink_current=None, source_current=None, signal=None)`
+**Signature:** `io(name, typ_or_template, checks=None, optional=False, help=None, direction=None, sink_current=None, source_current=None, signal=None, matched_group=None)` or `io(typ_or_template, checks=None, optional=False, help=None, direction=None, sink_current=None, source_current=None, signal=None, matched_group=None)`
 
 - `name`: Optional explicit input name (conventionally UPPERCASE). If omitted, `io()` must be assigned to a top-level variable and that variable name is used.
 - `typ_or_template`: A net type (`Net`, `Power`, `Ground`, etc.), an interface factory (`Spi`, `Uart`, etc.), a net template value, or an interface template value.
@@ -485,6 +485,7 @@ Declare a net or interface input for a module. This defines the module's electri
 - `sink_current`: Optional maximum current this module draws through the connection (e.g. `"300mA"` or `Current("300mA")`). Net-typed io only.
 - `source_current`: Optional maximum current this module can supply through the connection. Net-typed io only.
 - `signal`: Optional switching/sensitivity class this module emits on the connection, one of `"static"`, `"digital"`, `"clock"`, `"high_speed"`, `"switching_power"`, `"analog"`, `"rf"`. Most meaningful with `direction="output"`. Net-typed io only.
+- `matched_group`: Optional length-matching group name. Nets whose routed lengths must match (bus lanes, memory byte groups) declare the same group string; layout scoring reports the worst intra-group skew. A net belongs to at most one group — an explicit `Net(..., matched_group=...)` wins over io() declarations, and conflicting io() declarations are surfaced as a `matched_group_conflict` net property instead of picking one. Net-typed io only.
 
 ```python
 VCC = io(Power)

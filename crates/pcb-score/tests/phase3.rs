@@ -270,3 +270,137 @@ fn deterministic_full_report() {
     let b = serde_json::to_string(&score(&emi_board(10.0), &emi_netlist())).unwrap();
     assert_eq!(a, b);
 }
+
+/// Length-matched pair: two nets in group "lane0", one deliberately longer.
+fn matched_board(extra: f64) -> String {
+    let end = 10.0 + extra;
+    format!(
+        r#"(kicad_pcb
+  (layers (0 "F.Cu" signal) (2 "B.Cu" signal))
+  (net 0 "")
+  (net 1 "D0")
+  (net 2 "D1")
+  (footprint "lib:A" (layer "F.Cu") (at 0 0)
+    (pad "1" smd rect (at 0 0) (size 0.3 0.3) (layers "F.Cu") (net 1 "D0"))
+    (pad "2" smd rect (at 0 2) (size 0.3 0.3) (layers "F.Cu") (net 2 "D1")))
+  (footprint "lib:B" (layer "F.Cu") (at 10 0)
+    (pad "1" smd rect (at 0 0) (size 0.3 0.3) (layers "F.Cu") (net 1 "D0"))
+    (pad "2" smd rect (at {end} 2) (size 0.3 0.3) (layers "F.Cu") (net 2 "D1")))
+  (segment (start 0 0) (end 10 0) (width 0.2) (layer "F.Cu") (net 1))
+  (segment (start 0 2) (end {end} 2) (width 0.2) (layer "F.Cu") (net 2))
+)"#
+    )
+}
+
+fn matched_netlist() -> Schematic {
+    let group = ("matched_group", AttributeValue::String("lane0".to_string()));
+    let mut sch = Schematic::new();
+    sch.add_net(net("Net", 1, "D0", &[group.clone()]));
+    sch.add_net(net("Net", 2, "D1", &[group]));
+    sch
+}
+
+#[test]
+fn length_matching_groups_measures_group_skew() {
+    let matched = score(&matched_board(0.0), &matched_netlist());
+    let skewed = score(&matched_board(3.0), &matched_netlist());
+
+    let m = metric(&matched, "signal_integrity", "length_matching_groups");
+    let s = metric(&skewed, "signal_integrity", "length_matching_groups");
+    assert!(m.applicable && s.applicable);
+    assert!(m.raw.unwrap() < 0.01);
+    assert!((s.raw.unwrap() - 3.0).abs() < 0.01);
+    assert!(m.normalized.unwrap() > s.normalized.unwrap());
+    assert_eq!(s.worst[0].label, "lane0");
+
+    // Without declarations the metric stays out of the score.
+    let mut undeclared = Schematic::new();
+    undeclared.add_net(net("Net", 1, "D0", &[]));
+    undeclared.add_net(net("Net", 2, "D1", &[]));
+    let report = score(&matched_board(3.0), &undeclared);
+    assert!(!metric(&report, "signal_integrity", "length_matching_groups").applicable);
+}
+
+/// T-topology: source U1 feeds a heavy sink U2 over a wide trunk and a light
+/// sink U3 over a thin branch. Per-branch flow must accept the thin branch
+/// (it only carries 0.2A); the old net-total model would reject it.
+fn tee_board() -> &'static str {
+    r#"(kicad_pcb
+  (layers (0 "F.Cu" signal) (2 "B.Cu" signal))
+  (net 0 "")
+  (net 1 "V5")
+  (net 2 "GNDX")
+  (footprint "lib:SRC" (layer "F.Cu") (at 0 0)
+    (property "Reference" "U1" (at 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net 1 "V5")))
+  (footprint "lib:BIG" (layer "F.Cu") (at 20 0)
+    (property "Reference" "U2" (at 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net 1 "V5")))
+  (footprint "lib:SMALL" (layer "F.Cu") (at 0 10)
+    (property "Reference" "U3" (at 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net 1 "V5")))
+  (segment (start 0 0) (end 20 0) (width 2.0) (layer "F.Cu") (net 1))
+  (segment (start 0 0) (end 0 10) (width 0.25) (layer "F.Cu") (net 1))
+)"#
+}
+
+fn tee_netlist() -> Schematic {
+    use serde_json::json;
+    let module = ModuleRef::new("test.zen", "root");
+    let mut sch = Schematic::new();
+
+    let mut ports = Vec::new();
+    for (path, refdes) in [
+        (vec!["src", "U1"], "U1"),
+        (vec!["big", "U2"], "U2"),
+        (vec!["small", "U3"], "U3"),
+    ] {
+        let path: Vec<String> = path.into_iter().map(str::to_string).collect();
+        let component_ref = InstanceRef::new(module.clone(), path.clone());
+        let mut instance = Instance::component(module.clone());
+        instance.set_reference_designator(refdes);
+        sch.add_instance(component_ref.clone(), instance);
+        ports.push(component_ref.append("1".to_string()));
+    }
+
+    let current_ports = json!([
+        {"port": "big.VIN", "role": "sink", "amps": 1.8},
+        {"port": "small.VIN", "role": "sink", "amps": 0.2},
+        {"port": "src.VOUT", "role": "source", "amps": 2.0},
+    ]);
+    let mut v5 = net(
+        "Power",
+        1,
+        "V5",
+        &[
+            (
+                "current_sink_total",
+                AttributeValue::String("2A".to_string()),
+            ),
+            (
+                "current_source_total",
+                AttributeValue::String("2A".to_string()),
+            ),
+            ("current_ports", AttributeValue::Json(current_ports)),
+        ],
+    );
+    v5.ports = ports;
+    sch.add_net(v5);
+    sch.add_net(net("Ground", 2, "GNDX", &[]));
+    sch
+}
+
+#[test]
+fn per_branch_flow_accepts_thin_light_branch() {
+    let report = score(tee_board(), &tee_netlist());
+    let cap = metric(&report, "power_integrity", "trace_current_capacity");
+    assert!(cap.applicable);
+    assert!(
+        cap.note.as_deref().unwrap_or("").contains("per-branch"),
+        "flow model used, got note {:?}",
+        cap.note
+    );
+    // 0.25mm carries only 0.2A (needs ~0.1mm) and the 2mm trunk carries
+    // 1.8-2A (needs ~1.6mm): both fine, unlike net-total-vs-narrowest.
+    assert!(cap.raw.unwrap() >= 1.0, "worst ratio {:?}", cap.raw);
+}

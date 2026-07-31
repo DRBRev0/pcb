@@ -301,6 +301,8 @@ pub struct ParameterMetadataGen<V: ValueLifetimeless> {
     pub source_current: Option<V>,
     /// Declared switching/sensitivity class emitted on this io() connection.
     pub signal: Option<SignalType>,
+    /// Length-matching group this io() connection belongs to, if declared.
+    pub matched_group: Option<String>,
     /// The actual value returned by io() or config()
     pub actual_value: Option<V>,
     /// Source span for the `io()`/`config()` declaration when available.
@@ -353,6 +355,7 @@ impl<'v, V: ValueLike<'v>> ParameterMetadataGen<V> {
             sink_current: None,
             source_current: None,
             signal: None,
+            matched_group: None,
             actual_value: None,
             declaration_span,
             declaration_call_stack,
@@ -400,6 +403,7 @@ pub(crate) struct ParameterMetadataInput<'v> {
     pub(crate) sink_current: Option<Value<'v>>,
     pub(crate) source_current: Option<Value<'v>>,
     pub(crate) signal: Option<SignalType>,
+    pub(crate) matched_group: Option<String>,
     pub(crate) actual_value: Value<'v>,
 }
 
@@ -435,6 +439,7 @@ pub(crate) fn record_parameter_metadata<'v>(
             metadata.sink_current,
             metadata.source_current,
             metadata.signal,
+            metadata.matched_group.clone(),
             Some(metadata.actual_value),
             declaration_site.span,
             declaration_site.call_stack.clone(),
@@ -702,6 +707,7 @@ impl<'v, V: ValueLike<'v>> ModuleValueGen<V> {
         sink_current: Option<V>,
         source_current: Option<V>,
         signal: Option<SignalType>,
+        matched_group: Option<String>,
         actual_value: Option<V>,
         declaration_span: Option<ResolvedSpan>,
         declaration_call_stack: starlark::eval::CallStack,
@@ -723,6 +729,7 @@ impl<'v, V: ValueLike<'v>> ModuleValueGen<V> {
             param.sink_current = sink_current;
             param.source_current = source_current;
             param.signal = signal;
+            param.matched_group = matched_group;
             param.actual_value = actual_value;
             self.signature.push(param);
         }

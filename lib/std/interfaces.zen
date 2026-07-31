@@ -19,6 +19,7 @@ Net = builtin.net_type(
     voltage=field(Voltage | None, default=None),
     impedance=field(Impedance | None, default=None),
     signal=field(SignalType | str | None, default=None),
+    matched_group=field(str | None, default=None),
 )
 
 Power = builtin.net_type(

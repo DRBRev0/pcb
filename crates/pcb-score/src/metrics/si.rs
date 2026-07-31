@@ -521,12 +521,70 @@ impl ScorePass for SiPass {
             }
         }
 
-        // length_matching_groups: needs an explicit declaration mechanism.
-        metrics.push(MetricResult::not_applicable(
-            "length_matching_groups",
-            2.0,
-            "no matched groups declared (requires a future `matched_group` declaration)",
-        ));
+        // length_matching_groups: routed-length spread within each declared
+        // `matched_group` (worst max-min skew across groups).
+        {
+            let mut groups: BTreeMap<&str, Vec<(&str, f64)>> = BTreeMap::new();
+            for (&id, name) in &ctx.board.nets {
+                if let Some(group) = classes
+                    .get(name)
+                    .and_then(|info| info.matched_group.as_deref())
+                {
+                    groups
+                        .entry(group)
+                        .or_default()
+                        .push((name.as_str(), routed_length(ctx, id)));
+                }
+            }
+            groups.retain(|_, nets| nets.len() >= 2);
+            if groups.is_empty() {
+                metrics.push(MetricResult::not_applicable(
+                    "length_matching_groups",
+                    2.0,
+                    "no matched groups declared (io(..., matched_group=...))",
+                ));
+            } else {
+                let mut worst_skew = 0.0f64;
+                let mut worst = Vec::new();
+                for (group, nets) in &groups {
+                    let routed: Vec<f64> = nets
+                        .iter()
+                        .map(|(_, len)| *len)
+                        .filter(|len| *len > 1e-9)
+                        .collect();
+                    if routed.len() < 2 {
+                        // Group not routed yet; the connectivity gate covers it.
+                        continue;
+                    }
+                    let max = routed.iter().cloned().fold(0.0f64, f64::max);
+                    let min = routed.iter().cloned().fold(f64::INFINITY, f64::min);
+                    let skew = max - min;
+                    worst_skew = worst_skew.max(skew);
+                    worst.push(WorstEntry {
+                        label: (*group).to_string(),
+                        value: skew,
+                    });
+                }
+                if worst.is_empty() {
+                    metrics.push(MetricResult::not_applicable(
+                        "length_matching_groups",
+                        2.0,
+                        "declared matched groups have no routed nets yet",
+                    ));
+                } else {
+                    metrics.push(
+                        MetricResult::new(
+                            "length_matching_groups",
+                            worst_skew,
+                            "mm",
+                            norm::decay(worst_skew, 2.0),
+                            2.0,
+                        )
+                        .with_worst(worst, true),
+                    );
+                }
+            }
+        }
 
         // corner_discipline_hs: right-angle corners on high-speed nets.
         if hs_nets.is_empty() {

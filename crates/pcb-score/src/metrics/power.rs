@@ -89,9 +89,11 @@ impl ScorePass for PowerPass {
             })
             .collect();
 
-        // trace_current_capacity: min track width per current-carrying net vs
-        // the IPC-2152 requirement for the net's total declared current.
-        // Conservative: branch segments carry less than the total.
+        // trace_current_capacity: every segment vs the IPC-2152 width its
+        // current requires. Preferred model: per-branch electrical flow
+        // solved from the declared per-port currents (`current_ports`).
+        // Fallback when a net's ports cannot be mapped onto pads (or the
+        // graph is unsolvable): conservative net-total vs narrowest segment.
         if current_nets.is_empty() {
             metrics.push(MetricResult::not_applicable(
                 "trace_current_capacity",
@@ -101,32 +103,75 @@ impl ScorePass for PowerPass {
         } else {
             let mut worst_ratio = f64::INFINITY;
             let mut worst = Vec::new();
-            let mut any = false;
+            let mut flow_nets = 0usize;
+            let mut fallback_nets = 0usize;
             for (id, name, amps) in &current_nets {
-                let tracks: Vec<&crate::board::Track> =
-                    ctx.board.tracks.iter().filter(|t| t.net == *id).collect();
+                let tracks: Vec<(usize, &crate::board::Track)> = ctx
+                    .board
+                    .tracks
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| t.net == *id)
+                    .collect();
                 let has_zone = ctx.net_stats.get(id).map(|s| s.has_zone).unwrap_or(false);
                 if tracks.is_empty() || has_zone {
                     // Plane-fed nets are judged by plane_coverage instead.
                     continue;
                 }
-                any = true;
-                let min_width = tracks.iter().map(|t| t.width).fold(f64::INFINITY, f64::min);
-                let layer = &tracks
-                    .iter()
-                    .min_by(|a, b| {
-                        a.width
-                            .partial_cmp(&b.width)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .unwrap()
-                    .layer;
-                let required = required_width_mm(*amps, copper_t(layer));
-                let ratio = if required <= 1e-9 {
-                    1.0
-                } else {
-                    min_width / required
+
+                let ports = classes
+                    .get(*name)
+                    .map(|info| info.current_ports.as_slice())
+                    .unwrap_or(&[]);
+                let flow = ctx.netlist.and_then(|schematic| {
+                    crate::flow::per_track_currents(ctx.board, schematic, *id, name, ports)
+                });
+
+                let ratio = match flow {
+                    Some(track_amps) => {
+                        flow_nets += 1;
+                        let mut net_ratio = f64::INFINITY;
+                        for (idx, track) in &tracks {
+                            let segment_amps = track_amps.get(idx).copied().unwrap_or_default();
+                            if segment_amps < 1e-3 {
+                                continue;
+                            }
+                            let required = required_width_mm(segment_amps, copper_t(&track.layer));
+                            if required > 1e-9 {
+                                net_ratio = net_ratio.min(track.width / required);
+                            }
+                        }
+                        if net_ratio.is_finite() {
+                            Some(net_ratio)
+                        } else {
+                            None
+                        }
+                    }
+                    None => {
+                        fallback_nets += 1;
+                        let min_width = tracks
+                            .iter()
+                            .map(|(_, t)| t.width)
+                            .fold(f64::INFINITY, f64::min);
+                        let layer = &tracks
+                            .iter()
+                            .min_by(|a, b| {
+                                a.1.width
+                                    .partial_cmp(&b.1.width)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            })
+                            .unwrap()
+                            .1
+                            .layer;
+                        let required = required_width_mm(*amps, copper_t(layer));
+                        if required > 1e-9 {
+                            Some(min_width / required)
+                        } else {
+                            None
+                        }
+                    }
                 };
+                let Some(ratio) = ratio else { continue };
                 worst_ratio = worst_ratio.min(ratio);
                 if ratio < 1.5 {
                     worst.push(WorstEntry {
@@ -135,7 +180,17 @@ impl ScorePass for PowerPass {
                     });
                 }
             }
-            if any {
+            if worst_ratio.is_finite() {
+                let note = if fallback_nets == 0 {
+                    "per-branch electrical flow vs IPC-2152 required width".to_string()
+                } else if flow_nets == 0 {
+                    "net-total current vs narrowest segment (ports not mappable to pads)"
+                        .to_string()
+                } else {
+                    format!(
+                        "per-branch flow on {flow_nets} net(s); conservative net-total fallback on {fallback_nets}"
+                    )
+                };
                 metrics.push(
                     MetricResult::new(
                         "trace_current_capacity",
@@ -145,9 +200,7 @@ impl ScorePass for PowerPass {
                         4.0,
                     )
                     .with_worst(worst, false)
-                    .with_note(
-                        "net-total current vs narrowest segment (per-branch flow analysis planned)",
-                    ),
+                    .with_note(note),
                 );
             } else {
                 metrics.push(MetricResult::not_applicable(
@@ -163,7 +216,9 @@ impl ScorePass for PowerPass {
         {
             let budgets: Vec<(&str, f64)> = ctx
                 .board
-                .nets.values().filter_map(|name| {
+                .nets
+                .values()
+                .filter_map(|name| {
                     let info = classes.get(name)?;
                     let sink = info.sink_total_amps?;
                     let source = info.source_total_amps?;

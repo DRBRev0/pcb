@@ -327,3 +327,60 @@ Load(name="L2", VIN=vbus, GND=gnd)
     assert_eq!(ports[2]["role"], "source");
     assert_eq!(ports[2]["amps"], 1.0);
 }
+
+#[test]
+fn test_matched_group_propagates_to_netlist() {
+    let full_output = Sandbox::new()
+        .with_workspace()
+        .write(
+            "pair.zen",
+            r#"
+Resistor = Module("@stdlib/generics/Resistor.zen")
+
+A = io(Net, matched_group="lane0")
+B = io(Net, matched_group="lane0")
+
+Resistor(name="R1", value="22Ohm", package="0402", P1=A, P2=B)
+"#,
+        )
+        .write(
+            "board.zen",
+            r#"
+Pair = Module("./pair.zen")
+
+d0 = Net("D0")
+d1 = Net("D1")
+d2 = Net("D2", matched_group="lane1")
+d3 = Net("D3")
+
+Pair(name="P", A=d0, B=d1)
+Pair(name="P2", A=d2, B=d3)
+"#,
+        )
+        .run("pcbc", ["build", "board.zen", "--netlist"])
+        .stdout_capture()
+        .stderr_capture()
+        .read()
+        .expect("build --netlist should succeed");
+
+    let json_start = full_output.find('{').expect("JSON in netlist output");
+    let netlist: serde_json::Value =
+        serde_json::from_str(&full_output[json_start..]).expect("netlist output should be JSON");
+    let nets = netlist["nets"].as_object().expect("nets object");
+    for net_name in ["D0", "D1"] {
+        let (_, net) = nets
+            .iter()
+            .find(|(name, _)| name.contains(net_name))
+            .unwrap_or_else(|| panic!("{net_name} present"));
+        assert_eq!(
+            net["properties"]["matched_group"]["String"], "lane0",
+            "io()-declared group lands on {net_name}"
+        );
+    }
+    // The net-level declaration wins over the io()-declared group.
+    let (_, d2) = nets
+        .iter()
+        .find(|(name, _)| name.contains("D2"))
+        .expect("D2");
+    assert_eq!(d2["properties"]["matched_group"]["String"], "lane1");
+}

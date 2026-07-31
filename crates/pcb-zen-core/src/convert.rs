@@ -1189,6 +1189,7 @@ fn propagate_io_attributes(
         sinks: Vec<(String, Decimal)>,
         sources: Vec<(String, Decimal)>,
         signals: Vec<String>,
+        matched_groups: Vec<String>,
     }
 
     let mut aggregates: HashMap<NetId, NetIoAgg> = HashMap::new();
@@ -1198,6 +1199,7 @@ fn propagate_io_attributes(
             if param.sink_current.is_none()
                 && param.source_current.is_none()
                 && param.signal.is_none()
+                && param.matched_group.is_none()
             {
                 continue;
             }
@@ -1228,6 +1230,9 @@ fn propagate_io_attributes(
                 }
                 if let Some(signal) = param.signal {
                     agg.signals.push(signal.as_str().to_string());
+                }
+                if let Some(group) = &param.matched_group {
+                    agg.matched_groups.push(group.clone());
                 }
             }
         }
@@ -1281,6 +1286,26 @@ fn propagate_io_attributes(
                 "current_ports".to_string(),
                 AttributeValue::Json(JsonValue::Array(ports_json)),
             );
+        }
+
+        if !agg.matched_groups.is_empty() && !info.properties.contains_key("matched_group") {
+            // A net-level `matched_group` declaration wins over io() ones. A
+            // net can only belong to one group; conflicting declarations are
+            // surfaced instead of picking one arbitrarily.
+            let mut unique: Vec<String> = agg.matched_groups.clone();
+            unique.sort();
+            unique.dedup();
+            if unique.len() == 1 {
+                info.properties.insert(
+                    "matched_group".to_string(),
+                    AttributeValue::String(unique.into_iter().next().unwrap()),
+                );
+            } else {
+                info.properties.insert(
+                    "matched_group_conflict".to_string(),
+                    AttributeValue::Array(unique.into_iter().map(AttributeValue::String).collect()),
+                );
+            }
         }
 
         if !agg.signals.is_empty() {

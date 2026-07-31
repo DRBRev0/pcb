@@ -7,6 +7,7 @@
 
 pub mod board;
 pub mod classify;
+pub mod flow;
 pub mod impedance;
 pub mod metrics;
 pub mod model;

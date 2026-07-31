@@ -82,6 +82,8 @@ pub struct NetInfo {
     pub sink_total_amps: Option<f64>,
     pub source_total_amps: Option<f64>,
     pub current_ports: Vec<PortCurrent>,
+    /// Length-matching group this net belongs to, if declared.
+    pub matched_group: Option<String>,
 }
 
 impl NetInfo {
@@ -149,6 +151,7 @@ pub fn classify_nets(schematic: &Schematic) -> BTreeMap<String, NetInfo> {
                     }
                 }
                 "diff_pair_role" => info.diff_pair_role = value.string().map(str::to_string),
+                "matched_group" => info.matched_group = value.string().map(str::to_string),
                 "current_sink_total" => info.sink_total_amps = physical_amps(value),
                 "current_source_total" => info.source_total_amps = physical_amps(value),
                 "current_ports" => {

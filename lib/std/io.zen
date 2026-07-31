@@ -11,16 +11,17 @@ def input(
     sink_current=None,
     source_current=None,
     signal=None,
+    matched_group=None,
 ):
     name = name_or_typ if typ != None else None
     typ = typ if typ != None else name_or_typ
     if name != None:
         if checks != None:
-            return io(name, typ, checks, default=default, optional=optional, help=help, direction="input", sink_current=sink_current, source_current=source_current, signal=signal)
-        return io(name, typ, default=default, optional=optional, help=help, direction="input", sink_current=sink_current, source_current=source_current, signal=signal)
+            return io(name, typ, checks, default=default, optional=optional, help=help, direction="input", sink_current=sink_current, source_current=source_current, signal=signal, matched_group=matched_group)
+        return io(name, typ, default=default, optional=optional, help=help, direction="input", sink_current=sink_current, source_current=source_current, signal=signal, matched_group=matched_group)
     if checks != None:
-        return io(typ, checks, default=default, optional=optional, help=help, direction="input", sink_current=sink_current, source_current=source_current, signal=signal)
-    return io(typ, default=default, optional=optional, help=help, direction="input", sink_current=sink_current, source_current=source_current, signal=signal)
+        return io(typ, checks, default=default, optional=optional, help=help, direction="input", sink_current=sink_current, source_current=source_current, signal=signal, matched_group=matched_group)
+    return io(typ, default=default, optional=optional, help=help, direction="input", sink_current=sink_current, source_current=source_current, signal=signal, matched_group=matched_group)
 
 
 def output(
@@ -33,13 +34,14 @@ def output(
     sink_current=None,
     source_current=None,
     signal=None,
+    matched_group=None,
 ):
     name = name_or_typ if typ != None else None
     typ = typ if typ != None else name_or_typ
     if name != None:
         if checks != None:
-            return io(name, typ, checks, default=default, optional=optional, help=help, direction="output", sink_current=sink_current, source_current=source_current, signal=signal)
-        return io(name, typ, default=default, optional=optional, help=help, direction="output", sink_current=sink_current, source_current=source_current, signal=signal)
+            return io(name, typ, checks, default=default, optional=optional, help=help, direction="output", sink_current=sink_current, source_current=source_current, signal=signal, matched_group=matched_group)
+        return io(name, typ, default=default, optional=optional, help=help, direction="output", sink_current=sink_current, source_current=source_current, signal=signal, matched_group=matched_group)
     if checks != None:
-        return io(typ, checks, default=default, optional=optional, help=help, direction="output", sink_current=sink_current, source_current=source_current, signal=signal)
-    return io(typ, default=default, optional=optional, help=help, direction="output", sink_current=sink_current, source_current=source_current, signal=signal)
+        return io(typ, checks, default=default, optional=optional, help=help, direction="output", sink_current=sink_current, source_current=source_current, signal=signal, matched_group=matched_group)
+    return io(typ, default=default, optional=optional, help=help, direction="output", sink_current=sink_current, source_current=source_current, signal=signal, matched_group=matched_group)

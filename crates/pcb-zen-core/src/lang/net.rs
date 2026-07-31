@@ -91,7 +91,7 @@ pub fn generate_net_id() -> NetId {
 
 fn builtin_optional_net_fields(type_name: &str) -> &'static [&'static str] {
     match type_name {
-        "Net" => &["voltage", "impedance", "signal"],
+        "Net" => &["voltage", "impedance", "signal", "matched_group"],
         "Power" => &["voltage"],
         _ => &[],
     }
