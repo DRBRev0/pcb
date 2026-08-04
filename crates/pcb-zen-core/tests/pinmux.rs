@@ -590,6 +590,149 @@ Mcu(name = "M1", IO0 = at(Net("LED"), "PA10"))
 }
 
 #[test]
+fn duplicate_uses_rejected() {
+    let result = eval_with_fixtures(
+        r#"
+load("./stm32.zen", "PERIPHS")
+load("./ifaces.zen", "Uart")
+
+pin_solve(PERIPHS, [pin_request("X", Uart, uses = ["TX", "TX"])])
+"#,
+    );
+    assert_fails_with(&result, "duplicate signal");
+}
+
+#[test]
+fn raw_pin_dict_with_reserved_data_key_rejected() {
+    let result = eval_with_fixtures(
+        r#"
+load("./ifaces.zen", "Gpio")
+
+forged = {"kind": "pin", "name": "X1", "data": {"pin": "LIE"}, "cost": 0, "input_only": False, "strap": False}
+P = peripheral("P", provides = [Gpio], rebind = "fixed", signals = {"PIN": [forged]})
+pin_solve([P], [pin_request("R", Gpio)])
+"#,
+    );
+    assert_fails_with(&result, "reserved");
+}
+
+#[test]
+fn exclusivity_spans_solves_in_one_module() {
+    let result = eval_with_fixtures(
+        r#"
+load("./ifaces.zen", "Gpio")
+
+P = peripheral("P", provides = [Gpio], rebind = "fixed", signals = {"PIN": [pin("X1")]})
+pin_solve([P], [pin_request("A", Gpio)])
+pin_solve([P], [pin_request("B", Gpio)])
+"#,
+    );
+    assert_fails_with(&result, "already claimed by an earlier pin_solve");
+
+    let result = eval_with_fixtures(
+        r#"
+load("./ifaces.zen", "Gpio")
+
+POOL = pool("GPIO", provides = [Gpio], pins = ["X1", "X2", "X3"])
+r1 = pin_solve(POOL, [pin_request("A", Gpio)])
+r2 = pin_solve(POOL, [pin_request("B", Gpio)])
+p1 = r1["assignment"]["A"]["signals"]["PIN"]["pin"]
+p2 = r2["assignment"]["B"]["signals"]["PIN"]["pin"]
+check(p1 != p2, "second solve must avoid the claimed pin, got " + p1 + " twice")
+"#,
+    );
+    assert_ok(&result);
+}
+
+#[test]
+fn misused_previous_warns() {
+    let result = eval_with_fixtures(
+        r#"
+load("./stm32.zen", "PERIPHS")
+load("./ifaces.zen", "Uart")
+
+r1 = pin_solve(PERIPHS, [pin_request("DEBUG", Uart)])
+pin_solve(PERIPHS, [pin_request("DEBUG", Uart)], previous = r1)
+"#,
+    );
+    assert_ok(&result);
+    let text = diag_text(&result);
+    assert!(
+        text.contains("no usable assignment entry"),
+        "expected a previous= misuse warning, got:\n{text}"
+    );
+}
+
+#[test]
+fn conflicting_attr_dims_rejected() {
+    let result = eval_with_fixtures(
+        r#"
+load("./ifaces.zen", "Frequency")
+
+A = interface(X = Net, attrs = {"m": Frequency})
+B = interface(Y = Net, attrs = {"m": builtin.Time})
+
+peripheral("P", provides = [A, B], rebind = "fixed",
+    signals = {"X": [pin("P1")], "Y": [pin("P2")]})
+"#,
+    );
+    assert_fails_with(&result, "conflicting dimensions");
+}
+
+#[test]
+fn two_solves_merge_into_the_module_properties() {
+    let result = eval_with_fixtures(
+        r#"
+load("./stm32.zen", "PERIPHS")
+load("./ifaces.zen", "Uart", "Gpio")
+
+pin_solve(PERIPHS, [pin_request("DEBUG", Uart)])
+pin_solve(PERIPHS, [pin_request("LED", Gpio)])
+"#,
+    );
+    assert_ok(&result);
+    let props = result.output.as_ref().unwrap().sch_module.properties();
+    let assignment = format!("{:?}", props.get("pin_assignment"));
+    assert!(
+        assignment.contains("DEBUG") && assignment.contains("LED"),
+        "both solves must reach the property, got:\n{assignment}"
+    );
+}
+
+#[test]
+fn unconsumed_at_failure_keeps_module_warnings() {
+    let result = eval_zen(vec![
+        ("/ifaces.zen".to_string(), IFACES.to_string()),
+        ("/esp32c3.zen".to_string(), ESP32C3.to_string()),
+        (
+            "/mcu.zen".to_string(),
+            r#"
+load("./esp32c3.zen", "PERIPHS")
+load("./ifaces.zen", "Gpio")
+
+IO0 = io(Net, optional = True)
+pin_solve(PERIPHS, [pin_request("BOOT_BTN", Gpio, prefer = ["GPIO9"], lock = True)])
+"#
+            .to_string(),
+        ),
+        (
+            "/test.zen".to_string(),
+            r#"
+Mcu = Module("/mcu.zen")
+Mcu(name = "M1", IO0 = at(Net("LED"), "GPIO4"))
+"#
+            .to_string(),
+        ),
+    ]);
+    assert_fails_with(&result, "never consumed");
+    let text = diag_text(&result);
+    assert!(
+        text.contains("strapping pin"),
+        "module warnings must survive the failure, got:\n{text}"
+    );
+}
+
+#[test]
 fn unconsumed_hard_at_fails_the_build() {
     let result = eval_zen(vec![
         ("/ifaces.zen".to_string(), IFACES.to_string()),

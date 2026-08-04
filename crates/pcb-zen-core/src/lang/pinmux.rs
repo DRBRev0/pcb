@@ -199,6 +199,11 @@ fn parse_rpin<'v>(v: Value<'v>, heap: Heap<'v>, ctx: &str) -> anyhow::Result<RPi
             let key = k
                 .unpack_str()
                 .ok_or_else(|| anyhow::anyhow!("{ctx}: pin() data keys must be strings"))?;
+            if key == "pin" {
+                return Err(anyhow::anyhow!(
+                    "{ctx}: pin() data key `pin` is reserved (it names the pin itself in the assignment)"
+                ));
+            }
             let json = val
                 .to_json()
                 .ok()
@@ -310,12 +315,24 @@ fn parse_rreq<'v>(v: Value<'v>, heap: Heap<'v>) -> anyhow::Result<RReq<'v>> {
             "request `{name}`: uses must name at least one signal"
         ));
     }
+    let mut seen_uses = HashSet::new();
+    for s in &uses {
+        if !seen_uses.insert(s.as_str()) {
+            return Err(anyhow::anyhow!(
+                "request `{name}`: duplicate signal `{s}` in uses"
+            ));
+        }
+    }
     let prefer = match dict_get(&d, heap, "prefer") {
         Some(p) if !p.is_none() => ListRef::from_value(p)
             .ok_or_else(|| anyhow::anyhow!("request `{name}`: prefer must be a list"))?
             .iter()
-            .filter_map(|s| s.unpack_str().map(|s| s.to_owned()))
-            .collect(),
+            .map(|s| {
+                s.unpack_str().map(|s| s.to_owned()).ok_or_else(|| {
+                    anyhow::anyhow!("request `{name}`: prefer entries must be strings")
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?,
         _ => Vec::new(),
     };
     Ok(RReq {
@@ -835,10 +852,17 @@ fn make_peripheral_dict<'v>(
     for p in provides {
         for info in iface_closure(*p)? {
             for (aname, ty) in &info.attr_specs {
-                if let Some(t) = ty.downcast_ref::<pcb_sch::physical::PhysicalValueType>()
-                    && !declared.iter().any(|(n, _, _)| n == aname)
-                {
-                    declared.push((aname.clone(), t.dims(), info.name.clone()));
+                if let Some(t) = ty.downcast_ref::<pcb_sch::physical::PhysicalValueType>() {
+                    match declared.iter().find(|(n, _, _)| n == aname) {
+                        Some((_, dims, owner)) if *dims != t.dims() => {
+                            return Err(anyhow::anyhow!(
+                                "peripheral `{name}`: attr `{aname}` is declared with conflicting dimensions by {owner} and {}",
+                                info.name
+                            ));
+                        }
+                        Some(_) => {}
+                        None => declared.push((aname.clone(), t.dims(), info.name.clone())),
+                    }
                 }
             }
         }
@@ -1177,11 +1201,17 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
         }
         let uses_vals: Vec<String> = match uses {
             NoneOr::Other(u) => {
+                let mut seen = HashSet::new();
                 for s in &u.items {
                     if !info.fields.contains(s) {
                         return Err(anyhow::anyhow!(
                             "pin_request `{name}`: `{s}` is not a signal of {}",
                             info.name
+                        ));
+                    }
+                    if !seen.insert(s.as_str()) {
+                        return Err(anyhow::anyhow!(
+                            "pin_request `{name}`: duplicate signal `{s}` in uses"
                         ));
                     }
                 }
@@ -1331,7 +1361,19 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
         }
 
         let prev_map = match previous {
-            NoneOr::Other(v) => parse_previous(v, heap),
+            NoneOr::Other(v) => {
+                let parsed = parse_previous(v, heap);
+                let provided_entries = DictRef::from_value(v)
+                    .map(|d| d.iter().count())
+                    .unwrap_or(1);
+                if parsed.is_empty() && provided_entries > 0 {
+                    warn_at_call_site(
+                        eval,
+                        "pin_solve: previous= contains no usable assignment entry; pass the `assignment` dict of a prior solve".to_owned(),
+                    );
+                }
+                parsed
+            }
             NoneOr::None => HashMap::new(),
         };
 
@@ -1357,6 +1399,28 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
                 ));
             }
             all_combos.push(combos);
+        }
+
+        // Pin/instance exclusivity spans every pin_solve of the module:
+        // candidates claimed by another solve's requests are unavailable
+        // (a re-solved request releases its own claims).
+        if let Some(ctx) = eval.context_value() {
+            let current: HashSet<String> = reqs.iter().map(|r| r.name.clone()).collect();
+            let (claimed_instances, claimed_pins) = ctx.pin_claims_excluding(&current);
+            if !(claimed_instances.is_empty() && claimed_pins.is_empty()) {
+                for (i, combos) in all_combos.iter_mut().enumerate() {
+                    combos.retain(|c| {
+                        !claimed_instances.contains(&periphs[c.periph_idx].name)
+                            && !c.pins.iter().any(|(_, p)| claimed_pins.contains(&p.name))
+                    });
+                    if combos.is_empty() {
+                        return Err(anyhow::anyhow!(
+                            "pin_solve: request `{}`: every candidate uses a pin or instance already claimed by an earlier pin_solve in this module",
+                            reqs[i].name
+                        ));
+                    }
+                }
+            }
         }
 
         // Joint assignment. A truncated enumeration may have dropped the very
@@ -1387,6 +1451,16 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
                             "pin_solve: solver budget ({SOLVER_BUDGET} steps) exhausted; the assignment is feasible but may be suboptimal"
                         ),
                     );
+                }
+                if let Some(ctx) = eval.context_value() {
+                    for (i, r) in reqs.iter().enumerate() {
+                        let combo = &all_combos[i][chosen[i]];
+                        ctx.record_pin_claim(
+                            &r.name,
+                            periphs[combo.periph_idx].name.clone(),
+                            combo.pins.iter().map(|(_, p)| p.name.clone()).collect(),
+                        );
+                    }
                 }
                 chosen
             }
@@ -1483,7 +1557,9 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
         {
             let mut by_pool: Vec<(String, Vec<(String, String)>)> = Vec::new();
             for (i, r) in reqs.iter().enumerate() {
-                if r.lock {
+                // A lock with pins removes the request from the swap freedom;
+                // a bare lock=True constrains nothing and swaps normally.
+                if r.lock && !r.prefer.is_empty() {
                     continue;
                 }
                 let combo = &all_combos[i][chosen[i]];
@@ -1527,7 +1603,7 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
 
             let mut by_cluster: Vec<(String, Vec<(String, String)>)> = Vec::new();
             for (i, r) in reqs.iter().enumerate() {
-                if r.lock {
+                if r.lock && !r.prefer.is_empty() {
                     continue;
                 }
                 let combo = &all_combos[i][chosen[i]];
@@ -1584,14 +1660,63 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
         let swap_json = serde_json::Value::Array(swap_classes);
 
         // Persist as module properties so the data reaches the netlist and,
-        // through schematic export, board-side fields.
+        // through schematic export, board-side fields. A module may solve
+        // several parts: the properties merge every solve, keyed by request
+        // name — a re-solved request replaces its own entry and drops the
+        // prior swap classes that mention it (their freedom is stale).
+        let mut property_assignment = assignment_json.clone();
+        let mut property_swaps = swap_json.clone();
+        if let Some(ctx) = eval.context_value() {
+            let prior = |key: &str| {
+                ctx.module()
+                    .properties()
+                    .get(key)
+                    .and_then(|v| v.to_value().unpack_str().map(str::to_owned))
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            };
+            if let Some(prev) = prior("pin_assignment")
+                && let Some(prev_obj) = prev.as_object()
+            {
+                let cur = property_assignment
+                    .as_object_mut()
+                    .expect("assignment is an object");
+                for (k, v) in prev_obj {
+                    cur.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+            }
+            if let Some(prev) = prior("swap_classes")
+                && let Some(prev_arr) = prev.as_array()
+            {
+                let solved: HashSet<&str> = reqs.iter().map(|r| r.name.as_str()).collect();
+                let mut merged: Vec<serde_json::Value> = prev_arr
+                    .iter()
+                    .filter(|class| {
+                        class
+                            .get("members")
+                            .and_then(|m| m.as_array())
+                            .map(|members| {
+                                members.iter().all(|m| {
+                                    m.get("request")
+                                        .and_then(|r| r.as_str())
+                                        .map(|n| !solved.contains(n))
+                                        .unwrap_or(true)
+                                })
+                            })
+                            .unwrap_or(true)
+                    })
+                    .cloned()
+                    .collect();
+                merged.append(property_swaps.as_array_mut().expect("swaps is an array"));
+                property_swaps = serde_json::Value::Array(merged);
+            }
+        }
         eval.add_property(
             "pin_assignment",
-            heap.alloc(serde_json::to_string_pretty(&assignment_json).unwrap_or_default()),
+            heap.alloc(serde_json::to_string_pretty(&property_assignment).unwrap_or_default()),
         );
         eval.add_property(
             "swap_classes",
-            heap.alloc(serde_json::to_string_pretty(&swap_json).unwrap_or_default()),
+            heap.alloc(serde_json::to_string_pretty(&property_swaps).unwrap_or_default()),
         );
 
         // Candidate pins no served request claimed: the component wires them
@@ -1663,7 +1788,12 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
                     })?;
                 let net = match interface_field(*iface_val, &sig) {
                     Some(n) => n,
-                    None if sig_count == 1 => *iface_val,
+                    None if sig_count == 1
+                        && (iface_val.downcast_ref::<NetValue>().is_some()
+                            || iface_val.downcast_ref::<FrozenNetValue>().is_some()) =>
+                    {
+                        *iface_val
+                    }
                     None => {
                         return Err(anyhow::anyhow!(
                             "pin_map: request `{req_name}`: no field `{sig}` on the provided value \

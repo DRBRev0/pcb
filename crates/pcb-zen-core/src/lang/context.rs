@@ -93,6 +93,12 @@ pub struct ContextValue<'v> {
     #[allocative(skip)]
     #[serde(skip)]
     served_pin_requests: RefCell<std::collections::HashSet<String>>,
+    /// Instance and pins each solved request claimed, keyed by request name:
+    /// pin/instance exclusivity spans every pin_solve of the module, and a
+    /// re-solved request releases its own claims.
+    #[allocative(skip)]
+    #[serde(skip)]
+    pin_claims: RefCell<std::collections::HashMap<String, (String, Vec<String>)>>,
 }
 
 #[derive(Debug, Trace, ProvidesStaticType, Allocative, Serialize)]
@@ -180,6 +186,7 @@ impl<'v> ContextValue<'v> {
             pending_children: RefCell::new(Vec::new()),
             pin_constraints: RefCell::new(std::collections::HashMap::new()),
             served_pin_requests: RefCell::new(std::collections::HashSet::new()),
+            pin_claims: RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -216,6 +223,35 @@ impl<'v> ContextValue<'v> {
 
     pub(crate) fn pin_constraint(&self, name: &str) -> Option<(Vec<String>, bool)> {
         self.pin_constraints.borrow().get(name).cloned()
+    }
+
+    pub(crate) fn diagnostics_snapshot(&self) -> Vec<crate::Diagnostic> {
+        self.diagnostics.borrow().clone()
+    }
+
+    pub(crate) fn record_pin_claim(&self, req: &str, instance: String, pins: Vec<String>) {
+        self.pin_claims
+            .borrow_mut()
+            .insert(req.to_owned(), (instance, pins));
+    }
+
+    /// Instances and pins claimed by requests other than `except`.
+    pub(crate) fn pin_claims_excluding(
+        &self,
+        except: &std::collections::HashSet<String>,
+    ) -> (
+        std::collections::HashSet<String>,
+        std::collections::HashSet<String>,
+    ) {
+        let mut instances = std::collections::HashSet::new();
+        let mut pins = std::collections::HashSet::new();
+        for (req, (instance, req_pins)) in self.pin_claims.borrow().iter() {
+            if !except.contains(req) {
+                instances.insert(instance.clone());
+                pins.extend(req_pins.iter().cloned());
+            }
+        }
+        (instances, pins)
     }
 
     pub(crate) fn mark_pin_request_served(&self, name: &str) {

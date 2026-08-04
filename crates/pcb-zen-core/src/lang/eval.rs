@@ -1572,6 +1572,7 @@ impl EvalContext {
                     {
                         let unconsumed = ctx.unconsumed_hard_pin_constraints();
                         if !unconsumed.is_empty() {
+                            diagnostics.extend(ctx.diagnostics_snapshot());
                             for name in unconsumed {
                                 diagnostics.push(
                                     anyhow!(

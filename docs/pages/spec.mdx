@@ -257,7 +257,7 @@ bus = MyBus("BUS1", enable=False)
 debug_bus = MyBus()
 ```
 
-Interface fields can be net instances, interface instances (for hierarchical composition), or `field()` specs. When instantiated, the first positional argument is an optional name; named arguments override defaults.
+Interface fields can be net instances, interface instances (for hierarchical composition), or `field()` specs. The names `implies`, `attrs`, and `__post_init__` are reserved for interface metadata and cannot be fields. When instantiated, the first positional argument is an optional name; named arguments override defaults.
 
 If an interface instance omits its explicit name, the assigned variable name becomes the root used for generated child nets:
 
@@ -348,7 +348,7 @@ candidate physical pin for a signal.
 | `data` | no | Realization info (an STM32 AF index, an ESP32 IOMUX FUNC number), passed through unchanged into the solved assignment |
 | `cost` | no | The solver prefers lower-cost candidates |
 | `input_only` | no | Pin has no output driver: excluded from `direction = "output"` requests |
-| `strap` | no | Boot-strapping pin: chosen only as a last resort, warns when used |
+| `strap` | no | Boot-strapping pin: penalized against any alternative, warns when chosen |
 
 **`peripheral(name, provides, signals, rebind, attrs={}, unless=None)`** — a
 resource cluster (an MCU USART, one comparator of a dual package).
@@ -388,9 +388,9 @@ instance serves at most one request (even on disjoint pin sets); when no
 assignment satisfies every request, the build fails with per-candidate
 rejection reasons. The result is deterministic and globally optimized: the
 solver prefers the least-capable sufficient instance, avoids strapping pins,
-honors per-pin `cost` and `prefer=`, and sticks to `previous=` (a prior
-assignment passed as a stability seed) so adding a request does not reshuffle
-a routed design.
+honors per-pin `cost` and `prefer=`, and biases toward `previous=` (a prior
+assignment passed as a stability seed) so adding a request tends to keep a
+routed design in place.
 
 **`at(value, pins, soft=False)`** — constrain the physical pin(s) on the
 connection itself: `Mcu(IO0 = at(led_net, "PA8"))`. The wrapper is
@@ -411,8 +411,9 @@ absent from the assignment (e.g. dropped by `if_connected`) are skipped.
 | `swap_classes` | Residual swap freedom: pool classes with spare pins, gate-swap clusters |
 | `free_pins` | Candidate pins no request claimed — wire them with `{p: NotConnected() for p in res["free_pins"]}` |
 
-`assignment` and `swap_classes` are also stored as module properties (JSON)
-and flow through the netlist into schematic fields, so the assignment and the
+`assignment` and `swap_classes` are also stored as module properties (JSON) —
+several solves in one module merge, keyed by request name — and flow through
+the netlist into schematic fields, so the assignment and the
 remaining swap freedom reach layout tools with no side files.
 
 ## Components and symbols
