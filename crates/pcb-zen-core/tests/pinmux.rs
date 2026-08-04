@@ -590,6 +590,22 @@ Mcu(name = "M1", IO0 = at(Net("LED"), "PA10"))
 }
 
 #[test]
+fn bind_at_overrides_request_prefer() {
+    let result = eval_with_fixtures(
+        r#"
+load("./stm32.zen", "PERIPHS")
+load("./ifaces.zen", "Gpio")
+
+res = pin_solve(PERIPHS, [
+    pin_request("LED", Gpio, prefer = ["PB0"], bind = at(Net("LED"), "PA10")),
+])
+check(res["assignment"]["LED"]["signals"]["PIN"]["pin"] == "PA10", "caller at() must win over request prefer")
+"#,
+    );
+    assert_ok(&result);
+}
+
+#[test]
 fn symmetric_parameter_is_rejected() {
     let result = eval_with_fixtures(
         r#"

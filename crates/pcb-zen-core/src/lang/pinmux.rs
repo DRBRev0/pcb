@@ -1195,11 +1195,12 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
             ));
         }
         let uses_alloc: Vec<Value> = uses_vals.iter().map(|s| heap.alloc(s.as_str())).collect();
-        // An at()-derived constraint applies unless the request already sets
-        // prefer/lock explicitly.
-        let (prefer_items, lock) = match (&bind_pins, prefer.items.is_empty()) {
-            (Some(pins), true) => (pins.clone(), !bind_soft),
-            _ => (prefer.items.clone(), lock),
+        // The caller's at() constraint overrides request-side prefer/lock
+        // defaults — the same precedence as the io()-recorded constraints in
+        // pin_solve, whichever path delivers the connection.
+        let (prefer_items, lock) = match &bind_pins {
+            Some(pins) => (pins.clone(), !bind_soft),
+            None => (prefer.items.clone(), lock),
         };
         let prefer_alloc: Vec<Value> = prefer_items
             .iter()
