@@ -8,6 +8,17 @@ and this project adheres to Semantic Versioning (https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- Added pin-capability builtins `pin()`, `peripheral()`, `pool()`, `pin_request()` and `pin_solve()` to declare what a multi-function component's pins can do and solve the instance × pin assignment at elaboration; results are stored as `pin_assignment` / `swap_classes` module properties.
+- Added `at(value, pins, soft=)` to constrain the physical pin on the connection itself, e.g. `Mcu(IO0 = at(led_net, "PA8"))`.
+- Added `pin_map()` to turn a solved assignment into a `Component(pins=...)`-ready dict, plus `free_pins` in the `pin_solve` result for wiring unclaimed mux pins.
+- Added `pin_request(if_connected=True)` for optional `io()` capability slots and `pin_request(bind=)` for dict-of-roles demands like `Mcu(gpio = {"LED": at(led_net, "PA8")})`.
+- Added `interface(implies = [...])`: capability matching is nominal and closed over the implication DAG (a `Usart` provider satisfies a `Uart` request, never the reverse).
+- Added `interface(attrs = {...})` to declare the capability-attribute vocabulary peripheral attrs are validated against; the stdlib interfaces now declare `clk_max`/`baud_max`/`bitrate_max`/`vio` where applicable.
+- Added the stdlib single-signal capability interfaces `AdcIn` and `GpioPin` for ADC inputs and GPIO pools.
+- `pin_solve` now warns when a request's pin-combination enumeration hits the internal cap on wide pin matrices, since the chosen assignment may then be suboptimal.
+
 ### Changed
 
 - `pcb doc` now renders Markdown list items as styled bullets instead of literal hyphens.
