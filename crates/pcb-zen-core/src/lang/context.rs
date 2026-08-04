@@ -88,6 +88,11 @@ pub struct ContextValue<'v> {
     #[allocative(skip)]
     #[serde(skip)]
     pin_constraints: RefCell<std::collections::HashMap<String, (Vec<String>, bool)>>,
+    /// Request names `pin_solve` served. A hard `at()` constraint whose name
+    /// is never served fails the module's evaluation, not silently dropped.
+    #[allocative(skip)]
+    #[serde(skip)]
+    served_pin_requests: RefCell<std::collections::HashSet<String>>,
 }
 
 #[derive(Debug, Trace, ProvidesStaticType, Allocative, Serialize)]
@@ -174,6 +179,7 @@ impl<'v> ContextValue<'v> {
             diagnostics: RefCell::new(Vec::new()),
             pending_children: RefCell::new(Vec::new()),
             pin_constraints: RefCell::new(std::collections::HashMap::new()),
+            served_pin_requests: RefCell::new(std::collections::HashSet::new()),
         }
     }
 
@@ -210,6 +216,26 @@ impl<'v> ContextValue<'v> {
 
     pub(crate) fn pin_constraint(&self, name: &str) -> Option<(Vec<String>, bool)> {
         self.pin_constraints.borrow().get(name).cloned()
+    }
+
+    pub(crate) fn mark_pin_request_served(&self, name: &str) {
+        self.served_pin_requests
+            .borrow_mut()
+            .insert(name.to_owned());
+    }
+
+    /// Hard `at()` constraints no served pin_request ever matched, sorted.
+    pub(crate) fn unconsumed_hard_pin_constraints(&self) -> Vec<String> {
+        let served = self.served_pin_requests.borrow();
+        let mut names: Vec<String> = self
+            .pin_constraints
+            .borrow()
+            .iter()
+            .filter(|(name, (_, soft))| !soft && !served.contains(*name))
+            .map(|(name, _)| name.clone())
+            .collect();
+        names.sort();
+        names
     }
 
     pub(crate) fn add_diagnostic<D: Into<crate::Diagnostic>>(&self, diag: D) {

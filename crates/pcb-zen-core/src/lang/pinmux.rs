@@ -465,19 +465,19 @@ fn combos_for_request<'v>(
         let mut truncated = false;
         for (s, cands) in &cand_lists {
             let mut next = Vec::new();
-            for base in &pinmaps {
-                let mut usable = cands
+            'bases: for base in &pinmaps {
+                let usable = cands
                     .iter()
                     .filter(|c| !base.iter().any(|(_, b)| b.name == c.name));
-                for c in &mut usable {
+                for c in usable {
+                    if next.len() >= PINMAP_CAP {
+                        truncated = true;
+                        break 'bases;
+                    }
                     let mut d = base.clone();
                     d.push(((*s).to_owned(), (*c).clone()));
                     next.push(d);
-                    if next.len() >= PINMAP_CAP {
-                        break;
-                    }
                 }
-                truncated |= usable.next().is_some();
             }
             pinmaps = next;
         }
@@ -1315,6 +1315,7 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
         // input, where the at() wrapper still sits.
         if let Some(ctx) = eval.context_value() {
             for r in reqs.iter_mut() {
+                ctx.mark_pin_request_served(&r.name);
                 let constraint = ctx.pin_constraint(&r.name).or_else(|| {
                     ctx.module()
                         .inputs()

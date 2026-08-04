@@ -590,6 +590,46 @@ Mcu(name = "M1", IO0 = at(Net("LED"), "PA10"))
 }
 
 #[test]
+fn unconsumed_hard_at_fails_the_build() {
+    let result = eval_zen(vec![
+        ("/ifaces.zen".to_string(), IFACES.to_string()),
+        (
+            "/plain.zen".to_string(),
+            "IO0 = io(Net, optional = True)\n".to_string(),
+        ),
+        (
+            "/test.zen".to_string(),
+            r#"
+Mcu = Module("/plain.zen")
+Mcu(name = "M1", IO0 = at(Net("LED"), "PA10"))
+"#
+            .to_string(),
+        ),
+    ]);
+    assert_fails_with(&result, "never consumed");
+}
+
+#[test]
+fn unconsumed_soft_at_is_tolerated() {
+    let result = eval_zen(vec![
+        ("/ifaces.zen".to_string(), IFACES.to_string()),
+        (
+            "/plain.zen".to_string(),
+            "IO0 = io(Net, optional = True)\n".to_string(),
+        ),
+        (
+            "/test.zen".to_string(),
+            r#"
+Mcu = Module("/plain.zen")
+Mcu(name = "M1", IO0 = at(Net("LED"), "PA10", soft = True))
+"#
+            .to_string(),
+        ),
+    ]);
+    assert_ok(&result);
+}
+
+#[test]
 fn bind_at_overrides_request_prefer() {
     let result = eval_with_fixtures(
         r#"

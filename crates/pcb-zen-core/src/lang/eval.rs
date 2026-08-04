@@ -1566,6 +1566,26 @@ impl EvalContext {
 
             match eval_result {
                 Ok(_) => {
+                    if let Some(ctx) = module
+                        .extra_value()
+                        .and_then(|e| e.downcast_ref::<ContextValue>())
+                    {
+                        let unconsumed = ctx.unconsumed_hard_pin_constraints();
+                        if !unconsumed.is_empty() {
+                            for name in unconsumed {
+                                diagnostics.push(
+                                    anyhow!(
+                                        "at() pin constraint on input `{name}` was never consumed: no pin_request of that name reached pin_solve"
+                                    )
+                                    .into(),
+                                );
+                            }
+                            return WithDiagnostics {
+                                output: None,
+                                diagnostics: Diagnostics::from(diagnostics),
+                            };
+                        }
+                    }
                     let frozen_module = {
                         let _span = info_span!("freeze_module").entered();
                         module
