@@ -32,6 +32,7 @@ use crate::lang::net::{FrozenNetValue, NetValue};
 const REBIND_VALUES: [&str; 3] = ["none", "firmware", "fixed"];
 const PINMAP_CAP: usize = 512;
 const SOLVER_BUDGET: usize = 200_000;
+const SOLVER_HARD_BUDGET: usize = 5_000_000;
 
 struct IfaceInfo<'v> {
     id: TypeInstanceId,
@@ -374,8 +375,9 @@ fn combos_for_request<'v>(
     config: &SmallMap<String, Value<'v>>,
     previous: &HashMap<String, PrevAssign>,
     eval: &mut Evaluator<'v, '_, '_>,
-) -> anyhow::Result<(Vec<Combo>, Vec<(String, String)>)> {
+) -> anyhow::Result<(Vec<Combo>, Vec<(String, String)>, bool)> {
     let mut out: Vec<Combo> = Vec::new();
+    let mut any_truncated = false;
     let mut rejects: Vec<(String, String)> = Vec::new();
     let prev = previous.get(&req.name);
 
@@ -436,6 +438,28 @@ fn combos_for_request<'v>(
             continue;
         }
 
+        // Pin constraints shape the enumeration so PINMAP_CAP truncation
+        // cannot drop the constrained combinations: a covering lock restricts
+        // each signal's candidates to the named pins (exact); otherwise
+        // preferred pins are enumerated first.
+        if req.lock && !req.prefer.is_empty() && req.prefer.len() >= req.uses.len() {
+            for (_, cands) in cand_lists.iter_mut() {
+                let restricted: Vec<&RPin> = cands
+                    .iter()
+                    .copied()
+                    .filter(|c| req.prefer.contains(&c.name))
+                    .collect();
+                if !restricted.is_empty() {
+                    *cands = restricted;
+                }
+            }
+        }
+        if !req.prefer.is_empty() {
+            for (_, cands) in cand_lists.iter_mut() {
+                cands.sort_by_key(|c| !req.prefer.contains(&c.name));
+            }
+        }
+
         // Enumerate pin maps (product), excluding duplicate pins within the instance.
         let mut pinmaps: Vec<Vec<(String, RPin)>> = vec![Vec::new()];
         let mut truncated = false;
@@ -458,6 +482,7 @@ fn combos_for_request<'v>(
             pinmaps = next;
         }
         if truncated {
+            any_truncated = true;
             warn_at_call_site(
                 eval,
                 format!(
@@ -468,6 +493,8 @@ fn combos_for_request<'v>(
         }
 
         let surplus = p.provides_ids.len() as i64 - req.iface_closure_len as i64;
+        let had_pinmaps = !pinmaps.is_empty();
+        let combos_before = out.len();
         for pm in pinmaps {
             // Locked pins: with fewer pins than signals each named pin must be
             // claimed (at(uart, "PA2") pins one signal of a multi-signal role);
@@ -516,6 +543,17 @@ fn combos_for_request<'v>(
                 key,
             });
         }
+        if out.len() == combos_before {
+            let reason = if had_pinmaps {
+                format!(
+                    "no pin combination satisfies the locked pins `{}`",
+                    req.prefer.join("`, `")
+                )
+            } else {
+                "candidate pins collide within the instance".to_owned()
+            };
+            rejects.push((p.name.clone(), reason));
+        }
     }
 
     out.sort_by(|a, b| {
@@ -525,22 +563,36 @@ fn combos_for_request<'v>(
             &b.key,
         ))
     });
-    Ok((out, rejects))
+    Ok((out, rejects, any_truncated))
+}
+
+enum AssignOutcome {
+    Solved {
+        chosen: Vec<usize>,
+        capped: bool,
+    },
+    Infeasible,
+    /// Hard ceiling hit with no incumbent: feasibility neither proven nor
+    /// refuted — reported as such, never as infeasibility.
+    Unknown,
 }
 
 /// Deterministic branch-and-bound over the joint assignment space (pin
 /// conflicts couple otherwise independent instance choices, so this is
 /// constraint optimization, not plain matching). Candidates are explored in
 /// per-request cost order and pruned with an admissible lower bound, so the
-/// result minimizes total cost. The budget only bounds the search for a
-/// cheaper solution once one exists — with no incumbent the search runs to
-/// the first feasible assignment or proven infeasibility, so only optimality
-/// can degrade, never feasibility. The second return is `true` when the
-/// budget cut the optimization short.
-fn assign<'v>(reqs: &[RReq<'v>], all_combos: &[Vec<Combo>]) -> (Option<Vec<usize>>, bool) {
+/// result minimizes total cost. `SOLVER_BUDGET` only bounds the search for a
+/// cheaper solution once one exists (`capped` reports the cut); with no
+/// incumbent the search runs to the first feasible assignment, proven
+/// infeasibility, or the unconditional `SOLVER_HARD_BUDGET` ceiling
+/// (`Unknown`) so pathological instances cannot hang the build.
+fn assign<'v>(reqs: &[RReq<'v>], all_combos: &[Vec<Combo>]) -> AssignOutcome {
     let n = reqs.len();
     if n == 0 {
-        return (Some(Vec::new()), false);
+        return AssignOutcome::Solved {
+            chosen: Vec::new(),
+            capped: false,
+        };
     }
     // Evaluation order: locked first, then fewest candidates, then declaration order.
     let mut order: Vec<usize> = (0..n).collect();
@@ -568,6 +620,9 @@ fn assign<'v>(reqs: &[RReq<'v>], all_combos: &[Vec<Combo>]) -> (Option<Vec<usize
         if spent >= SOLVER_BUDGET && best.is_some() {
             capped = true;
             break;
+        }
+        if spent >= SOLVER_HARD_BUDGET {
+            return AssignOutcome::Unknown;
         }
         spent += 1;
         if pos == n {
@@ -637,7 +692,10 @@ fn assign<'v>(reqs: &[RReq<'v>], all_combos: &[Vec<Combo>]) -> (Option<Vec<usize
             choice[pos] += 1;
         }
     }
-    (best.map(|(_, sol)| sol), capped)
+    match best {
+        Some((_, chosen)) => AssignOutcome::Solved { chosen, capped },
+        None => AssignOutcome::Infeasible,
+    }
 }
 
 fn json_to_value<'v>(heap: Heap<'v>, v: &serde_json::Value) -> Value<'v> {
@@ -737,7 +795,6 @@ fn make_peripheral_dict<'v>(
     signals: Vec<(String, Vec<Value<'v>>)>,
     rebind: &str,
     attrs: &SmallMap<String, Value<'v>>,
-    symmetric: Value<'v>,
     unless: Option<&str>,
     pool: Option<&str>,
 ) -> anyhow::Result<Value<'v>> {
@@ -839,7 +896,6 @@ fn make_peripheral_dict<'v>(
         (heap.alloc("signals"), heap.alloc(AllocDict(signal_pairs))),
         (heap.alloc("rebind"), heap.alloc(rebind)),
         (heap.alloc("attrs"), heap.alloc(AllocDict(attr_pairs))),
-        (heap.alloc("symmetric"), symmetric),
         (
             heap.alloc("unless"),
             unless
@@ -980,7 +1036,6 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
             String,
             Value<'v>,
         >,
-        #[starlark(require = named, default = NoneOr::None)] symmetric: NoneOr<Value<'v>>,
         #[starlark(require = named, default = NoneOr::None)] unless: NoneOr<String>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<Value<'v>> {
@@ -997,10 +1052,6 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
         for (sig, cands) in signals.iter() {
             normalized.push((sig.clone(), normalize_candidates(heap, &name, sig, *cands)?));
         }
-        let symmetric_v = match symmetric {
-            NoneOr::None => heap.alloc(Vec::<Value>::new()),
-            NoneOr::Other(v) => v,
-        };
         make_peripheral_dict(
             heap,
             &name,
@@ -1008,7 +1059,6 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
             normalized,
             &rebind,
             &attrs,
-            symmetric_v,
             unless.into_option().as_deref(),
             None,
         )
@@ -1061,7 +1111,6 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
                 vec![(field.clone(), vec![pin_dict])],
                 &rebind,
                 &SmallMap::default(),
-                heap.alloc(Vec::<Value>::new()),
                 None,
                 Some(&name),
             )?);
@@ -1260,10 +1309,19 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
         reqs.retain(|r| !r.if_connected || connected.contains(&r.name));
 
         // `at()` constraints recorded at io-binding time override any
-        // request-side prefer/lock defaults.
+        // request-side prefer/lock defaults. When pin_solve runs before the
+        // matching io(), nothing is recorded yet: fall back to the raw caller
+        // input, where the at() wrapper still sits.
         if let Some(ctx) = eval.context_value() {
             for r in reqs.iter_mut() {
-                if let Some((pins, soft)) = ctx.pin_constraint(&r.name) {
+                let constraint = ctx.pin_constraint(&r.name).or_else(|| {
+                    ctx.module()
+                        .inputs()
+                        .get(r.name.as_str())
+                        .and_then(|v| unpack_pin_at(v.to_value()))
+                        .map(|(_, pins, soft)| (pins, soft))
+                });
+                if let Some((pins, soft)) = constraint {
                     r.prefer = pins;
                     r.lock = !soft;
                 }
@@ -1277,8 +1335,13 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
 
         // Candidate combos per request, with reasoned rejections.
         let mut all_combos: Vec<Vec<Combo>> = Vec::new();
+        let mut truncated_reqs: Vec<String> = Vec::new();
         for r in &reqs {
-            let (combos, rejects) = combos_for_request(r, &periphs, &config, &prev_map, eval)?;
+            let (combos, rejects, truncated) =
+                combos_for_request(r, &periphs, &config, &prev_map, eval)?;
+            if truncated {
+                truncated_reqs.push(r.name.clone());
+            }
             if combos.is_empty() {
                 let detail = rejects
                     .iter()
@@ -1294,27 +1357,51 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
             all_combos.push(combos);
         }
 
-        // Joint assignment.
-        let (solution, capped) = assign(&reqs, &all_combos);
-        let Some(chosen) = solution else {
-            let detail = reqs
+        // Joint assignment. A truncated enumeration may have dropped the very
+        // combinations that would have fit, so failures must say so.
+        let failure_detail = |reqs: &[RReq], all_combos: &[Vec<Combo>]| {
+            let mut detail = reqs
                 .iter()
                 .enumerate()
                 .map(|(i, r)| format!("  {}: {} candidate combo(s)", r.name, all_combos[i].len()))
                 .collect::<Vec<_>>()
                 .join("\n");
-            return Err(anyhow::anyhow!(
-                "pin_solve: no feasible assignment (instance/pin exclusivity):\n{detail}"
-            ));
+            if !truncated_reqs.is_empty() {
+                detail.push_str(&format!(
+                    "\nnote: pin combinations for `{}` were capped at {PINMAP_CAP}; a feasible \
+                     assignment may have been dropped — constrain those requests \
+                     (instance=/prefer=) to narrow the enumeration",
+                    truncated_reqs.join("`, `")
+                ));
+            }
+            detail
         };
-        if capped {
-            warn_at_call_site(
-                eval,
-                format!(
-                    "pin_solve: solver budget ({SOLVER_BUDGET} steps) exhausted; the assignment is feasible but may be suboptimal"
-                ),
-            );
-        }
+        let chosen = match assign(&reqs, &all_combos) {
+            AssignOutcome::Solved { chosen, capped } => {
+                if capped {
+                    warn_at_call_site(
+                        eval,
+                        format!(
+                            "pin_solve: solver budget ({SOLVER_BUDGET} steps) exhausted; the assignment is feasible but may be suboptimal"
+                        ),
+                    );
+                }
+                chosen
+            }
+            AssignOutcome::Infeasible => {
+                return Err(anyhow::anyhow!(
+                    "pin_solve: no feasible assignment (instance/pin exclusivity):\n{}",
+                    failure_detail(&reqs, &all_combos)
+                ));
+            }
+            AssignOutcome::Unknown => {
+                return Err(anyhow::anyhow!(
+                    "pin_solve: search budget exhausted before feasibility could be proven; \
+                     constrain requests (instance=/prefer=) to narrow the search:\n{}",
+                    failure_detail(&reqs, &all_combos)
+                ));
+            }
+        };
 
         // Build results (JSON first; the Starlark value mirrors it).
         let mut used_pins: HashSet<String> = HashSet::new();

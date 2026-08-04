@@ -479,6 +479,129 @@ pin_solve(PERIPHS, [pin_request("X", Uart, uses = [])])
 }
 
 #[test]
+fn infeasible_after_truncation_mentions_the_cap() {
+    let result = eval_with_fixtures(
+        r#"
+load("./ifaces.zen", "Uart")
+
+WIDE = peripheral(
+    "WIDE",
+    provides = [Uart],
+    rebind = "firmware",
+    signals = {
+        "TX": [pin("P" + str(i)) for i in range(24)],
+        "RX": [pin("P" + str(i)) for i in range(24)],
+    },
+)
+
+pin_solve([WIDE], [pin_request("A", Uart), pin_request("B", Uart)])
+"#,
+    );
+    assert_fails_with(&result, "no feasible assignment");
+    assert_fails_with(&result, "capped at");
+}
+
+#[test]
+fn locked_pin_beyond_the_cap_is_still_found() {
+    let result = eval_with_fixtures(
+        r#"
+load("./ifaces.zen", "Gpio")
+
+P = peripheral(
+    "P",
+    provides = [Gpio],
+    rebind = "firmware",
+    signals = {"PIN": [pin("P" + str(i)) for i in range(600)]},
+)
+
+res = pin_solve([P], [pin_request("R", Gpio, prefer = ["P599"], lock = True)])
+check(res["assignment"]["R"]["signals"]["PIN"]["pin"] == "P599", "locked pin must win over the cap")
+"#,
+    );
+    assert_ok(&result);
+}
+
+#[test]
+fn mandatory_pin_beyond_the_cap_is_still_found() {
+    let result = eval_with_fixtures(
+        r#"
+load("./ifaces.zen", "Uart")
+
+W = peripheral(
+    "W",
+    provides = [Uart],
+    rebind = "firmware",
+    signals = {
+        "TX": [pin("T" + str(i)) for i in range(30)],
+        "RX": [pin("R" + str(i)) for i in range(30)],
+    },
+)
+
+res = pin_solve([W], [pin_request("U", Uart, prefer = ["T29"], lock = True)])
+check(res["assignment"]["U"]["signals"]["TX"]["pin"] == "T29", "mandatory pin must win over the cap")
+"#,
+    );
+    assert_ok(&result);
+}
+
+#[test]
+fn failed_lock_names_the_pins_in_the_rejection() {
+    let result = eval_with_fixtures(
+        r#"
+load("./stm32.zen", "PERIPHS")
+load("./ifaces.zen", "Gpio")
+
+pin_solve(PERIPHS, [pin_request("LED", Gpio, prefer = ["NOPE"], lock = True)])
+"#,
+    );
+    assert_fails_with(&result, "no pin combination satisfies the locked pins");
+}
+
+#[test]
+fn at_constraint_survives_solve_before_io() {
+    let result = eval_zen(vec![
+        ("/ifaces.zen".to_string(), IFACES.to_string()),
+        ("/stm32.zen".to_string(), STM32.to_string()),
+        (
+            "/mcu_early.zen".to_string(),
+            r#"
+load("./ifaces.zen", "Gpio")
+load("./stm32.zen", "PERIPHS")
+
+res = pin_solve(PERIPHS, [pin_request("IO0", Gpio, if_connected = True)])
+a = res["assignment"]
+builtin.add_property("io0_pin", a["IO0"]["signals"]["PIN"]["pin"] if "IO0" in a else "none")
+
+IO0 = io(Net, optional = True)
+"#
+            .to_string(),
+        ),
+        (
+            "/test.zen".to_string(),
+            r#"
+Mcu = Module("/mcu_early.zen")
+Mcu(name = "M1", IO0 = at(Net("LED"), "PA10"))
+"#
+            .to_string(),
+        ),
+    ]);
+    assert_ok(&result);
+    assert_eq!(io0_pin(&result), "PA10");
+}
+
+#[test]
+fn symmetric_parameter_is_rejected() {
+    let result = eval_with_fixtures(
+        r#"
+load("./ifaces.zen", "Gpio")
+
+peripheral("P", provides = [Gpio], rebind = "none", signals = {"PIN": ["X1"]}, symmetric = [["A"]])
+"#,
+    );
+    assert_fails_with(&result, "symmetric");
+}
+
+#[test]
 fn pin_data_large_int_roundtrip() {
     let result = eval_with_fixtures(
         r#"
