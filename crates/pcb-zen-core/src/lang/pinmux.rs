@@ -163,7 +163,6 @@ struct RReq<'v> {
 #[derive(Clone)]
 struct Combo {
     periph_idx: usize,
-    /// Pin choice per used signal, in `uses` order.
     pins: Vec<(String, RPin)>,
     cost: i64,
     key: String,
@@ -305,6 +304,11 @@ fn parse_rreq<'v>(v: Value<'v>, heap: Heap<'v>) -> anyhow::Result<RReq<'v>> {
             .collect::<anyhow::Result<Vec<_>>>()?,
         _ => closure[0].fields.clone(),
     };
+    if uses.is_empty() {
+        return Err(anyhow::anyhow!(
+            "request `{name}`: uses must name at least one signal"
+        ));
+    }
     let prefer = match dict_get(&d, heap, "prefer") {
         Some(p) if !p.is_none() => ListRef::from_value(p)
             .ok_or_else(|| anyhow::anyhow!("request `{name}`: prefer must be a list"))?
@@ -465,11 +469,20 @@ fn combos_for_request<'v>(
 
         let surplus = p.provides_ids.len() as i64 - req.iface_closure_len as i64;
         for pm in pinmaps {
-            if req.lock
-                && !req.prefer.is_empty()
-                && !pm.iter().all(|(_, c)| req.prefer.contains(&c.name))
-            {
-                continue;
+            // Locked pins: with fewer pins than signals each named pin must be
+            // claimed (at(uart, "PA2") pins one signal of a multi-signal role);
+            // with enough pins to cover every signal they are the allowed set.
+            if req.lock && !req.prefer.is_empty() {
+                let ok = if req.prefer.len() < req.uses.len() {
+                    req.prefer
+                        .iter()
+                        .all(|p| pm.iter().any(|(_, c)| c.name == *p))
+                } else {
+                    pm.iter().all(|(_, c)| req.prefer.contains(&c.name))
+                };
+                if !ok {
+                    continue;
+                }
             }
             let mut cost = 100 * surplus;
             for (sig, c) in &pm {
@@ -519,12 +532,15 @@ fn combos_for_request<'v>(
 /// conflicts couple otherwise independent instance choices, so this is
 /// constraint optimization, not plain matching). Candidates are explored in
 /// per-request cost order and pruned with an admissible lower bound, so the
-/// result minimizes total cost. On budget exhaustion the best solution found
-/// so far is returned; only optimality can degrade, never feasibility.
-fn assign<'v>(reqs: &[RReq<'v>], all_combos: &[Vec<Combo>]) -> Option<Vec<usize>> {
+/// result minimizes total cost. The budget only bounds the search for a
+/// cheaper solution once one exists — with no incumbent the search runs to
+/// the first feasible assignment or proven infeasibility, so only optimality
+/// can degrade, never feasibility. The second return is `true` when the
+/// budget cut the optimization short.
+fn assign<'v>(reqs: &[RReq<'v>], all_combos: &[Vec<Combo>]) -> (Option<Vec<usize>>, bool) {
     let n = reqs.len();
     if n == 0 {
-        return Some(Vec::new());
+        return (Some(Vec::new()), false);
     }
     // Evaluation order: locked first, then fewest candidates, then declaration order.
     let mut order: Vec<usize> = (0..n).collect();
@@ -545,8 +561,15 @@ fn assign<'v>(reqs: &[RReq<'v>], all_combos: &[Vec<Combo>]) -> Option<Vec<usize>
     let mut used_pin: HashSet<String> = HashSet::new();
     let mut best: Option<(i64, Vec<usize>)> = None;
     let mut pos: usize = 0;
+    let mut spent = 0usize;
+    let mut capped = false;
 
-    for _ in 0..SOLVER_BUDGET {
+    loop {
+        if spent >= SOLVER_BUDGET && best.is_some() {
+            capped = true;
+            break;
+        }
+        spent += 1;
         if pos == n {
             let total = partial_cost[n];
             // Strict improvement keeps the first (deterministic) optimum.
@@ -614,7 +637,7 @@ fn assign<'v>(reqs: &[RReq<'v>], all_combos: &[Vec<Combo>]) -> Option<Vec<usize>
             choice[pos] += 1;
         }
     }
-    best.map(|(_, sol)| sol)
+    (best.map(|(_, sol)| sol), capped)
 }
 
 fn json_to_value<'v>(heap: Heap<'v>, v: &serde_json::Value) -> Value<'v> {
@@ -623,7 +646,7 @@ fn json_to_value<'v>(heap: Heap<'v>, v: &serde_json::Value) -> Value<'v> {
         serde_json::Value::Bool(b) => Value::new_bool(*b),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
-                heap.alloc(i as i32)
+                heap.alloc(i)
             } else {
                 heap.alloc(n.as_f64().unwrap_or(0.0))
             }
@@ -1117,6 +1140,11 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
             }
             NoneOr::None => info.fields.clone(),
         };
+        if uses_vals.is_empty() {
+            return Err(anyhow::anyhow!(
+                "pin_request `{name}`: uses must name at least one signal"
+            ));
+        }
         let uses_alloc: Vec<Value> = uses_vals.iter().map(|s| heap.alloc(s.as_str())).collect();
         // An at()-derived constraint applies unless the request already sets
         // prefer/lock explicitly.
@@ -1267,7 +1295,8 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
         }
 
         // Joint assignment.
-        let Some(chosen) = assign(&reqs, &all_combos) else {
+        let (solution, capped) = assign(&reqs, &all_combos);
+        let Some(chosen) = solution else {
             let detail = reqs
                 .iter()
                 .enumerate()
@@ -1278,6 +1307,14 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
                 "pin_solve: no feasible assignment (instance/pin exclusivity):\n{detail}"
             ));
         };
+        if capped {
+            warn_at_call_site(
+                eval,
+                format!(
+                    "pin_solve: solver budget ({SOLVER_BUDGET} steps) exhausted; the assignment is feasible but may be suboptimal"
+                ),
+            );
+        }
 
         // Build results (JSON first; the Starlark value mirrors it).
         let mut used_pins: HashSet<String> = HashSet::new();
@@ -1416,14 +1453,19 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
                     None => by_cluster.push((key, vec![member])),
                 }
             }
-            by_cluster.sort_by(|a, b| a.0.cmp(&b.0));
+            // Order clusters by their members, not by key: TypeInstanceIds
+            // depend on concurrent module-evaluation order, so the key is
+            // only stable within one build.
+            for (_, members) in by_cluster.iter_mut() {
+                members.sort();
+            }
+            by_cluster.sort_by(|a, b| a.1.cmp(&b.1));
             let assigned_instances: HashSet<String> = chosen
                 .iter()
                 .enumerate()
                 .map(|(i, &ci)| periphs[all_combos[i][ci].periph_idx].name.clone())
                 .collect();
-            for (key, mut members) in by_cluster {
-                members.sort();
+            for (key, members) in by_cluster {
                 let mut spares: Vec<String> = periphs
                     .iter()
                     .filter(|p| {

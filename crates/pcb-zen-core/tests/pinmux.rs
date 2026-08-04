@@ -450,6 +450,55 @@ check(res["assignment"]["BOOT_BTN"]["signals"]["PIN"]["pin"] == "GPIO9", "locked
 }
 
 #[test]
+fn hard_lock_single_pin_on_multi_signal_role() {
+    let result = eval_with_fixtures(
+        r#"
+load("./stm32.zen", "PERIPHS")
+load("./ifaces.zen", "Uart")
+
+res = pin_solve(PERIPHS, [pin_request("DEBUG", Uart, prefer = ["PA2"], lock = True)])
+a = res["assignment"]["DEBUG"]
+check(a["instance"] == "USART2", "expected USART2, got " + a["instance"])
+check(a["signals"]["TX"]["pin"] == "PA2", "TX must land on the locked pin")
+"#,
+    );
+    assert_ok(&result);
+}
+
+#[test]
+fn empty_uses_rejected() {
+    let result = eval_with_fixtures(
+        r#"
+load("./stm32.zen", "PERIPHS")
+load("./ifaces.zen", "Uart")
+
+pin_solve(PERIPHS, [pin_request("X", Uart, uses = [])])
+"#,
+    );
+    assert_fails_with(&result, "at least one signal");
+}
+
+#[test]
+fn pin_data_large_int_roundtrip() {
+    let result = eval_with_fixtures(
+        r#"
+load("./ifaces.zen", "Gpio")
+
+P = peripheral(
+    "P",
+    provides = [Gpio],
+    rebind = "fixed",
+    signals = {"PIN": [pin("X1", data = {"big": 5000000000})]},
+)
+
+res = pin_solve([P], [pin_request("R", Gpio)])
+check(res["assignment"]["R"]["signals"]["PIN"]["big"] == 5000000000, "large data value must round-trip")
+"#,
+    );
+    assert_ok(&result);
+}
+
+#[test]
 fn pinmap_cap_truncation_warns() {
     let result = eval_with_fixtures(
         r#"
