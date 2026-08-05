@@ -177,6 +177,18 @@ fn assert_fails_with(result: &WithDiagnostics<EvalOutput>, needle: &str) {
     );
 }
 
+fn json_property(result: &WithDiagnostics<EvalOutput>, key: &str) -> serde_json::Value {
+    let props = result.output.as_ref().unwrap().sch_module.properties();
+    let value = props
+        .get(key)
+        .unwrap_or_else(|| panic!("missing module property {key:?}"));
+    let text = value
+        .to_value()
+        .unpack_str()
+        .unwrap_or_else(|| panic!("module property {key:?} is not a string"));
+    serde_json::from_str(text).unwrap()
+}
+
 #[test]
 fn downgrade_and_poorest_instance() {
     let result = eval_with_fixtures(
@@ -645,6 +657,60 @@ check(p1 != p2, "second solve must avoid the claimed pin, got " + p1 + " twice")
 }
 
 #[test]
+fn residual_freedom_excludes_prior_solve_claims() {
+    // free_pins and pool spare_pins must not list a pin an earlier solve owns.
+    let result = eval_with_fixtures(
+        r#"
+load("./ifaces.zen", "Gpio")
+
+POOL = pool("GPIO", provides = [Gpio], pins = ["X1", "X2", "X3"])
+r1 = pin_solve(POOL, [pin_request("A", Gpio)])
+r2 = pin_solve(POOL, [pin_request("B", Gpio)])
+p1 = r1["assignment"]["A"]["signals"]["PIN"]["pin"]
+check(p1 not in r2["free_pins"], "free_pins must exclude the pin claimed by the first solve")
+check(len(r2["free_pins"]) == 1, "one pool pin left, got " + str(r2["free_pins"]))
+pools = [c for c in r2["swap_classes"] if c["granularity"] == "pin"]
+check(len(pools) == 1, "expected one pool class")
+check(p1 not in pools[0]["spare_pins"], "spare_pins must exclude the pin claimed by the first solve")
+"#,
+    );
+    assert_ok(&result);
+
+    // Per-signal alternates must not offer a pin an earlier solve owns.
+    let result = eval_with_fixtures(
+        r#"
+load("./ifaces.zen", "Gpio")
+
+P1 = peripheral("P1", provides = [Gpio], rebind = "firmware",
+    signals = {"PIN": [pin("X1"), pin("X2")]})
+P2 = peripheral("P2", provides = [Gpio], rebind = "firmware",
+    signals = {"PIN": [pin("X1"), pin("X2")]})
+r1 = pin_solve([P1, P2], [pin_request("A", Gpio)])
+r2 = pin_solve([P1, P2], [pin_request("B", Gpio)])
+p1 = r1["assignment"]["A"]["signals"]["PIN"]["pin"]
+alts = r2["assignment"]["B"]["alternates"]
+check(p1 not in alts.get("PIN", []), "alternates must exclude the pin claimed by the first solve")
+"#,
+    );
+    assert_ok(&result);
+
+    // Cluster spare_units must not offer a unit an earlier solve owns: with
+    // both comparator units taken across two solves, no swap class remains.
+    let result = eval_with_fixtures(
+        r#"
+load("./comparator.zen", "PERIPHS")
+load("./ifaces.zen", "Comparator")
+
+pin_solve(PERIPHS, [pin_request("CMP1", Comparator)])
+r2 = pin_solve(PERIPHS, [pin_request("CMP2", Comparator)])
+clusters = [c for c in r2["swap_classes"] if c["granularity"] == "cluster"]
+check(len(clusters) == 0, "no residual cluster freedom once both units are claimed, got " + str(clusters))
+"#,
+    );
+    assert_ok(&result);
+}
+
+#[test]
 fn misused_previous_warns() {
     let result = eval_with_fixtures(
         r#"
@@ -697,6 +763,136 @@ pin_solve(PERIPHS, [pin_request("LED", Gpio)])
         assignment.contains("DEBUG") && assignment.contains("LED"),
         "both solves must reach the property, got:\n{assignment}"
     );
+}
+
+#[test]
+fn swap_classes_property_merges_pool_solves() {
+    // Two solves on one pool merge into a single property class whose spares
+    // reflect every claim in the module, not just the last solve's.
+    let result = eval_with_fixtures(
+        r#"
+load("./ifaces.zen", "Gpio")
+
+POOL = pool("GPIO", provides = [Gpio], pins = ["X1", "X2", "X3", "X4"])
+pin_solve(POOL, [pin_request("A", Gpio)])
+pin_solve(POOL, [pin_request("B", Gpio)])
+"#,
+    );
+    assert_ok(&result);
+    let swaps = json_property(&result, "swap_classes");
+    let classes = swaps.as_array().unwrap();
+    assert_eq!(classes.len(), 1, "one merged pool class, got {swaps}");
+    let members = classes[0]["members"].as_array().unwrap();
+    let requests: Vec<&str> = members
+        .iter()
+        .map(|m| m["request"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        requests,
+        ["A", "B"],
+        "members from both solves, got {swaps}"
+    );
+    let member_pins: Vec<&str> = members.iter().map(|m| m["pin"].as_str().unwrap()).collect();
+    let spares: Vec<&str> = classes[0]["spare_pins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap())
+        .collect();
+    assert_eq!(spares.len(), 2, "two of four pool pins left, got {swaps}");
+    assert!(
+        spares.iter().all(|s| !member_pins.contains(s)),
+        "spares must exclude claimed pins, got {swaps}"
+    );
+}
+
+#[test]
+fn resolving_one_member_keeps_its_siblings_in_the_property() {
+    // Re-solving A must not drop B's membership from the shared class.
+    let result = eval_with_fixtures(
+        r#"
+load("./ifaces.zen", "Gpio")
+
+POOL = pool("GPIO", provides = [Gpio], pins = ["X1", "X2"])
+pin_solve(POOL, [pin_request("A", Gpio), pin_request("B", Gpio)])
+pin_solve(POOL, [pin_request("A", Gpio)])
+"#,
+    );
+    assert_ok(&result);
+    let swaps = json_property(&result, "swap_classes");
+    let classes = swaps.as_array().unwrap();
+    assert_eq!(classes.len(), 1, "one merged pool class, got {swaps}");
+    let requests: Vec<&str> = classes[0]["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["request"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        requests,
+        ["A", "B"],
+        "the sibling survives the re-solve, got {swaps}"
+    );
+}
+
+#[test]
+fn cluster_property_merges_and_refreshes_spares_across_solves() {
+    // Cluster classes from separate solves over the same silicon merge, and
+    // spare units drop out as later solves occupy them.
+    let result = eval_with_fixtures(
+        r#"
+load("./ifaces.zen", "Comparator")
+
+UNIT_A = peripheral("A", provides = [Comparator], rebind = "none",
+    signals = {"INP": [pin("1")], "INN": [pin("2")], "OUT": [pin("3")]})
+UNIT_B = peripheral("B", provides = [Comparator], rebind = "none",
+    signals = {"INP": [pin("5")], "INN": [pin("6")], "OUT": [pin("7")]})
+UNIT_C = peripheral("C", provides = [Comparator], rebind = "none",
+    signals = {"INP": [pin("8")], "INN": [pin("9")], "OUT": [pin("10")]})
+PERIPHS = [UNIT_A, UNIT_B, UNIT_C]
+
+pin_solve(PERIPHS, [pin_request("CMP1", Comparator)])
+pin_solve(PERIPHS, [pin_request("CMP2", Comparator)])
+"#,
+    );
+    assert_ok(&result);
+    let swaps = json_property(&result, "swap_classes");
+    let classes = swaps.as_array().unwrap();
+    assert_eq!(classes.len(), 1, "one merged cluster class, got {swaps}");
+    let members = classes[0]["members"].as_array().unwrap();
+    let requests: Vec<&str> = members
+        .iter()
+        .map(|m| m["request"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        requests,
+        ["CMP1", "CMP2"],
+        "members from both solves, got {swaps}"
+    );
+    let member_units: Vec<&str> = members
+        .iter()
+        .map(|m| m["instance"].as_str().unwrap())
+        .collect();
+    let spares: Vec<&str> = classes[0]["spare_units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap())
+        .collect();
+    assert_eq!(spares.len(), 1, "one unit left, got {swaps}");
+    assert!(
+        spares.iter().all(|s| !member_units.contains(s)),
+        "spare units must exclude occupied units, got {swaps}"
+    );
+}
+
+#[test]
+fn reserved_interface_kwargs_misuse_mentions_reservation() {
+    let result = eval_with_fixtures("A = interface(X = Net, attrs = Net)\n");
+    assert_fails_with(&result, "reserved for capability metadata");
+
+    let result = eval_with_fixtures("B = interface(X = Net, implies = Net)\n");
+    assert_fails_with(&result, "reserved for capability metadata");
 }
 
 #[test]

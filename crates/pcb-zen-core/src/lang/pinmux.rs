@@ -1403,22 +1403,27 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
 
         // Pin/instance exclusivity spans every pin_solve of the module:
         // candidates claimed by another solve's requests are unavailable
-        // (a re-solved request releases its own claims).
-        if let Some(ctx) = eval.context_value() {
-            let current: HashSet<String> = reqs.iter().map(|r| r.name.clone()).collect();
-            let (claimed_instances, claimed_pins) = ctx.pin_claims_excluding(&current);
-            if !(claimed_instances.is_empty() && claimed_pins.is_empty()) {
-                for (i, combos) in all_combos.iter_mut().enumerate() {
-                    combos.retain(|c| {
-                        !claimed_instances.contains(&periphs[c.periph_idx].name)
-                            && !c.pins.iter().any(|(_, p)| claimed_pins.contains(&p.name))
-                    });
-                    if combos.is_empty() {
-                        return Err(anyhow::anyhow!(
-                            "pin_solve: request `{}`: every candidate uses a pin or instance already claimed by an earlier pin_solve in this module",
-                            reqs[i].name
-                        ));
-                    }
+        // (a re-solved request releases its own claims). The claimed sets
+        // also seed the reported residual freedom below, so free/alternate/
+        // spare listings match the exclusivity the solver enforces.
+        let (claimed_instances, claimed_pins) = eval
+            .context_value()
+            .map(|ctx| {
+                let current: HashSet<String> = reqs.iter().map(|r| r.name.clone()).collect();
+                ctx.pin_claims_excluding(&current)
+            })
+            .unwrap_or_default();
+        if !(claimed_instances.is_empty() && claimed_pins.is_empty()) {
+            for (i, combos) in all_combos.iter_mut().enumerate() {
+                combos.retain(|c| {
+                    !claimed_instances.contains(&periphs[c.periph_idx].name)
+                        && !c.pins.iter().any(|(_, p)| claimed_pins.contains(&p.name))
+                });
+                if combos.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "pin_solve: request `{}`: every candidate uses a pin or instance already claimed by an earlier pin_solve in this module",
+                        reqs[i].name
+                    ));
                 }
             }
         }
@@ -1479,8 +1484,10 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
             }
         };
 
-        // Build results (JSON first; the Starlark value mirrors it).
-        let mut used_pins: HashSet<String> = HashSet::new();
+        // Build results (JSON first; the Starlark value mirrors it). Pins
+        // claimed by earlier solves count as used: alternates, spares and
+        // free_pins must never offer a pin another request already owns.
+        let mut used_pins: HashSet<String> = claimed_pins;
         for (i, &ci) in chosen.iter().enumerate() {
             for (_, p) in &all_combos[i][ci].pins {
                 used_pins.insert(p.name.clone());
@@ -1551,9 +1558,28 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
             assignment.insert(r.name.clone(), serde_json::Value::Object(entry));
         }
 
+        // Instances occupied module-wide: this solve's choices plus earlier
+        // solves' claims. Spare-unit listings (and the property merge below)
+        // must never offer an occupied unit.
+        let assigned_instances: HashSet<String> = chosen
+            .iter()
+            .enumerate()
+            .map(|(i, &ci)| periphs[all_combos[i][ci].periph_idx].name.clone())
+            .chain(claimed_instances.iter().cloned())
+            .collect();
+
         // Residual freedom: pool classes (pin granularity) + identical-provides
-        // rebind="none" clusters (gate swap).
-        let mut swap_classes: Vec<serde_json::Value> = Vec::new();
+        // rebind="none" clusters (gate swap). Collected unfiltered: the
+        // emission rule (two members, or one member plus spares) runs on the
+        // returned value now, and again on the merged module property once
+        // prior solves' members are folded in — a class below the threshold
+        // alone can cross it combined with an earlier solve's members.
+        // (pool, rebind, members as (request, pin), spare pins)
+        type PoolClass = (String, String, Vec<(String, String)>, Vec<String>);
+        // (unit names, members as (request, unit), spare units)
+        type ClusterClass = (HashSet<String>, Vec<(String, String)>, Vec<String>);
+        let mut pool_classes: Vec<PoolClass> = Vec::new();
+        let mut cluster_classes: Vec<ClusterClass> = Vec::new();
         {
             let mut by_pool: Vec<(String, Vec<(String, String)>)> = Vec::new();
             for (i, r) in reqs.iter().enumerate() {
@@ -1587,18 +1613,7 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
                     .find(|p| p.pool.as_deref() == Some(pool.as_str()))
                     .map(|p| p.rebind.clone())
                     .unwrap_or_else(|| "firmware".to_owned());
-                if members.len() >= 2 || (!members.is_empty() && !spares.is_empty()) {
-                    swap_classes.push(serde_json::json!({
-                        "granularity": "pin",
-                        "rebind": rebind,
-                        "pool": pool,
-                        "members": members
-                            .iter()
-                            .map(|(r, p)| serde_json::json!({"request": r, "pin": p}))
-                            .collect::<Vec<_>>(),
-                        "spare_pins": spares,
-                    }));
-                }
+                pool_classes.push((pool, rebind, members, spares));
             }
 
             let mut by_cluster: Vec<(String, Vec<(String, String)>)> = Vec::new();
@@ -1625,34 +1640,56 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
                 members.sort();
             }
             by_cluster.sort_by(|a, b| a.1.cmp(&b.1));
-            let assigned_instances: HashSet<String> = chosen
-                .iter()
-                .enumerate()
-                .map(|(i, &ci)| periphs[all_combos[i][ci].periph_idx].name.clone())
-                .collect();
             for (key, members) in by_cluster {
-                let mut spares: Vec<String> = periphs
+                let units: HashSet<String> = periphs
                     .iter()
-                    .filter(|p| {
-                        p.rebind == "none"
-                            && p.pool.is_none()
-                            && p.provides_key() == key
-                            && !assigned_instances.contains(&p.name)
-                    })
+                    .filter(|p| p.rebind == "none" && p.pool.is_none() && p.provides_key() == key)
                     .map(|p| p.name.clone())
                     .collect();
+                let mut spares: Vec<String> = units
+                    .iter()
+                    .filter(|n| !assigned_instances.contains(*n))
+                    .cloned()
+                    .collect();
                 spares.sort();
-                if members.len() >= 2 || (!members.is_empty() && !spares.is_empty()) {
-                    swap_classes.push(serde_json::json!({
-                        "granularity": "cluster",
-                        "rebind": "none",
-                        "members": members
-                            .iter()
-                            .map(|(r, u)| serde_json::json!({"request": r, "instance": u}))
-                            .collect::<Vec<_>>(),
-                        "spare_units": spares,
-                    }));
-                }
+                cluster_classes.push((units, members, spares));
+            }
+        }
+        let emits = |members: &[(String, String)], n_spares: usize| {
+            members.len() >= 2 || (!members.is_empty() && n_spares > 0)
+        };
+        let pool_class_json = |(pool, rebind, members, spares): &PoolClass| {
+            serde_json::json!({
+                "granularity": "pin",
+                "rebind": rebind,
+                "pool": pool,
+                "members": members
+                    .iter()
+                    .map(|(r, p)| serde_json::json!({"request": r, "pin": p}))
+                    .collect::<Vec<_>>(),
+                "spare_pins": spares,
+            })
+        };
+        let cluster_class_json = |(_, members, spares): &ClusterClass| {
+            serde_json::json!({
+                "granularity": "cluster",
+                "rebind": "none",
+                "members": members
+                    .iter()
+                    .map(|(r, u)| serde_json::json!({"request": r, "instance": u}))
+                    .collect::<Vec<_>>(),
+                "spare_units": spares,
+            })
+        };
+        let mut swap_classes: Vec<serde_json::Value> = Vec::new();
+        for c in &pool_classes {
+            if emits(&c.2, c.3.len()) {
+                swap_classes.push(pool_class_json(c));
+            }
+        }
+        for c in &cluster_classes {
+            if emits(&c.1, c.2.len()) {
+                swap_classes.push(cluster_class_json(c));
             }
         }
 
@@ -1681,32 +1718,143 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
                     .as_object_mut()
                     .expect("assignment is an object");
                 for (k, v) in prev_obj {
-                    cur.entry(k.clone()).or_insert_with(|| v.clone());
+                    cur.entry(k.clone()).or_insert_with(|| {
+                        // Prior alternates net of pins this solve claimed.
+                        let mut v = v.clone();
+                        if let Some(alts) = v.get_mut("alternates").and_then(|a| a.as_object_mut())
+                        {
+                            for list in alts.values_mut() {
+                                if let Some(arr) = list.as_array_mut() {
+                                    arr.retain(|p| {
+                                        p.as_str().map(|n| !used_pins.contains(n)).unwrap_or(true)
+                                    });
+                                }
+                            }
+                            alts.retain(|_, l| l.as_array().is_none_or(|a| !a.is_empty()));
+                        }
+                        v
+                    });
                 }
             }
             if let Some(prev) = prior("swap_classes")
                 && let Some(prev_arr) = prev.as_array()
             {
+                // Prior classes stay live, minus what this solve consumed:
+                // re-solved members leave their old class (their freedom is
+                // stale), spares lose newly claimed pins/units, and members
+                // on a pool or cluster this solve touched again fold into the
+                // fresh class — whose spares already account for every claim
+                // in the module — so one class never fragments across solves.
                 let solved: HashSet<&str> = reqs.iter().map(|r| r.name.as_str()).collect();
-                let mut merged: Vec<serde_json::Value> = prev_arr
-                    .iter()
-                    .filter(|class| {
+                let parse_members =
+                    |class: &serde_json::Value, value_key: &str| -> Vec<(String, String)> {
                         class
                             .get("members")
                             .and_then(|m| m.as_array())
-                            .map(|members| {
-                                members.iter().all(|m| {
-                                    m.get("request")
-                                        .and_then(|r| r.as_str())
-                                        .map(|n| !solved.contains(n))
-                                        .unwrap_or(true)
-                                })
+                            .map(|ms| {
+                                ms.iter()
+                                    .filter_map(|m| {
+                                        let r = m.get("request").and_then(|v| v.as_str())?;
+                                        let v = m.get(value_key).and_then(|v| v.as_str())?;
+                                        (!solved.contains(r)).then(|| (r.to_owned(), v.to_owned()))
+                                    })
+                                    .collect()
                             })
-                            .unwrap_or(true)
-                    })
-                    .cloned()
-                    .collect();
-                merged.append(property_swaps.as_array_mut().expect("swaps is an array"));
+                            .unwrap_or_default()
+                    };
+                let mut merged_pools = pool_classes.clone();
+                let mut merged_clusters = cluster_classes.clone();
+                let mut merged: Vec<serde_json::Value> = Vec::new();
+                for prior_class in prev_arr {
+                    if prior_class.get("granularity").and_then(|g| g.as_str()) == Some("pin") {
+                        let live = parse_members(prior_class, "pin");
+                        let pool = prior_class
+                            .get("pool")
+                            .and_then(|p| p.as_str())
+                            .unwrap_or_default();
+                        if let Some(cur) = merged_pools.iter_mut().find(|c| c.0 == pool) {
+                            cur.2.extend(live);
+                            cur.2.sort();
+                            continue;
+                        }
+                        // Pool untouched by this solve: keep, net of the pins
+                        // this solve claimed.
+                        let spares: Vec<String> = prior_class
+                            .get("spare_pins")
+                            .and_then(|s| s.as_array())
+                            .map(|s| {
+                                s.iter()
+                                    .filter_map(|p| p.as_str())
+                                    .filter(|n| !used_pins.contains(*n))
+                                    .map(str::to_owned)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if emits(&live, spares.len()) {
+                            let rebind = prior_class
+                                .get("rebind")
+                                .and_then(|r| r.as_str())
+                                .unwrap_or("firmware")
+                                .to_owned();
+                            merged.push(pool_class_json(&(pool.to_owned(), rebind, live, spares)));
+                        }
+                    } else {
+                        let live = parse_members(prior_class, "instance");
+                        // A cluster's identity is its unit set (member units
+                        // plus spares); overlap means the same silicon.
+                        let mut prior_units: HashSet<String> = prior_class
+                            .get("members")
+                            .and_then(|m| m.as_array())
+                            .map(|ms| {
+                                ms.iter()
+                                    .filter_map(|m| m.get("instance").and_then(|v| v.as_str()))
+                                    .map(str::to_owned)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if let Some(spares) =
+                            prior_class.get("spare_units").and_then(|s| s.as_array())
+                        {
+                            prior_units.extend(
+                                spares.iter().filter_map(|s| s.as_str()).map(str::to_owned),
+                            );
+                        }
+                        if let Some(cur) = merged_clusters
+                            .iter_mut()
+                            .find(|c| !c.0.is_disjoint(&prior_units))
+                        {
+                            cur.1.extend(live);
+                            cur.1.sort();
+                            continue;
+                        }
+                        // Cluster untouched by this solve: keep, net of the
+                        // units this solve occupied.
+                        let spares: Vec<String> = prior_class
+                            .get("spare_units")
+                            .and_then(|s| s.as_array())
+                            .map(|s| {
+                                s.iter()
+                                    .filter_map(|u| u.as_str())
+                                    .filter(|n| !assigned_instances.contains(*n))
+                                    .map(str::to_owned)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if emits(&live, spares.len()) {
+                            merged.push(cluster_class_json(&(HashSet::new(), live, spares)));
+                        }
+                    }
+                }
+                for c in &merged_pools {
+                    if emits(&c.2, c.3.len()) {
+                        merged.push(pool_class_json(c));
+                    }
+                }
+                for c in &merged_clusters {
+                    if emits(&c.1, c.2.len()) {
+                        merged.push(cluster_class_json(c));
+                    }
+                }
                 property_swaps = serde_json::Value::Array(merged);
             }
         }
@@ -1719,8 +1867,9 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
             heap.alloc(serde_json::to_string_pretty(&property_swaps).unwrap_or_default()),
         );
 
-        // Candidate pins no served request claimed: the component wires them
-        // as intentionally open (or reuses them), without re-listing them.
+        // Candidate pins no request claimed, in this solve or any earlier one:
+        // the component wires them as intentionally open (or reuses them),
+        // without re-listing them.
         let mut free_pins: Vec<String> = periphs
             .iter()
             .flat_map(|p| p.signals.iter())

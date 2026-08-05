@@ -783,7 +783,9 @@ pub(crate) fn interface_globals(builder: &mut GlobalsBuilder) {
                 let d =
                     starlark::values::dict::DictRef::from_value(v.to_value()).ok_or_else(|| {
                         anyhow::anyhow!(
-                            "interface(attrs=...) must be a dict of attribute name -> physical type"
+                            "interface(attrs=...) must be a dict of attribute name -> physical type; \
+                             `attrs` is reserved for capability metadata — rename the field if you \
+                             meant a connection field"
                         )
                     })?;
                 for (k, ty) in d.iter() {
@@ -804,7 +806,11 @@ pub(crate) fn interface_globals(builder: &mut GlobalsBuilder) {
             } else if name == "implies" {
                 let list =
                     starlark::values::list::ListRef::from_value(v.to_value()).ok_or_else(|| {
-                        anyhow::anyhow!("interface(implies=...) must be a list of interface types")
+                        anyhow::anyhow!(
+                            "interface(implies=...) must be a list of interface types; `implies` \
+                             is reserved for capability metadata — rename the field if you meant \
+                             a connection field"
+                        )
                     })?;
                 for item in list.iter() {
                     if item.downcast_ref::<InterfaceFactory<'v>>().is_none()

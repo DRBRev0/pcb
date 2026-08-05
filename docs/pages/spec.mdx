@@ -409,7 +409,7 @@ absent from the assignment (e.g. dropped by `if_connected`) are skipped.
 |-----|---------|
 | `assignment` | Per request: the chosen instance and pin per signal (with each pin's realization `data`), plus free alternates |
 | `swap_classes` | Residual swap freedom: pool classes with spare pins, gate-swap clusters |
-| `free_pins` | Candidate pins no request claimed — wire them with `{p: NotConnected() for p in res["free_pins"]}` |
+| `free_pins` | Candidate pins no request claimed, in this solve or any earlier `pin_solve` of the module — wire them with `{p: NotConnected() for p in res["free_pins"]}` |
 
 `assignment` and `swap_classes` are also stored as module properties (JSON) —
 several solves in one module merge, keyed by request name — and flow through
