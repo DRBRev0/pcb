@@ -15,7 +15,7 @@ and this project adheres to Semantic Versioning (https://semver.org/spec/v2.0.0.
 - Added `pin_map()` to turn a solved assignment into a `Component(pins=...)`-ready dict: every solved request's pads plus the mux pads no request claimed, tied to `NotConnected()`.
 - Added `pin_request(if_connected=True)` for optional `io()` capability slots and `pin_request(bind=)` for dict-of-roles demands like `Mcu(gpio = {"LED": at(led_net, "PA8")})`.
 - Added `interface(implies = [...])`: capability matching is nominal and closed over the implication DAG (a `Usart` provider satisfies a `Uart` request, never the reverse).
-- Added `interface(attrs = {...})` to declare the capability-attribute vocabulary peripheral attrs are validated against; the stdlib interfaces now declare `clk_max`/`baud_max`/`bitrate_max`/`vio` where applicable.
+- Added `interface(attrs = {...})` to declare the capability-attribute vocabulary peripheral attrs are validated against; the stdlib interfaces now declare `clk_max`/`baud_max`/`bitrate_max`/`vio`, plus `gbw` on `Opamp` and `freq_max` on `OscPair`.
 - Added the stdlib single-signal capability interfaces `AdcIn` and `GpioPin` for ADC inputs and GPIO pools.
 - `pin_solve` now warns when a request's pin-combination enumeration hits the internal cap on wide pin matrices, since the chosen assignment may then be suboptimal.
 - `fab-panel create` now automatically balances copper in the gutters between placed assembly panels.

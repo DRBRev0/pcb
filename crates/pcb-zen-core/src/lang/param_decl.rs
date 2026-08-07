@@ -405,7 +405,7 @@ fn resolve_config<'v>(
     let is_optional = args.optional.unwrap_or(default_value.is_some());
 
     let value = if let Some(provided) = eval.request_input(name)? {
-        crate::lang::pinmux::record_pin_at_in_config(name, provided, eval);
+        let provided = crate::lang::pinmux::record_pin_at_in_config(name, provided, eval);
         convert_value(eval, provided)?
     } else if is_optional {
         default_value.unwrap_or_else(Value::new_none)

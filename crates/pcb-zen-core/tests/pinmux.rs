@@ -1281,6 +1281,170 @@ r2 = pin_solve([A, B], [], config = {"wifi": True})
 }
 
 #[test]
+fn a_role_dict_records_the_net_not_the_wrapper() {
+    // The constraint goes to the store; what the module records is the
+    // connection, or the netlist would carry a placeholder for that role.
+    let result = eval_zen(vec![
+        ("/ifaces.zen".to_string(), IFACES.to_string()),
+        (
+            "/mcu.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "pool", "pin_request", "pin_solve")
+load("./ifaces.zen", "Gpio")
+P = pool("GPIO", provides = [Gpio], pins = ["PA0", "PA1"])
+GPIO = config("gpio", dict, optional = True)
+res = pin_solve([P], [pin_request(k, Gpio, bind = v) for k, v in (GPIO or {}).items()])
+"#
+            .to_string(),
+        ),
+        (
+            "/test.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "at")
+load("./ifaces.zen", "Gpio")
+Mcu = Module("/mcu.zen")
+Mcu(name = "U1", gpio = {"LED": at(Gpio("L"), "PA1")})
+"#
+            .to_string(),
+        ),
+    ]);
+    assert_ok(&result);
+
+    let recorded: Vec<String> = result
+        .output
+        .as_ref()
+        .map(|o| {
+            o.module_tree()
+                .values()
+                .flat_map(|m| {
+                    m.signature()
+                        .iter()
+                        .filter(|p| p.name == "gpio")
+                        .filter_map(|p| p.actual_value.as_ref())
+                        .map(|v| v.to_value().to_string())
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        recorded.iter().all(|v| !v.contains("at(")),
+        "the role holds its net, got {recorded:?}"
+    );
+    assert!(
+        recorded.iter().any(|v| v.contains("LED")),
+        "and the net is still there, got {recorded:?}"
+    );
+}
+
+#[test]
+fn two_ats_on_one_net_read_the_same_either_side_of_io() {
+    // Each input carries its own constraint, so which side of the solve the
+    // io() calls sit on must not change the answer.
+    for (label, body) in [
+        (
+            "solve after io()",
+            r#"
+load("@stdlib/pinmux.zen", "pool", "pin_request", "pin_solve")
+load("./ifaces.zen", "Gpio")
+P = pool("GPIO", provides = [Gpio], pins = ["P1", "P2", "P3"])
+A = io(Gpio)
+B = io(Gpio)
+res = pin_solve([P], [pin_request("A", Gpio), pin_request("B", Gpio)])
+builtin.add_property("a", res["assignment"]["A"]["signals"]["PIN"]["pin"])
+builtin.add_property("b", res["assignment"]["B"]["signals"]["PIN"]["pin"])
+"#,
+        ),
+        (
+            "solve before io()",
+            r#"
+load("@stdlib/pinmux.zen", "pool", "pin_request", "pin_solve")
+load("./ifaces.zen", "Gpio")
+P = pool("GPIO", provides = [Gpio], pins = ["P1", "P2", "P3"])
+res = pin_solve([P], [pin_request("A", Gpio), pin_request("B", Gpio)])
+A = io(Gpio)
+B = io(Gpio)
+builtin.add_property("a", res["assignment"]["A"]["signals"]["PIN"]["pin"])
+builtin.add_property("b", res["assignment"]["B"]["signals"]["PIN"]["pin"])
+"#,
+        ),
+    ] {
+        let result = eval_zen(vec![
+            ("/ifaces.zen".to_string(), IFACES.to_string()),
+            ("/mcu.zen".to_string(), body.to_string()),
+            (
+                "/test.zen".to_string(),
+                r#"
+load("@stdlib/pinmux.zen", "at")
+load("./ifaces.zen", "Gpio")
+N = Gpio("SHARED")
+Mcu = Module("/mcu.zen")
+Mcu(name = "U1", A = at(N, "P2"), B = at(N, "P3"))
+"#
+                .to_string(),
+            ),
+        ]);
+        assert_ok(&result);
+        let pins: Vec<String> = result
+            .output
+            .as_ref()
+            .map(|o| {
+                o.module_tree()
+                    .values()
+                    .flat_map(|m| {
+                        ["a", "b"].iter().filter_map(move |k| {
+                            m.properties()
+                                .get(*k)
+                                .and_then(|v| v.to_value().unpack_str().map(|s| format!("{k}={s}")))
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(pins, ["a=P2", "b=P3"], "{label}, got {pins:?}");
+    }
+}
+
+#[test]
+fn alternates_leave_out_pads_the_request_could_not_take() {
+    // An output request never lands on an input-only pad, so its reported
+    // freedom must not offer one either.
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
+load("./ifaces.zen", "Gpio")
+P = peripheral("P", provides = [Gpio], rebind = "fixed",
+    signals = {"PIN": [pin("PA0"), pin("PA1", input_only = True), pin("PA2")]})
+res = pin_solve([P], [pin_request("A", Gpio, direction = "output")])
+alts = res["assignment"]["A"]["alternates"]["PIN"]
+check(alts == ["PA2"], "input-only pads are not alternates, got " + str(alts))
+"#,
+    );
+    assert_ok(&result);
+}
+
+#[test]
+fn an_assignment_serving_nobody_says_so() {
+    // Nothing was served, so the map has no part to infer; the message must
+    // point at that rather than claim the assignment spans components.
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "pool", "pin_request", "pin_solve", "pin_map")
+load("./ifaces.zen", "Gpio")
+A = pool("GPIO", part = "U1", provides = [Gpio], pins = ["PA0"])
+B = pool("GPIO", part = "U2", provides = [Gpio], pins = ["PB0"])
+pin_solve([A], [pin_request("X", Gpio)])
+r = pin_solve([B], [])
+m = pin_map(r["assignment"], {})
+"#,
+    );
+    assert_fails_with(
+        &result,
+        "serves no request and the module solved `U1`, `U2`",
+    );
+}
+
+#[test]
 fn a_role_named_like_a_config_still_gets_its_at() {
     // Role names come from caller data and may collide with a config() name;
     // the role carries its own value, so the collision must not disarm it.
