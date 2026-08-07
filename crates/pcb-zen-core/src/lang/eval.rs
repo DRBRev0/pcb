@@ -946,6 +946,7 @@ impl EvalSession {
     /// since schematic conversion reads the shared module tree from the session.
     pub fn prepare_for_root_eval(&self) {
         self.clear_module_tree();
+        self.pin_constraints.lock().unwrap().clear();
     }
 
     // --- Module tree ---

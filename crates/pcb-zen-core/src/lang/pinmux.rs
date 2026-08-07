@@ -70,42 +70,85 @@ fn iface_fields<'v>(v: Value<'v>) -> Option<Vec<(String, Value<'v>)>> {
 #[derive(Default)]
 pub(crate) struct PinConstraints {
     entries: Vec<PinConstraintEntry>,
-    by_net: HashMap<u64, usize>,
-    /// Nets a solve already handled straight off the `at()` wrapper.
-    preconsumed: HashSet<u64>,
+    by_net: HashMap<u64, Vec<usize>>,
+    /// Credits left by solves that read an `at()` wrapper before its io()
+    /// bound: one credit pairs with exactly one later `record` on that net.
+    preconsumed: HashMap<u64, usize>,
 }
 
 struct PinConstraintEntry {
     input: String,
     module: String,
+    /// Instance whose io() carried the wrapper. A solve may claim this entry
+    /// only from that instance or below it, so two parts sharing a net each
+    /// get their own constraint.
+    owner: Vec<String>,
     lock: PinLock,
     soft: bool,
     consumed: bool,
 }
 
 impl PinConstraints {
-    fn record(&mut self, input: String, module: String, nets: &[u64], lock: PinLock, soft: bool) {
-        let consumed = nets.iter().any(|n| self.preconsumed.contains(n));
+    fn record(
+        &mut self,
+        input: String,
+        module: String,
+        owner: Vec<String>,
+        nets: &[u64],
+        lock: PinLock,
+        soft: bool,
+    ) {
+        let consumed = nets
+            .iter()
+            .any(|n| self.preconsumed.get(n).is_some_and(|c| *c > 0));
+        if consumed {
+            for n in nets {
+                if let Some(c) = self.preconsumed.get_mut(n) {
+                    *c -= 1;
+                }
+            }
+        }
         let idx = self.entries.len();
         self.entries.push(PinConstraintEntry {
             input,
             module,
+            owner,
             lock,
             soft,
             consumed,
         });
         for n in nets {
-            self.by_net.insert(*n, idx);
+            self.by_net.entry(*n).or_default().push(idx);
         }
     }
 
-    fn preconsume(&mut self, nets: &[u64]) {
-        self.preconsumed.extend(nets.iter().copied());
+    /// Clear everything: the store spans one root evaluation, not the session.
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+        self.by_net.clear();
+        self.preconsumed.clear();
     }
 
-    /// Claim the constraint riding on any of `nets`, marking it consumed.
-    fn claim(&mut self, nets: &[u64]) -> Option<(PinLock, bool)> {
-        let idx = nets.iter().find_map(|n| self.by_net.get(n).copied())?;
+    fn preconsume(&mut self, nets: &[u64]) {
+        for n in nets {
+            *self.preconsumed.entry(*n).or_default() += 1;
+        }
+    }
+
+    /// Claim the constraint riding on any of `nets` that `solver` is entitled
+    /// to: the closest enclosing instance wins, so a nested solve still sees a
+    /// constraint applied above it without stealing a sibling's.
+    fn claim(&mut self, nets: &[u64], solver: &[String]) -> Option<(PinLock, bool)> {
+        let idx = nets
+            .iter()
+            .filter_map(|n| self.by_net.get(n))
+            .flatten()
+            .copied()
+            .filter(|i| {
+                let e = &self.entries[*i];
+                !e.consumed && solver.starts_with(&e.owner)
+            })
+            .max_by_key(|i| self.entries[*i].owner.len())?;
         let e = &mut self.entries[idx];
         e.consumed = true;
         Some((e.lock.clone(), e.soft))
@@ -281,6 +324,8 @@ struct RPin {
 struct RPeriph<'v> {
     name: String,
     provides_ids: HashSet<TypeInstanceId>,
+    /// Display names of everything provided, for diagnostics only.
+    provides_names: HashSet<String>,
     signals: Vec<(String, Vec<RPin>)>,
     rebind: String,
     attrs: Value<'v>,
@@ -402,9 +447,11 @@ fn parse_rperiph<'v>(v: Value<'v>, heap: Heap<'v>) -> anyhow::Result<RPeriph<'v>
     let provides_list = ListRef::from_value(provides)
         .ok_or_else(|| anyhow::anyhow!("peripheral `{name}`: provides must be a list"))?;
     let mut provides_ids = HashSet::new();
+    let mut provides_names = HashSet::new();
     for p in provides_list.iter() {
         for info in iface_closure(p)? {
             provides_ids.insert(info.id);
+            provides_names.insert(info.name.clone());
         }
     }
     let signals_v = dict_get(&d, heap, "signals")
@@ -433,6 +480,7 @@ fn parse_rperiph<'v>(v: Value<'v>, heap: Heap<'v>) -> anyhow::Result<RPeriph<'v>
     Ok(RPeriph {
         name,
         provides_ids,
+        provides_names,
         signals,
         rebind: dict_get_str(&d, heap, "rebind").unwrap_or_else(|| "firmware".to_owned()),
         attrs: dict_get(&d, heap, "attrs").unwrap_or_else(Value::new_none),
@@ -593,10 +641,17 @@ fn combos_for_request<'v>(
             continue;
         }
         if !p.provides_ids.contains(&req.iface_id) {
-            rejects.push((
-                p.name.clone(),
-                format!("does not provide {}", req.iface_name),
-            ));
+            // Same display name, different identity: two `interface()` calls,
+            // which are two capabilities however alike they look.
+            let reason = if p.provides_names.contains(&req.iface_name) {
+                format!(
+                    "provides a different {} — capability types are per interface() declaration, so two declarations never match",
+                    req.iface_name
+                )
+            } else {
+                format!("does not provide {}", req.iface_name)
+            };
+            rejects.push((p.name.clone(), reason));
             continue;
         }
         if let Some(inst) = &req.instance
@@ -607,12 +662,20 @@ fn combos_for_request<'v>(
             continue;
         }
         if let Some(where_fn) = req.where_fn {
-            let verdict = eval.eval_function(where_fn, &[p.attrs], &[]).map_err(|e| {
-                anyhow::anyhow!("request `{}`: where= predicate failed: {e}", req.name)
-            })?;
-            if !verdict.to_bool() {
-                rejects.push((p.name.clone(), "where= predicate rejected".to_owned()));
-                continue;
+            // A predicate that trips over an attr this provider does not set
+            // rejects the candidate; it must not sink the whole solve.
+            match eval.eval_function(where_fn, &[p.attrs], &[]) {
+                Ok(v) if v.to_bool() => {}
+                Ok(_) => {
+                    rejects.push((p.name.clone(), "where= predicate rejected".to_owned()));
+                    continue;
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    let first = msg.lines().next().unwrap_or("error").trim().to_owned();
+                    rejects.push((p.name.clone(), format!("where= predicate failed: {first}")));
+                    continue;
+                }
             }
         }
 
@@ -642,10 +705,11 @@ fn combos_for_request<'v>(
             continue;
         }
 
-        // Shape the enumeration so PINMAP_CAP truncation cannot drop the
-        // constrained combinations. A per-signal lock restricts that signal
-        // exactly; `any` pins can only be narrowed when they must fill every
-        // signal. Otherwise constrained pins are just enumerated first.
+        // Narrow the enumeration where the lock allows it: a per-signal entry
+        // restricts that signal exactly, `any` pins only when they must fill
+        // every signal. Otherwise they are merely enumerated first, so a wide
+        // matrix can still truncate away a feasible combination — the `capped`
+        // warning covers that case.
         let mut starved: Option<(String, Vec<String>)> = None;
         if req.lock {
             let covering = !req.prefer.any.is_empty() && req.prefer.any.len() == req.uses.len();
@@ -1110,10 +1174,14 @@ pub(crate) fn unwrap_pin_at<'v>(
                 && let Some(store) = eval.eval_context().map(|c| c.pin_constraints())
             {
                 let module = eval.source_path().unwrap_or_default();
+                let owner = eval
+                    .context_value()
+                    .map(|ctx| ctx.module().path().segments.clone())
+                    .unwrap_or_default();
                 store
                     .lock()
                     .unwrap()
-                    .record(name.to_owned(), module, &nets, lock, soft);
+                    .record(name.to_owned(), module, owner, &nets, lock, soft);
             }
             inner
         }
@@ -1717,6 +1785,7 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
         // input's nets.
         let store = eval.eval_context().map(|c| c.pin_constraints());
         if let (Some(ctx), Some(store)) = (eval.context_value(), store) {
+            let solver: Vec<String> = ctx.module().path().segments.clone();
             for r in reqs.iter_mut() {
                 if configs.contains(&r.name) {
                     continue;
@@ -1741,11 +1810,11 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                     // Claim covers an io() that already bound, preconsume one
                     // that binds after this solve.
                     Some(c) => {
-                        store.claim(&nets);
+                        store.claim(&nets, &solver);
                         store.preconsume(&nets);
                         Some(c)
                     }
-                    None => store.claim(&nets),
+                    None => store.claim(&nets, &solver),
                 };
                 if let Some((pins, soft)) = constraint {
                     r.prefer = pins;
@@ -2407,5 +2476,49 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
             );
         }
         Ok(heap.alloc(AllocDict(out)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Inline because the scenario is not reachable from `.zen`: whether a
+    /// second constraint on the same net is recorded before or after the early
+    /// solve depends on child-evaluation order, which a design cannot control.
+    #[test]
+    fn a_preconsume_credit_absolves_one_later_entry_only() {
+        let lock = |pin: &str| PinLock {
+            any: vec![pin.to_owned()],
+            by_signal: Vec::new(),
+        };
+        let owner = |seg: &str| vec![seg.to_owned()];
+
+        let mut c = PinConstraints::default();
+        c.preconsume(&[5]);
+        c.record(
+            "A".into(),
+            "a.zen".into(),
+            owner("A"),
+            &[5],
+            lock("PA1"),
+            false,
+        );
+        c.record(
+            "B".into(),
+            "b.zen".into(),
+            owner("B"),
+            &[5],
+            lock("PA2"),
+            false,
+        );
+
+        let left = c.unconsumed_hard();
+        assert_eq!(
+            left.len(),
+            1,
+            "only the unapplied one remains, got {left:?}"
+        );
+        assert_eq!(left[0].1, "B");
     }
 }

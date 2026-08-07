@@ -8,6 +8,9 @@ mod common;
 use common::eval_zen;
 use pcb_zen_core::WithDiagnostics;
 use pcb_zen_core::lang::eval::EvalOutput;
+use pcb_zen_core::lang::eval::{EvalContext, EvalContextConfig, EvalSession};
+use std::path::PathBuf;
+use std::sync::Arc;
 
 const IFACES: &str = r#"
 Frequency = 1 / builtin.Time
@@ -1717,7 +1720,7 @@ pin_solve(P, [pin_request("C", Uart2)])
             .to_string(),
         ),
     ]);
-    assert_fails_with(&result, "U0: rejected — does not provide Uart");
+    assert_fails_with(&result, "U0: rejected — provides a different Uart");
 }
 
 #[test]
@@ -2077,4 +2080,134 @@ Mcu(name = "U1", COM = at(Uart("BUS"), {"TX": "PB6"}))
         .next()
         .unwrap_or_default();
     assert_eq!(tx, "PB6", "at() dict must pin the named signal");
+}
+
+#[test]
+fn two_parts_pinning_one_shared_net_each_get_their_own() {
+    let part = |p: &str| {
+        format!(
+            r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
+load("./ifaces.zen", "Gpio")
+P = peripheral("P0", provides = [Gpio], rebind = "fixed",
+    signals = {{"PIN": [pin("{p}"), pin("OTHER")]}})
+BUS = io("BUS", Gpio)
+res = pin_solve([P], [pin_request("BUS", Gpio)])
+builtin.add_property("chosen", res["assignment"]["BUS"]["signals"]["PIN"]["pin"])
+"#
+        )
+    };
+    let result = eval_zen(vec![
+        ("/ifaces.zen".to_string(), IFACES.to_string()),
+        ("/a.zen".to_string(), part("PB7")),
+        ("/b.zen".to_string(), part("P3")),
+        (
+            "/test.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "at")
+load("./ifaces.zen", "Gpio")
+A = Module("./a.zen")
+B = Module("./b.zen")
+bus = Gpio("SHARED")
+A(name = "A", BUS = at(bus, "PB7"))
+B(name = "B", BUS = at(bus, "P3"))
+"#
+            .to_string(),
+        ),
+    ]);
+    assert_ok(&result);
+    let chosen: Vec<(String, String)> = result
+        .output
+        .as_ref()
+        .unwrap()
+        .module_tree()
+        .iter()
+        .filter_map(|(path, m)| {
+            let v = m.properties().get("chosen")?;
+            Some((
+                path.segments.join("."),
+                v.to_value().unpack_str()?.to_owned(),
+            ))
+        })
+        .collect();
+    assert_eq!(
+        chosen,
+        [
+            ("A".to_string(), "PB7".to_string()),
+            ("B".to_string(), "P3".to_string())
+        ],
+        "each part must get the pin named at its own call site"
+    );
+}
+
+#[test]
+fn where_predicate_failure_rejects_only_that_candidate() {
+    // B9 declares no `baud_max`, so the predicate raises on it; the solve must
+    // fall through to the provider that does instead of aborting.
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
+load("./ifaces.zen", "Uart")
+
+NOATTR = peripheral("NOATTR", provides = [Uart], rebind = "fixed",
+    signals = {"TX": [pin("P1")], "RX": [pin("P2")]})
+WITHATTR = peripheral("WITHATTR", provides = [Uart], rebind = "fixed",
+    signals = {"TX": [pin("P3")], "RX": [pin("P4")]},
+    attrs = {"baud_max": "8MHz"})
+
+def fast(a):
+    return a["baud_max"] >= "1MHz"
+
+res = pin_solve([NOATTR, WITHATTR], [pin_request("COM", Uart, where = fast)])
+check(res["assignment"]["COM"]["instance"] == "WITHATTR", "must skip the attr-less provider")
+"#,
+    );
+    assert_ok(&result);
+}
+
+/// A hard `at()` left unconsumed by the first design must not fail the second.
+#[test]
+fn a_failed_design_does_not_poison_the_next_one() {
+    let mut files = common::stdlib_test_files();
+    files.insert(
+        "/leaf.zen".to_string(),
+        "IO0 = io(\"IO0\", Net, optional = True)\n".to_string(),
+    );
+    files.insert(
+        "/a.zen".to_string(),
+        r#"
+load("@stdlib/pinmux.zen", "at")
+Leaf = Module("./leaf.zen")
+Leaf(name = "L", IO0 = at(Net("LED"), "PA9"))
+"#
+        .to_string(),
+    );
+    files.insert("/b.zen".to_string(), "N = Net(\"B\")\n".to_string());
+
+    let file_provider: Arc<dyn pcb_zen_core::FileProvider> =
+        Arc::new(common::InMemoryFileProvider::new(files));
+    let resolution = Arc::new(common::test_resolution());
+    let session = EvalSession::default();
+
+    let eval_root = |path: &str| {
+        session.prepare_for_root_eval();
+        EvalContext::from_session_and_config(
+            session.clone(),
+            EvalContextConfig::new(file_provider.clone(), resolution.clone()),
+        )
+        .set_source_path(PathBuf::from(path))
+        .eval()
+    };
+
+    let a = eval_root("/a.zen");
+    assert!(
+        !a.is_success(),
+        "a.zen must fail on its own unconsumed at()"
+    );
+    let b = eval_root("/b.zen");
+    assert!(
+        b.is_success(),
+        "b.zen must build clean, got: {:#?}",
+        b.diagnostics
+    );
 }
