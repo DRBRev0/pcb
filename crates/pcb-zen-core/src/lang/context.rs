@@ -64,6 +64,14 @@ pub(crate) struct FrozenPendingChild {
     pub(crate) call_stack: CallStack,
 }
 
+/// What one solved `pin_request` took, plus the pad namespace it took it from.
+#[derive(Debug, Clone)]
+pub(crate) struct PinClaim {
+    pub(crate) instance: String,
+    pub(crate) pins: Vec<String>,
+    pub(crate) scope: String,
+}
+
 #[derive(Debug, Trace, ProvidesStaticType, Allocative, Serialize)]
 #[repr(C)]
 pub struct ContextValue<'v> {
@@ -87,11 +95,16 @@ pub struct ContextValue<'v> {
     /// re-solved request releases its own claims.
     #[allocative(skip)]
     #[serde(skip)]
-    pin_claims: RefCell<std::collections::HashMap<String, (String, Vec<String>)>>,
-    /// Net (id, name) each physical pin has been mapped to by `pin_map`.
+    pin_claims: RefCell<std::collections::HashMap<String, PinClaim>>,
+    /// Pads no request claimed, per part scope, for `pin_map` to tie off.
     #[allocative(skip)]
     #[serde(skip)]
-    mapped_pins: RefCell<std::collections::HashMap<String, (u64, String)>>,
+    free_pads: RefCell<std::collections::HashMap<String, Vec<String>>>,
+    /// Net (id, name) each physical pin has been mapped to by `pin_map`,
+    /// keyed by `(part scope, pin)`: two components may share pin names.
+    #[allocative(skip)]
+    #[serde(skip)]
+    mapped_pins: RefCell<std::collections::HashMap<(String, String), (u64, String)>>,
 }
 
 #[derive(Debug, Trace, ProvidesStaticType, Allocative, Serialize)]
@@ -178,6 +191,7 @@ impl<'v> ContextValue<'v> {
             diagnostics: RefCell::new(Vec::new()),
             pending_children: RefCell::new(Vec::new()),
             pin_claims: RefCell::new(std::collections::HashMap::new()),
+            free_pads: RefCell::new(std::collections::HashMap::new()),
             mapped_pins: RefCell::new(std::collections::HashMap::new()),
         }
     }
@@ -207,10 +221,13 @@ impl<'v> ContextValue<'v> {
         self.missing_inputs.borrow_mut().push(name);
     }
 
-    pub(crate) fn record_pin_claim(&self, req: &str, instance: String, pins: Vec<String>) {
-        self.pin_claims
-            .borrow_mut()
-            .insert(req.to_owned(), (instance, pins));
+    pub(crate) fn record_pin_claim(&self, req: &str, claim: PinClaim) {
+        self.pin_claims.borrow_mut().insert(req.to_owned(), claim);
+    }
+
+    /// Which part's pad namespace a solved request belongs to.
+    pub(crate) fn pin_claim_scope(&self, req: &str) -> Option<String> {
+        self.pin_claims.borrow().get(req).map(|c| c.scope.clone())
     }
 
     /// `(instance, pins)` claimed by requests other than `except`.
@@ -222,18 +239,40 @@ impl<'v> ContextValue<'v> {
             .borrow()
             .iter()
             .filter(|(req, _)| !except.contains(*req))
-            .map(|(_, (instance, pins))| (instance.clone(), pins.clone()))
+            .map(|(_, c)| (c.instance.clone(), c.pins.clone()))
             .collect()
     }
 
-    /// Net a physical pin was already mapped to, for the whole module: a
-    /// superseded solve's assignment must not re-map a pin to a second net.
-    pub(crate) fn pin_map_net(&self, pin: &str) -> Option<(u64, String)> {
-        self.mapped_pins.borrow().get(pin).cloned()
+    /// Net a pad was already mapped to, within one part: a superseded solve's
+    /// assignment must not re-map a pad to a second net.
+    pub(crate) fn pin_map_net(&self, scope: &str, pin: &str) -> Option<(u64, String)> {
+        self.mapped_pins
+            .borrow()
+            .get(&(scope.to_owned(), pin.to_owned()))
+            .cloned()
     }
 
-    pub(crate) fn record_pin_map(&self, pin: String, net: (u64, String)) {
-        self.mapped_pins.borrow_mut().insert(pin, net);
+    pub(crate) fn record_free_pads(&self, scope: String, pads: Vec<String>) {
+        self.free_pads.borrow_mut().insert(scope, pads);
+    }
+
+    /// Every part scope a `pin_solve` has run over in this module, sorted.
+    pub(crate) fn free_pad_scopes(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.free_pads.borrow().keys().cloned().collect();
+        v.sort();
+        v
+    }
+
+    pub(crate) fn free_pads(&self, scope: &str) -> Vec<String> {
+        self.free_pads
+            .borrow()
+            .get(scope)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn record_pin_map(&self, scope: String, pin: String, net: (u64, String)) {
+        self.mapped_pins.borrow_mut().insert((scope, pin), net);
     }
 
     pub(crate) fn add_diagnostic<D: Into<crate::Diagnostic>>(&self, diag: D) {

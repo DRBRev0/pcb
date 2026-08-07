@@ -181,9 +181,8 @@ _enforce_logic_levels()
 
 # Every candidate pad no request claimed is intentionally open — the solver
 # knows the full mux-pin set from the capability tables, no separate list.
-pins = {"VDD": VDD, "VSS": VSS, "NRST": NRST}
-pins.update({p: NotConnected() for p in res["free_pins"]})
-pins.update(m)
+pins = m
+pins.update({"VDD": VDD, "VSS": VSS, "NRST": NRST})
 
 Component(
     name = "MCU",

@@ -41,9 +41,8 @@ res = pin_solve(UNITS, [pin_request(n, Comparator, bind = comp[n]) for n in comp
 
 m = pin_map(res["assignment"], comp)
 
-pins = {"VCC": VCC, "GND": GND}
-pins.update({p: NotConnected() for p in res["free_pins"]})
-pins.update(m)
+pins = m
+pins.update({"VCC": VCC, "GND": GND})
 
 # A floating comparator input oscillates: strap unused units to a defined
 # state (INP > INN keeps the open-collector output off, OUT stays NC).

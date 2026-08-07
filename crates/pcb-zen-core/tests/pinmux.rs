@@ -206,7 +206,7 @@ fn json_property(result: &WithDiagnostics<EvalOutput>, key: &str) -> serde_json:
 fn downgrade_and_poorest_instance() {
     let result = eval_with_fixtures(
         r#"
-load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve", "pin_map")
 load("./stm32.zen", "PERIPHS")
 load("./ifaces.zen", "Uart", "Usart")
 
@@ -216,8 +216,8 @@ check(a["DEBUG"]["instance"] == "USART2", "DEBUG got " + a["DEBUG"]["instance"])
 check(a["SC"]["instance"] == "USART1", "SC got " + a["SC"]["instance"])
 check(a["SC"]["signals"]["TX"]["pin"] == "PA9", "SC TX pin")
 check(a["SC"]["signals"]["TX"]["af"] == 1, "SC TX af")
-check("PB3" in res["free_pins"], "unclaimed candidate must be free")
-check(not ("PA9" in res["free_pins"]), "claimed pin must not be free")
+m = pin_map(res["assignment"], {"DEBUG": Uart("D"), "SC": Usart("S")})
+check("PB3" in m, "unclaimed candidate must be tied off")
 "#,
     );
     assert_ok(&result);
@@ -704,15 +704,15 @@ fn residual_freedom_excludes_prior_solve_claims() {
     // free_pins and pool spare_pins must not list a pin an earlier solve owns.
     let result = eval_with_fixtures(
         r#"
-load("@stdlib/pinmux.zen", "pin_request", "pin_solve", "pool")
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve", "pool", "pin_map")
 load("./ifaces.zen", "Gpio")
 
 POOL = pool("GPIO", provides = [Gpio], pins = ["X1", "X2", "X3"])
 r1 = pin_solve(POOL, [pin_request("A", Gpio)])
 r2 = pin_solve(POOL, [pin_request("B", Gpio)])
 p1 = r1["assignment"]["A"]["signals"]["PIN"]["pin"]
-check(p1 not in r2["free_pins"], "free_pins must exclude the pin claimed by the first solve")
-check(len(r2["free_pins"]) == 1, "one pool pin left, got " + str(r2["free_pins"]))
+m2 = pin_map(r2["assignment"], {"B": Net("NB")})
+check(not (p1 in m2), "the pin claimed by the first solve must not be tied off here")
 pools = [c for c in r2["swap_classes"] if c["granularity"] == "pin"]
 check(len(pools) == 1, "expected one pool class")
 check(p1 not in pools[0]["spare_pins"], "spare_pins must exclude the pin claimed by the first solve")
@@ -1270,7 +1270,7 @@ res = pin_solve(PERIPHS, [
     pin_request("LED", Gpio, prefer = ["PB0"], lock = True),
 ])
 m = pin_map(res["assignment"], {"COM": DBG, "LED": LED})
-check(len(m) == 3, "expected 3 mapped pins, got " + str(len(m)))
+check(m["PA9"] == DBG.TX and m["PA10"] == DBG.RX, "mapped pins present")
 check(m["PA9"] == DBG.TX, "PA9 must carry DBG.TX")
 check(m["PA10"] == DBG.RX, "PA10 must carry DBG.RX")
 check(m["PB0"] == LED, "PB0 must carry the LED net")
@@ -1368,12 +1368,14 @@ res = pin_solve(
 named = {}
 named.update(gpio)
 named.update(adc)
+a = res["assignment"]
 m = pin_map(res["assignment"], named)
 
-a = res["assignment"]
 builtin.add_property("led_pin", a["LED"]["signals"]["PIN"]["pin"] if "LED" in a else "none")
 builtin.add_property("vbat_pin", a["VBAT"]["signals"]["IN"]["pin"] if "VBAT" in a else "none")
-builtin.add_property("map_size", str(len(m)))
+_led = a["LED"]["signals"]["PIN"]["pin"] if "LED" in a else "?"
+_vbat = a["VBAT"]["signals"]["IN"]["pin"] if "VBAT" in a else "?"
+builtin.add_property("map_roles", str(int(_led in m) + int(_vbat in m)))
 "#;
 
 #[test]
@@ -1407,7 +1409,7 @@ Mcu(name = "M1", gpio = {"LED": at(Net("LED"), "PA10")}, adc = {"VBAT": Net("VBA
     };
     assert_eq!(get("led_pin"), "PA10", "at() constraint through the dict");
     assert_eq!(get("vbat_pin"), "PA0", "ADC role served");
-    assert_eq!(get("map_size"), "2", "pin_map must cover both roles");
+    assert_eq!(get("map_roles"), "2", "pin_map must cover both roles");
 }
 
 #[test]
@@ -2219,9 +2221,9 @@ load("./ifaces.zen", "Comparator")
 # Same part number twice, so both chips carry the same pin numbering.
 def quad(ref):
     return [
-        peripheral(ref + ".A", provides = [Comparator], rebind = "none",
+        peripheral(ref + ".A", part = ref, provides = [Comparator], rebind = "none",
             signals = {"INP": [pin("7")], "INN": [pin("6")], "OUT": [pin("1")]}),
-        peripheral(ref + ".B", provides = [Comparator], rebind = "none",
+        peripheral(ref + ".B", part = ref, provides = [Comparator], rebind = "none",
             signals = {"INP": [pin("5")], "INN": [pin("4")], "OUT": [pin("2")]}),
     ]
 "#;
@@ -2454,4 +2456,134 @@ pin_solve([U2], [pin_request("L2", Gpio)])
         Some(1),
         "U1 keeps its own alternate, got {a}"
     );
+}
+
+#[test]
+fn pin_map_allows_two_parts_to_share_a_pin_name() {
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve", "pin_map")
+load("./ifaces.zen", "Gpio")
+U1 = peripheral("U1.P", provides = [Gpio], rebind = "fixed", signals = {"PIN": [pin("7")]})
+U2 = peripheral("U2.P", provides = [Gpio], rebind = "fixed", signals = {"PIN": [pin("7")]})
+r1 = pin_solve([U1], [pin_request("A", Gpio)])
+r2 = pin_solve([U2], [pin_request("B", Gpio)])
+m1 = pin_map(r1["assignment"], {"A": Net("NA")})
+m2 = pin_map(r2["assignment"], {"B": Net("NB")})
+check(m1["7"] != m2["7"], "each part keeps its own pad 7")
+"#,
+    );
+    assert_ok(&result);
+}
+
+const QUAD: &str = r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin")
+load("./ifaces.zen", "Comparator")
+def quad(ref):
+    return [
+        peripheral(ref + ".A", part = ref, provides = [Comparator], rebind = "none",
+            signals = {"INP": [pin("7")], "INN": [pin("6")], "OUT": [pin("1")]}),
+        peripheral(ref + ".B", part = ref, provides = [Comparator], rebind = "none",
+            signals = {"INP": [pin("5")], "INN": [pin("4")], "OUT": [pin("2")]}),
+    ]
+"#;
+
+fn eval_quad(main: &str) -> WithDiagnostics<EvalOutput> {
+    eval_zen(vec![
+        ("/ifaces.zen".to_string(), IFACES.to_string()),
+        ("/chip.zen".to_string(), QUAD.to_string()),
+        ("/test.zen".to_string(), main.to_string()),
+    ])
+}
+
+#[test]
+fn declared_parts_spread_requests_over_both_components() {
+    let result = eval_quad(
+        r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve", "pin_map")
+load("./chip.zen", "quad")
+load("./ifaces.zen", "Comparator")
+
+roles = ["R1", "R2", "R3", "R4"]
+res = pin_solve(quad("U1") + quad("U2"), [pin_request(k, Comparator) for k in roles])
+check(res["assignment"]["R1"]["instance"] == "U1.A", "R1 on U1.A")
+check(res["assignment"]["R3"]["instance"] == "U2.A", "R3 must reach the second chip")
+
+ifaces = {k: Comparator(k) for k in roles}
+m1 = pin_map(res["assignment"], ifaces, part = "U1")
+m2 = pin_map(res["assignment"], ifaces, part = "U2")
+check(sorted(m1.keys()) == sorted(m2.keys()), "both chips carry the same pad names")
+check(m1["7"] != m2["7"], "but they are different pads")
+"#,
+    );
+    assert_ok(&result);
+}
+
+#[test]
+fn mapping_a_multi_part_assignment_needs_a_part() {
+    let result = eval_quad(
+        r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve", "pin_map")
+load("./chip.zen", "quad")
+load("./ifaces.zen", "Comparator")
+roles = ["R1", "R2", "R3", "R4"]
+res = pin_solve(quad("U1") + quad("U2"), [pin_request(k, Comparator) for k in roles])
+pin_map(res["assignment"], {k: Comparator(k) for k in roles})
+"#,
+    );
+    assert_fails_with(
+        &result,
+        "spans several parts; pass part= to map one component at a time",
+    );
+}
+
+#[test]
+fn a_pool_inside_a_flat_list_is_still_one_part() {
+    // `pool()` yields a list, so nesting is how pools compose: it must not be
+    // read as a part boundary.
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pool", "pin_request", "pin_solve")
+load("./ifaces.zen", "Uart", "Gpio")
+U = peripheral("U0", provides = [Uart], rebind = "fixed",
+    signals = {"TX": [pin("P1")], "RX": [pin("P2")]})
+G = pool("GPIO", provides = [Gpio], pins = ["P1", "P3"])
+res = pin_solve([U, G], [pin_request("COM", Uart), pin_request("LED", Gpio)])
+check(res["assignment"]["LED"]["signals"]["PIN"]["pin"] == "P3", "P1 is taken by TX")
+"#,
+    );
+    assert_ok(&result);
+}
+
+/// `pin_map` ties unclaimed pads off; a design may still override them, which
+/// is how the LM339 example straps its unused comparator units.
+#[test]
+fn unclaimed_pads_are_tied_off_and_can_be_overridden() {
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve", "pin_map")
+load("./ifaces.zen", "Comparator")
+
+def unit(n, p, m, o):
+    return peripheral(n, provides = [Comparator], rebind = "none",
+        signals = {"INP": [pin(p)], "INN": [pin(m)], "OUT": [pin(o)]})
+UNITS = [unit("A", "IN1P", "IN1N", "OUT1"), unit("B", "IN2P", "IN2N", "OUT2")]
+VCC = Net("VCC")
+GND = Net("GND")
+role = Comparator("OV")
+
+res = pin_solve(UNITS, [pin_request("OV", Comparator, bind = role)])
+pins = pin_map(res["assignment"], {"OV": role})
+
+# The served unit carries its role...
+check(pins["IN1P"] == role.INP, "IN1P carries the role")
+check(pins["OUT1"] == role.OUT, "OUT1 carries the role")
+# ...the spare unit's pads come back open, and a design may strap them.
+check(pins["OUT2"].name == "", "an unclaimed pad is open")
+pins["IN2P"] = VCC
+pins["IN2N"] = GND
+check(pins["IN2P"] == VCC, "an open pad can be overridden")
+"#,
+    );
+    assert_ok(&result);
 }

@@ -633,6 +633,28 @@ pub(crate) fn instantiate_not_connected<'v>(
     }))
 }
 
+/// An intentionally open net, as `NotConnected()` builds one.
+pub(crate) fn alloc_open_net<'v>(eval: &mut Evaluator<'v, '_, '_>) -> Value<'v> {
+    let (declaration_path, declaration_span) = eval
+        .call_stack_top_location()
+        .map(|loc| (loc.file.filename().to_string(), Some(loc.resolve_span())))
+        .unwrap_or_else(|| (eval.source_path().unwrap_or_default(), None));
+    eval.heap().alloc(NetValue {
+        net_id: generate_net_id(),
+        name: String::new(),
+        template_name: None,
+        original_name: None,
+        assignment_inferable: false,
+        was_bound: OnceLock::new(),
+        inferred_name: OnceLock::new(),
+        declaration_path,
+        declaration_span,
+        type_name: "Net".to_string(),
+        connection_intent: ConnectionIntent::Open,
+        properties: SmallMap::new(),
+    })
+}
+
 /// A callable type constructor for creating typed nets
 ///
 /// Created by `builtin.net_type(name)`, e.g.:

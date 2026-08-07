@@ -349,6 +349,10 @@ struct RPin {
 
 struct RPeriph<'v> {
     name: String,
+    /// Component this peripheral's pads belong to (`peripheral(part=)`).
+    part: String,
+    /// Index of `part` in the solve's part list.
+    part_idx: usize,
     provides_ids: HashSet<TypeInstanceId>,
     /// Display names of everything provided, for diagnostics only.
     provides_names: HashSet<String>,
@@ -505,6 +509,8 @@ fn parse_rperiph<'v>(v: Value<'v>, heap: Heap<'v>) -> anyhow::Result<RPeriph<'v>
     }
     Ok(RPeriph {
         name,
+        part: dict_get_str(&d, heap, "part").unwrap_or_default(),
+        part_idx: 0,
         provides_ids,
         provides_names,
         signals,
@@ -895,7 +901,7 @@ enum AssignOutcome {
 /// incumbent the search runs to the first feasible assignment, proven
 /// infeasibility, or the unconditional `SOLVER_HARD_BUDGET` ceiling
 /// (`Unknown`) so pathological instances cannot hang the build.
-fn assign<'v>(reqs: &[RReq<'v>], all_combos: &[Vec<Combo>]) -> AssignOutcome {
+fn assign<'v>(reqs: &[RReq<'v>], all_combos: &[Vec<Combo>], part_of: &[usize]) -> AssignOutcome {
     let n = reqs.len();
     if n == 0 {
         return AssignOutcome::Solved {
@@ -919,7 +925,7 @@ fn assign<'v>(reqs: &[RReq<'v>], all_combos: &[Vec<Combo>]) -> AssignOutcome {
     let mut assigned: Vec<Option<usize>> = vec![None; n];
     let mut partial_cost = vec![0i64; n + 1];
     let mut used_inst: HashSet<usize> = HashSet::new();
-    let mut used_pin: HashSet<String> = HashSet::new();
+    let mut used_pin: HashSet<(usize, String)> = HashSet::new();
     let mut best: Option<(i64, Vec<usize>)> = None;
     let mut pos: usize = 0;
     let mut spent = 0usize;
@@ -945,8 +951,9 @@ fn assign<'v>(reqs: &[RReq<'v>], all_combos: &[Vec<Combo>]) -> AssignOutcome {
             let back_ri = order[pos];
             let back = &all_combos[back_ri][assigned[back_ri].unwrap()];
             used_inst.remove(&back.periph_idx);
+            let back_part = part_of[back.periph_idx];
             for (_, p) in &back.pins {
-                used_pin.remove(&p.name);
+                used_pin.remove(&(back_part, p.name.clone()));
             }
             assigned[back_ri] = None;
             choice[pos] += 1;
@@ -967,14 +974,17 @@ fn assign<'v>(reqs: &[RReq<'v>], all_combos: &[Vec<Combo>]) -> AssignOutcome {
             }
             // Charged per check, not per node: this scan is where the time goes.
             spent += 1;
+            let part = part_of[c.periph_idx];
             let clash = used_inst.contains(&c.periph_idx)
-                || c.pins.iter().any(|(_, p)| used_pin.contains(&p.name));
+                || c.pins
+                    .iter()
+                    .any(|(_, p)| used_pin.contains(&(part, p.name.clone())));
             if !clash {
                 choice[pos] = ci;
                 assigned[ri] = Some(ci);
                 used_inst.insert(c.periph_idx);
                 for (_, p) in &c.pins {
-                    used_pin.insert(p.name.clone());
+                    used_pin.insert((part, p.name.clone()));
                 }
                 partial_cost[pos + 1] = partial_cost[pos] + c.cost;
                 placed = true;
@@ -996,8 +1006,9 @@ fn assign<'v>(reqs: &[RReq<'v>], all_combos: &[Vec<Combo>]) -> AssignOutcome {
             let back_ri = order[pos];
             let back = &all_combos[back_ri][assigned[back_ri].unwrap()];
             used_inst.remove(&back.periph_idx);
+            let back_part = part_of[back.periph_idx];
             for (_, p) in &back.pins {
-                used_pin.remove(&p.name);
+                used_pin.remove(&(back_part, p.name.clone()));
             }
             assigned[back_ri] = None;
             choice[pos] += 1;
@@ -1243,6 +1254,7 @@ fn make_peripheral_dict<'v>(
     attrs: &SmallMap<String, Value<'v>>,
     unless: Option<&str>,
     pool: Option<&str>,
+    part: Option<&str>,
 ) -> anyhow::Result<Value<'v>> {
     if !REBIND_VALUES.contains(&rebind) {
         return Err(anyhow::anyhow!(
@@ -1364,6 +1376,10 @@ fn make_peripheral_dict<'v>(
         (
             heap.alloc("pool"),
             pool.map(|p| heap.alloc(p)).unwrap_or_else(Value::new_none),
+        ),
+        (
+            heap.alloc("part"),
+            part.map(|p| heap.alloc(p)).unwrap_or_else(Value::new_none),
         ),
     ];
     Ok(heap.alloc(AllocDict(pairs)))
@@ -1502,6 +1518,7 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
             Value<'v>,
         >,
         #[starlark(require = named, default = NoneOr::None)] unless: NoneOr<String>,
+        #[starlark(require = named, default = NoneOr::None)] part: NoneOr<String>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<Value<'v>> {
         let heap = eval.heap();
@@ -1526,6 +1543,7 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
             &attrs,
             unless.into_option().as_deref(),
             None,
+            part.into_option().as_deref(),
         )
     }
 
@@ -1536,9 +1554,11 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
         #[starlark(require = named)] provides: UnpackList<Value<'v>>,
         #[starlark(require = named)] pins: UnpackList<Value<'v>>,
         #[starlark(require = named, default = "firmware".to_string())] rebind: String,
+        #[starlark(require = named, default = NoneOr::None)] part: NoneOr<String>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<Value<'v>> {
         let heap = eval.heap();
+        let part = part.into_option();
         if provides.items.len() != 1 {
             return Err(anyhow::anyhow!(
                 "pool `{name}`: provides must list exactly one interface type"
@@ -1580,6 +1600,7 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                 &SmallMap::default(),
                 None,
                 Some(&name),
+                part.as_deref(),
             )?);
         }
         Ok(heap.alloc(units))
@@ -1754,23 +1775,36 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
     ) -> anyhow::Result<Value<'v>> {
         let heap = eval.heap();
 
-        // Flatten one level of nesting so `[usart1] + gpio_pool` and
-        // `[usart1, gpio_pool]` both work.
-        let plist = ListRef::from_value(peripherals)
-            .ok_or_else(|| anyhow::anyhow!("pin_solve: peripherals must be a list"))?;
+        // One level of nesting is flattened: `pool()` yields a list of units,
+        // so `[usart1, gpio_pool]` is one table.
+        let plist = ListRef::from_value(peripherals).ok_or_else(|| {
+            anyhow::anyhow!("pin_solve: peripherals must be a list of peripheral()/pool() values")
+        })?;
         let mut periphs: Vec<RPeriph> = Vec::new();
         for entry in plist.iter() {
-            if let Some(nested) = ListRef::from_value(entry) {
-                for e in nested.iter() {
-                    periphs.push(parse_rperiph(e, heap)?);
+            match ListRef::from_value(entry) {
+                Some(nested) => {
+                    for e in nested.iter() {
+                        periphs.push(parse_rperiph(e, heap)?);
+                    }
                 }
-            } else {
-                periphs.push(parse_rperiph(entry, heap)?);
+                None => periphs.push(parse_rperiph(entry, heap)?),
             }
+        }
+        // Pads belong to a part: peripherals declaring the same `part=` share a
+        // pin namespace, and those declaring none form a single anonymous part.
+        let mut part_names: Vec<String> = Vec::new();
+        for p in &periphs {
+            if !part_names.contains(&p.part) {
+                part_names.push(p.part.clone());
+            }
+        }
+        for p in periphs.iter_mut() {
+            p.part_idx = part_names.iter().position(|n| *n == p.part).unwrap_or(0);
         }
         let mut seen_names = HashSet::new();
         for p in &periphs {
-            if !seen_names.insert(p.name.clone()) {
+            if !seen_names.insert((p.part_idx, p.name.clone())) {
                 return Err(anyhow::anyhow!(
                     "pin_solve: duplicate peripheral name `{}`",
                     p.name
@@ -1913,6 +1947,26 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
         // count: pin names belong to a part, so another part's `7` is not ours.
         // The claimed sets also seed the reported residual freedom below, so
         // free/alternate/spare listings match the exclusivity enforced here.
+        let part_of: Vec<usize> = periphs.iter().map(|p| p.part_idx).collect();
+        // Pads belong to a part. A named part scopes claims by its name; an
+        // unnamed one (the list form) by its sorted peripheral set, so two
+        // solves over the same table still see each other.
+        let scopes: Vec<String> = part_names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                if !name.is_empty() {
+                    return name.clone();
+                }
+                let mut ns: Vec<&str> = periphs
+                    .iter()
+                    .filter(|p| p.part_idx == i)
+                    .map(|p| p.name.as_str())
+                    .collect();
+                ns.sort_unstable();
+                ns.join("\u{1}")
+            })
+            .collect();
         let mut claimed_instances: HashSet<String> = HashSet::new();
         let mut claimed_pins: HashSet<String> = HashSet::new();
         if let Some(ctx) = eval.context_value() {
@@ -1959,7 +2013,7 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
             }
             detail
         };
-        let chosen = match assign(&reqs, &all_combos) {
+        let chosen = match assign(&reqs, &all_combos, &part_of) {
             AssignOutcome::Solved { chosen, capped } => {
                 if capped {
                     warn_at_call_site(
@@ -1974,16 +2028,26 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                         let combo = &all_combos[i][chosen[i]];
                         ctx.record_pin_claim(
                             &r.name,
-                            periphs[combo.periph_idx].name.clone(),
-                            combo.pins.iter().map(|(_, p)| p.name.clone()).collect(),
+                            crate::lang::context::PinClaim {
+                                instance: periphs[combo.periph_idx].name.clone(),
+                                pins: combo.pins.iter().map(|(_, p)| p.name.clone()).collect(),
+                                scope: scopes[periphs[combo.periph_idx].part_idx].clone(),
+                            },
                         );
                     }
                 }
                 chosen
             }
             AssignOutcome::Infeasible => {
+                // A single-part solve treats every pin name as one pad, which
+                // is what collides when two components are merged into it.
+                let hint = if part_names.len() == 1 {
+                    "\nnote: all these peripherals share one pin namespace; if they belong to                      different components, pass a dict of part name -> list so each keeps its own"
+                } else {
+                    ""
+                };
                 return Err(anyhow::anyhow!(
-                    "pin_solve: no feasible assignment (instance/pin exclusivity):\n{}",
+                    "pin_solve: no feasible assignment (instance/pin exclusivity):\n{}{hint}",
                     failure_detail(&reqs, &all_combos)
                 ));
             }
@@ -2000,9 +2064,12 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
         // claimed by earlier solves count as used: alternates, spares and
         // free_pins must never offer a pin another request already owns.
         let mut used_pins: HashSet<String> = claimed_pins;
+        let mut used_pads: HashSet<(usize, String)> = HashSet::new();
         for (i, &ci) in chosen.iter().enumerate() {
+            let part = part_of[all_combos[i][ci].periph_idx];
             for (_, p) in &all_combos[i][ci].pins {
                 used_pins.insert(p.name.clone());
+                used_pads.insert((part, p.name.clone()));
             }
         }
 
@@ -2397,17 +2464,23 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
         // Candidate pins no request claimed, in this solve or any earlier one:
         // the component wires them as intentionally open (or reuses them),
         // without re-listing them.
-        let mut free_pins: Vec<String> = periphs
-            .iter()
-            .flat_map(|p| p.signals.iter())
-            .flat_map(|(_, cands)| cands.iter())
-            .map(|c| c.name.clone())
-            .filter(|n| !used_pins.contains(n))
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        free_pins.sort();
-        let free_vals: Vec<Value> = free_pins.iter().map(|n| heap.alloc(n.as_str())).collect();
+        // Pads no request claimed, recorded per part for `pin_map` to tie off.
+        if let Some(ctx) = eval.context_value() {
+            for (i, _) in part_names.iter().enumerate() {
+                let mut v: Vec<String> = periphs
+                    .iter()
+                    .filter(|p| p.part_idx == i)
+                    .flat_map(|p| p.signals.iter())
+                    .flat_map(|(_, cands)| cands.iter())
+                    .map(|c| c.name.clone())
+                    .filter(|n| !used_pads.contains(&(i, n.clone())) && !used_pins.contains(n))
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .collect();
+                v.sort();
+                ctx.record_free_pads(scopes[i].clone(), v);
+            }
+        }
 
         let pairs: Vec<(Value, Value)> = vec![
             (
@@ -2415,7 +2488,6 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                 json_to_value(heap, &assignment_json),
             ),
             (heap.alloc("swap_classes"), json_to_value(heap, &swap_json)),
-            (heap.alloc("free_pins"), heap.alloc(free_vals)),
         ];
         Ok(heap.alloc(AllocDict(pairs)))
     }
@@ -2430,6 +2502,7 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
         #[allow(unused_variables)] this: &Pinmux,
         #[starlark(require = pos)] assignment: Value<'v>,
         #[starlark(require = pos)] ifaces: SmallMap<String, Value<'v>>,
+        #[starlark(require = named, default = NoneOr::None)] part: NoneOr<String>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<Value<'v>> {
         let heap = eval.heap();
@@ -2438,7 +2511,50 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
         })?;
         let mut out: Vec<(Value, Value)> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
+        // Which part this call maps: the one named, else the single part the
+        // assignment's requests all belong to.
+        let scope_of = |req: &str| {
+            eval.context_value()
+                .and_then(|ctx| ctx.pin_claim_scope(req))
+        };
+        let scopes: Vec<String> = {
+            let mut v: Vec<String> = ad
+                .keys()
+                .filter_map(|k| k.unpack_str())
+                .filter_map(scope_of)
+                .collect();
+            v.sort();
+            v.dedup();
+            // A solve that served no request still has pads to tie off.
+            if v.is_empty() {
+                v = eval
+                    .context_value()
+                    .map(|ctx| ctx.free_pad_scopes())
+                    .unwrap_or_default();
+            }
+            v
+        };
+        let want_scope: Option<String> = match &part {
+            NoneOr::Other(p) => Some(p.clone()),
+            NoneOr::None => {
+                if scopes.len() > 1 {
+                    return Err(anyhow::anyhow!(
+                        "pin_map: this assignment spans several parts; pass part= to map one \
+                         component at a time"
+                    ));
+                }
+                scopes.first().cloned()
+            }
+        };
+        let want_part = want_scope.as_deref();
         for (req_name, raw_val) in ifaces.iter() {
+            // One call feeds one Component, so a multi-part solve maps a part
+            // at a time.
+            if let Some(want) = want_part
+                && scope_of(req_name).is_some_and(|s| s != want)
+            {
+                continue;
+            }
             // Accept at()-wrapped values: the constraint was consumed at solve
             // time, only the inner net matters here.
             let iface_val = &unpack_pin_at(*raw_val)
@@ -2503,8 +2619,9 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                 // hand this pin to a different net.
                 if let Some(id) = net_identity(net)
                     && let Some(ctx) = eval.context_value()
+                    && let Some(scope) = ctx.pin_claim_scope(req_name)
                 {
-                    if let Some(prev) = ctx.pin_map_net(&pin_name)
+                    if let Some(prev) = ctx.pin_map_net(&scope, &pin_name)
                         && prev.0 != id.0
                     {
                         return Err(anyhow::anyhow!(
@@ -2515,7 +2632,7 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                             id.1
                         ));
                     }
-                    ctx.record_pin_map(pin_name.clone(), id);
+                    ctx.record_pin_map(scope, pin_name.clone(), id);
                 }
                 out.push((heap.alloc(pin_name.as_str()), net));
             }
@@ -2526,6 +2643,7 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
             .keys()
             .filter_map(|k| k.unpack_str())
             .filter(|k| !ifaces.contains_key(*k))
+            .filter(|k| want_part.is_none_or(|want| scope_of(k).is_none_or(|s| s == want)))
             .map(|k| k.to_owned())
             .collect();
         if !unmapped.is_empty() {
@@ -2537,6 +2655,18 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                     unmapped.join("`, `")
                 ),
             );
+        }
+        // Pads this part exposes that no request took are intentionally open,
+        // so one call yields the component's whole pin table.
+        if let Some(scope) = want_part
+            && let Some(ctx) = eval.context_value()
+        {
+            for pad in ctx.free_pads(scope) {
+                if seen.insert(pad.clone()) {
+                    let open = crate::lang::net::alloc_open_net(eval);
+                    out.push((heap.alloc(pad.as_str()), open));
+                }
+            }
         }
         Ok(heap.alloc(AllocDict(out)))
     }

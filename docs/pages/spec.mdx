@@ -365,6 +365,7 @@ resource cluster (an MCU USART, one comparator of a dual package).
 | `rebind` | yes | What a later swap costs: `"none"` (gate swap), `"firmware"` (a constant to regenerate), `"fixed"` (never movable) |
 | `attrs` | no | Capability attributes, validated against the interfaces' vocabulary |
 | `unless` | no | The peripheral is unavailable when this key is truthy in `pin_solve(config=...)` |
+| `part` | no | Component these pads belong to; peripherals sharing a `part` share a pin namespace |
 
 **`pool(name, provides, pins, rebind="firmware")`** — sugar for N
 interchangeable single-signal units (GPIO pools): one unit per pin, all
@@ -387,7 +388,10 @@ demand: the interface type *is* the request.
 | `bind` | no | The connected value, carried on the request itself (dict-of-roles pattern) |
 
 **`pin_solve(peripherals, requests, config={}, previous=None)`** — solve the
-joint instance × pin assignment. A pin carries at most one function and an
+joint instance × pin assignment across every peripheral given. Pin names are a
+part's pads: peripherals declaring the same `part=` share a pin namespace,
+those declaring none form one anonymous part, and a module holding two
+components solves both in one call. A pin carries at most one function and an
 instance serves at most one request (even on disjoint pin sets); when no
 assignment satisfies every request, the build fails with per-candidate
 rejection reasons. The result is deterministic and globally optimized: the
@@ -410,10 +414,13 @@ free. To bound a single signal instead, pass a dict:
 `at(uart, {"TX": ["PA9", "PB6"]})` means "TX takes one of these, RX is
 free".
 
-**`pin_map(assignment, ifaces)`** — turn `pin_solve`'s `assignment` into a
-`Component(pins=...)`-ready dict (physical pin → net of the matching
-interface field; a bare `Net` works for single-signal requests). Requests
-absent from the assignment (e.g. dropped by `if_connected`) are skipped.
+**`pin_map(assignment, ifaces, part=None)`** — the whole pin table of one
+component: every solved request's pads mapped to the net of the matching
+interface field (a bare `Net` works for single-signal requests), plus every
+candidate pad no request claimed, tied to `NotConnected()`. Override any of
+them afterwards. Requests absent from the assignment (e.g. dropped by
+`if_connected`) are skipped. `part=` selects the component when the assignment
+spans several; it is required then.
 
 `pin_solve` returns a dict:
 
@@ -421,7 +428,6 @@ absent from the assignment (e.g. dropped by `if_connected`) are skipped.
 |-----|---------|
 | `assignment` | Per request: the chosen instance and pin per signal (with each pin's realization `data`), plus free alternates |
 | `swap_classes` | Residual swap freedom of *this* solve: pool classes with spare pins, gate-swap clusters. The module property of the same name merges every solve, so the two differ once a module solves more than once |
-| `free_pins` | Candidate pins no request claimed, in this solve or any earlier `pin_solve` of the module — wire them with `{p: NotConnected() for p in res["free_pins"]}` |
 
 `assignment` and `swap_classes` are also stored as module properties (JSON) —
 several solves in one module merge, keyed by request name — and flow through
