@@ -452,9 +452,6 @@ pub struct EvalSession {
     module_deps: Arc<RwLock<HashMap<PathBuf, HashSet<PathBuf>>>>,
     /// Tree of all frozen child modules indexed by fully qualified path.
     module_tree: Arc<RwLock<BTreeMap<ModulePath, FrozenModule>>>,
-    /// `at()` pin constraints for the whole build, keyed by net identity so a
-    /// descendant's `pin_solve` can claim one recorded further up.
-    pub(crate) pin_constraints: Arc<Mutex<crate::lang::pinmux::PinConstraints>>,
 }
 
 /// Configuration for creating an EvalContext. Send + Sync safe for passing across threads.
@@ -477,6 +474,15 @@ pub struct EvalContextConfig {
     /// Per-context load chain for cycle detection. Contains canonical paths of all files
     /// in the current load chain (ancestors). Thread-local to each evaluation path.
     pub(crate) load_chain: HashSet<PathBuf>,
+
+    /// `at()` pin constraints of the design being elaborated, shared with every
+    /// descendant so a constraint reaches a nested `pin_solve`, and distinct per
+    /// root so concurrent designs never see each other's.
+    pub(crate) pin_constraints: Arc<Mutex<crate::lang::pinmux::PinConstraints>>,
+
+    /// Nominal interface identities for this design: one declaration keeps one
+    /// identity however many times its file is evaluated.
+    pub(crate) interface_ids: Arc<crate::lang::pinmux::InterfaceIds>,
 
     /// The absolute path to the module we are evaluating.
     pub(crate) source_path: Option<PathBuf>,
@@ -528,6 +534,8 @@ impl EvalContextConfig {
             builtin_docs,
             file_provider,
             resolution,
+            pin_constraints: Arc::default(),
+            interface_ids: Arc::default(),
             module_path: ModulePath::root(),
             load_chain: HashSet::new(),
             source_path: None,
@@ -600,6 +608,8 @@ impl EvalContextConfig {
             builtin_docs: self.builtin_docs.clone(),
             file_provider: self.file_provider.clone(),
             resolution: self.resolution.clone(),
+            pin_constraints: self.pin_constraints.clone(),
+            interface_ids: self.interface_ids.clone(),
             module_path: child_module_path,
             load_chain: child_load_chain,
             source_path: None,
@@ -628,6 +638,8 @@ impl EvalContextConfig {
             builtin_docs: self.builtin_docs.clone(),
             file_provider: self.file_provider.clone(),
             resolution: self.resolution.clone(),
+            pin_constraints: self.pin_constraints.clone(),
+            interface_ids: self.interface_ids.clone(),
             module_path: child_module_path,
             load_chain: HashSet::new(),
             source_path: None,
@@ -933,7 +945,6 @@ impl Default for EvalSession {
             symbol_meta: Arc::new(RwLock::new(HashMap::new())),
             module_deps: Arc::new(RwLock::new(HashMap::new())),
             module_tree: Arc::new(RwLock::new(BTreeMap::new())),
-            pin_constraints: Arc::default(),
         }
     }
 }
@@ -946,7 +957,6 @@ impl EvalSession {
     /// since schematic conversion reads the shared module tree from the session.
     pub fn prepare_for_root_eval(&self) {
         self.clear_module_tree();
-        self.pin_constraints.lock().unwrap().clear();
     }
 
     // --- Module tree ---
@@ -1242,6 +1252,8 @@ impl EvalContext {
             builtin_docs: self.config.builtin_docs.clone(),
             file_provider: self.config.file_provider.clone(),
             resolution: self.config.resolution.clone(),
+            pin_constraints: self.config.pin_constraints.clone(),
+            interface_ids: self.config.interface_ids.clone(),
             module_path,
             load_chain: self.config.load_chain.clone(),
             source_path: None,
@@ -1304,7 +1316,11 @@ impl EvalContext {
     }
 
     pub(crate) fn pin_constraints(&self) -> Arc<Mutex<crate::lang::pinmux::PinConstraints>> {
-        self.session.pin_constraints.clone()
+        self.config.pin_constraints.clone()
+    }
+
+    pub(crate) fn interface_ids(&self) -> Arc<crate::lang::pinmux::InterfaceIds> {
+        self.config.interface_ids.clone()
     }
 
     fn load_cache_scope(&self, path: &Path) -> Option<PackageScopeKey> {
@@ -1685,23 +1701,23 @@ impl EvalContext {
                     // Every solve in the tree has run by now, so a hard
                     // constraint still unclaimed is one nothing ever wanted.
                     if is_root {
-                        for (module, input) in self
-                            .session
+                        for (module, input, span) in self
+                            .config
                             .pin_constraints
                             .lock()
                             .unwrap()
                             .unconsumed_hard()
                         {
-                            let where_ = if module.is_empty() {
-                                String::new()
-                            } else {
-                                format!(" of `{module}`")
-                            };
                             diagnostics.push(
-                                anyhow!(
-                                    "at() pin constraint on input `{input}`{where_} was never consumed: no pin_request named `{input}` reached a pin_solve"
+                                Diagnostic::categorized(
+                                    &module,
+                                    &format!(
+                                        "at() pin constraint on input `{input}` was never consumed: no pin_request named `{input}` reached a pin_solve"
+                                    ),
+                                    "pinmux.unconsumed_at",
+                                    EvalSeverity::Error,
                                 )
-                                .into(),
+                                .with_span(span),
                             );
                         }
                     }

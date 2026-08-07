@@ -12,7 +12,7 @@ use starlark::{starlark_complex_value, starlark_complex_values};
 use std::cell::OnceCell;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use crate::lang::context::ContextValue;
 use crate::lang::evaluator_ext::EvaluatorExt;
@@ -954,20 +954,15 @@ impl<'v, V: ValueLike<'v> + InterfaceCell> InterfaceFactoryGen<V> {
         &self.attr_spec
     }
 
-    /// Keyed on the declaration (file + exported name), not the evaluation: the
-    /// load cache is per package scope, so one file can be evaluated twice.
-    pub fn type_instance_id(&self) -> TypeInstanceId {
-        let Some(name) = self.type_name() else {
-            return self.id;
-        };
-        type DeclCache = HashMap<(String, String), TypeInstanceId>;
-        static CACHE: OnceLock<Mutex<DeclCache>> = OnceLock::new();
-        *CACHE
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-            .unwrap()
-            .entry((self.declaration_path.clone(), name))
-            .or_insert_with(TypeInstanceId::r#gen)
+    /// Identity of this very `interface()` evaluation. Capability matching
+    /// keys on the declaration instead — see `nominal_id` in `pinmux.rs`.
+    pub fn evaluation_id(&self) -> TypeInstanceId {
+        self.id
+    }
+
+    /// File that declared this interface.
+    pub fn declaration_path(&self) -> &str {
+        &self.declaration_path
     }
 
     /// Best-effort display name: the exported variable name when known.

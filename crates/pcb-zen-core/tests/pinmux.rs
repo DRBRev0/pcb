@@ -1055,6 +1055,24 @@ peripheral("P", provides = [Gpio], rebind = "none", signals = {"PIN": ["X1"]}, s
 }
 
 #[test]
+fn pin_data_above_i64_roundtrips_as_an_integer() {
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
+load("./ifaces.zen", "Gpio")
+BIG = 18446744073709551615
+P = peripheral("P", provides = [Gpio], rebind = "fixed",
+    signals = {"PIN": [pin("X1", data = {"big": BIG})]})
+res = pin_solve([P], [pin_request("R", Gpio)])
+got = res["assignment"]["R"]["signals"]["PIN"]["big"]
+check(got == BIG, "must round-trip, got " + str(got))
+check(type(got) == "int", "and stay an int, got " + type(got))
+"#,
+    );
+    assert_ok(&result);
+}
+
+#[test]
 fn pin_data_large_int_roundtrip() {
     let result = eval_with_fixtures(
         r#"
@@ -1819,7 +1837,7 @@ Mcu(name = "U1", debug_uart = at(Uart("BUS"), ["PA9", "PA10"]))
     ]);
     assert_fails_with(
         &result,
-        "constraint on input `debug_uart` of `/mcu.zen` was never consumed: no pin_request named `debug_uart` reached a pin_solve",
+        "constraint on input `debug_uart` was never consumed: no pin_request named `debug_uart` reached a pin_solve",
     );
 }
 
@@ -2168,6 +2186,8 @@ check(res["assignment"]["COM"]["instance"] == "WITHATTR", "must skip the attr-le
 }
 
 /// A hard `at()` left unconsumed by the first design must not fail the second.
+/// No `prepare_for_root_eval` here on purpose: each root owns its constraint
+/// store, so the isolation holds by construction rather than by a reset.
 #[test]
 fn a_failed_design_does_not_poison_the_next_one() {
     let mut files = common::stdlib_test_files();
@@ -2192,7 +2212,6 @@ Leaf(name = "L", IO0 = at(Net("LED"), "PA9"))
     let session = EvalSession::default();
 
     let eval_root = |path: &str| {
-        session.prepare_for_root_eval();
         EvalContext::from_session_and_config(
             session.clone(),
             EvalContextConfig::new(file_provider.clone(), resolution.clone()),
@@ -2645,4 +2664,46 @@ Som(name = "SOM", LED = at(Gpio("LED_NET"), "PA7"))
     };
     assert_eq!(pin("first"), "PA7", "the forwarded at() applies");
     assert_eq!(pin("second"), "PA7", "and still applies on a re-solve");
+}
+
+#[test]
+fn an_idle_part_keeps_its_pads_when_another_part_uses_the_same_names() {
+    // Both requests land on U1; U2 exposes the very same pad names and must
+    // still come back tied off, or Component() rejects it as unconnected.
+    let result = eval_quad(
+        r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve", "pin_map")
+load("./chip.zen", "quad")
+load("./ifaces.zen", "Comparator")
+
+res = pin_solve(quad("U1") + quad("U2"),
+                [pin_request("R1", Comparator), pin_request("R2", Comparator)])
+check(res["assignment"]["R1"]["instance"] == "U1.A", "R1 on U1.A")
+check(res["assignment"]["R2"]["instance"] == "U1.B", "R2 on U1.B")
+
+ifaces = {"R1": Comparator("a"), "R2": Comparator("b")}
+u2 = pin_map(res["assignment"], ifaces, part = "U2")
+check(sorted(u2.keys()) == ["1", "2", "4", "5", "6", "7"], "U2 ties off all six pads, got " + str(sorted(u2.keys())))
+"#,
+    );
+    assert_ok(&result);
+}
+
+#[test]
+fn an_earlier_solve_on_one_part_leaves_the_other_free() {
+    // Same table solved twice: U1's claimed pads must not block U2's, which
+    // carry identical names.
+    let result = eval_quad(
+        r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
+load("./chip.zen", "quad")
+load("./ifaces.zen", "Comparator")
+
+ALL = quad("U1") + quad("U2")
+pin_solve(ALL, [pin_request("R1", Comparator), pin_request("R2", Comparator)])
+r = pin_solve(ALL, [pin_request("R3", Comparator)])
+check(r["assignment"]["R3"]["instance"] == "U2.A", "R3 must reach the idle chip")
+"#,
+    );
+    assert_ok(&result);
 }

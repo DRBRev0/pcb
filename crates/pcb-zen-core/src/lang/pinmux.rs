@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::Mutex;
 
 use allocative::Allocative;
 use pcb_sch::physical::PhysicalValue;
@@ -83,6 +84,8 @@ pub(crate) struct PinConstraints {
 struct PinConstraintEntry {
     input: String,
     module: String,
+    /// Where the `at()` was written, so a build error can point at it.
+    span: Option<starlark::codemap::ResolvedSpan>,
     /// Instance whose io() carried the wrapper. A solve may claim this entry
     /// only from that instance or below it, so two parts sharing a net each
     /// get their own constraint.
@@ -96,10 +99,12 @@ struct PinConstraintEntry {
 }
 
 impl PinConstraints {
+    #[allow(clippy::too_many_arguments)]
     fn record(
         &mut self,
         input: String,
         module: String,
+        span: Option<starlark::codemap::ResolvedSpan>,
         owner: Vec<String>,
         nets: &[u64],
         lock: PinLock,
@@ -122,6 +127,7 @@ impl PinConstraints {
         self.entries.push(PinConstraintEntry {
             input,
             module,
+            span,
             owner,
             lock,
             soft,
@@ -130,14 +136,6 @@ impl PinConstraints {
         for n in nets {
             self.by_net.entry(*n).or_default().push(idx);
         }
-    }
-
-    /// Clear everything: the store spans one root evaluation, not the session.
-    pub(crate) fn clear(&mut self) {
-        self.ambiguous = None;
-        self.entries.clear();
-        self.by_net.clear();
-        self.preconsumed.clear();
     }
 
     /// Settle `input`'s constraint for a solve that read it off the wrapper:
@@ -216,14 +214,18 @@ impl PinConstraints {
     }
 
     /// Hard constraints no solve claimed, as `(module, input)`, sorted.
-    pub(crate) fn unconsumed_hard(&self) -> Vec<(String, String)> {
-        let mut out: Vec<(String, String)> = self
+    /// Hard constraints no solve claimed, as `(module, input, span)`, sorted.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn unconsumed_hard(
+        &self,
+    ) -> Vec<(String, String, Option<starlark::codemap::ResolvedSpan>)> {
+        let mut out: Vec<_> = self
             .entries
             .iter()
             .filter(|e| !e.soft && e.claimant.is_none())
-            .map(|e| (e.module.clone(), e.input.clone()))
+            .map(|e| (e.module.clone(), e.input.clone(), e.span))
             .collect();
-        out.sort();
+        out.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
         out
     }
 }
@@ -300,11 +302,42 @@ fn check_signal_names(info: &IfaceInfo<'_>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn iface_info<'v>(v: Value<'v>) -> Option<IfaceInfo<'v>> {
+/// The build's interface-identity map, or a private one when there is no
+/// evaluation context (identities then matter only within the call).
+fn interface_ids<'v>(eval: &Evaluator<'v, '_, '_>) -> std::sync::Arc<InterfaceIds> {
+    eval.eval_context()
+        .map(|c| c.interface_ids())
+        .unwrap_or_default()
+}
+
+/// Nominal interface identities for one build, keyed by declaration site.
+/// Session-scoped rather than process-global: sessions run concurrently, and a
+/// shared map would let one build hand another a stale id.
+pub(crate) type InterfaceIds = Mutex<HashMap<(String, String), TypeInstanceId>>;
+
+/// Identity of an interface *declaration* (file + exported name), so a file
+/// evaluated twice — the load cache is per package scope — stays one type.
+/// An interface never bound to a name keeps its per-evaluation identity.
+fn nominal_id(
+    ids: &InterfaceIds,
+    declaration_path: &str,
+    name: Option<String>,
+    evaluation_id: TypeInstanceId,
+) -> TypeInstanceId {
+    let Some(name) = name else {
+        return evaluation_id;
+    };
+    *ids.lock()
+        .unwrap()
+        .entry((declaration_path.to_owned(), name))
+        .or_insert_with(TypeInstanceId::r#gen)
+}
+
+fn iface_info<'v>(v: Value<'v>, ids: &InterfaceIds) -> Option<IfaceInfo<'v>> {
     let signals = || net_leaves(v).into_iter().map(|(k, _)| k).collect();
     if let Some(f) = v.downcast_ref::<InterfaceFactory<'v>>() {
         return Some(IfaceInfo {
-            id: f.type_instance_id(),
+            id: nominal_id(ids, f.declaration_path(), f.type_name(), f.evaluation_id()),
             name: f.type_name().unwrap_or_else(|| v.to_string()),
             signals: signals(),
             implies: f.implies().iter().map(|x| x.to_value()).collect(),
@@ -317,7 +350,7 @@ fn iface_info<'v>(v: Value<'v>) -> Option<IfaceInfo<'v>> {
     }
     if let Some(f) = v.downcast_ref::<FrozenInterfaceFactory>() {
         return Some(IfaceInfo {
-            id: f.type_instance_id(),
+            id: nominal_id(ids, f.declaration_path(), f.type_name(), f.evaluation_id()),
             name: f.type_name().unwrap_or_else(|| v.to_string()),
             signals: signals(),
             implies: f.implies().iter().map(|x| x.to_value()).collect(),
@@ -332,8 +365,8 @@ fn iface_info<'v>(v: Value<'v>) -> Option<IfaceInfo<'v>> {
 }
 
 /// BFS closure of an interface type over `implies`, deduplicated by nominal id.
-fn iface_closure<'v>(root: Value<'v>) -> anyhow::Result<Vec<IfaceInfo<'v>>> {
-    let root_info = iface_info(root)
+fn iface_closure<'v>(root: Value<'v>, ids: &InterfaceIds) -> anyhow::Result<Vec<IfaceInfo<'v>>> {
+    let root_info = iface_info(root, ids)
         .ok_or_else(|| anyhow::anyhow!("expected an interface type, got `{}`", root.get_type()))?;
     check_signal_names(&root_info)?;
     let mut seen: HashSet<TypeInstanceId> = HashSet::new();
@@ -344,7 +377,7 @@ fn iface_closure<'v>(root: Value<'v>) -> anyhow::Result<Vec<IfaceInfo<'v>>> {
         let implied: Vec<Value<'v>> = out[cursor].implies.clone();
         cursor += 1;
         for iv in implied {
-            let info = iface_info(iv).ok_or_else(|| {
+            let info = iface_info(iv, ids).ok_or_else(|| {
                 anyhow::anyhow!("interface(implies=...) entry is not an interface type")
             })?;
             if seen.insert(info.id) {
@@ -496,7 +529,11 @@ fn parse_rpin<'v>(v: Value<'v>, heap: Heap<'v>, ctx: &str) -> anyhow::Result<RPi
     })
 }
 
-fn parse_rperiph<'v>(v: Value<'v>, heap: Heap<'v>) -> anyhow::Result<RPeriph<'v>> {
+fn parse_rperiph<'v>(
+    v: Value<'v>,
+    heap: Heap<'v>,
+    ids: &InterfaceIds,
+) -> anyhow::Result<RPeriph<'v>> {
     let d = DictRef::from_value(v).ok_or_else(|| {
         anyhow::anyhow!("pin_solve: peripherals must be peripheral()/pool() values")
     })?;
@@ -514,7 +551,7 @@ fn parse_rperiph<'v>(v: Value<'v>, heap: Heap<'v>) -> anyhow::Result<RPeriph<'v>
     let mut provides_ids = HashSet::new();
     let mut provides_names = HashSet::new();
     for p in provides_list.iter() {
-        for info in iface_closure(p)? {
+        for info in iface_closure(p, ids)? {
             provides_ids.insert(info.id);
             provides_names.insert(info.name.clone());
         }
@@ -556,7 +593,7 @@ fn parse_rperiph<'v>(v: Value<'v>, heap: Heap<'v>) -> anyhow::Result<RPeriph<'v>
     })
 }
 
-fn parse_rreq<'v>(v: Value<'v>, heap: Heap<'v>) -> anyhow::Result<RReq<'v>> {
+fn parse_rreq<'v>(v: Value<'v>, heap: Heap<'v>, ids: &InterfaceIds) -> anyhow::Result<RReq<'v>> {
     let d = DictRef::from_value(v)
         .ok_or_else(|| anyhow::anyhow!("pin_solve: requests must be pin_request() values"))?;
     if dict_get_str(&d, heap, "kind").as_deref() != Some("request") {
@@ -568,7 +605,7 @@ fn parse_rreq<'v>(v: Value<'v>, heap: Heap<'v>) -> anyhow::Result<RReq<'v>> {
         .ok_or_else(|| anyhow::anyhow!("pin_solve: request missing name"))?;
     let iface = dict_get(&d, heap, "iface")
         .ok_or_else(|| anyhow::anyhow!("request `{name}`: missing interface"))?;
-    let closure = iface_closure(iface)?;
+    let closure = iface_closure(iface, ids)?;
     let uses = match dict_get(&d, heap, "uses") {
         Some(u) if !u.is_none() => ListRef::from_value(u)
             .ok_or_else(|| anyhow::anyhow!("request `{name}`: uses must be a list"))?
@@ -1068,6 +1105,9 @@ fn json_to_value<'v>(heap: Heap<'v>, v: &serde_json::Value) -> Value<'v> {
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 heap.alloc(i)
+            } else if let Some(u) = n.as_u64() {
+                // Vendor data above i64::MAX still round-trips as an integer.
+                heap.alloc(u)
             } else {
                 heap.alloc(n.as_f64().unwrap_or(0.0))
             }
@@ -1106,6 +1146,12 @@ fn warn_at_call_site(eval: &mut Evaluator<'_, '_, '_>, msg: String) {
 #[repr(C)]
 pub struct PinAtGen<V: ValueLifetimeless> {
     pub inner: V,
+    /// Where `at()` was written, so an unmet constraint points at the caller.
+    pub site: String,
+    #[freeze(identity)]
+    #[trace(unsafe_ignore)]
+    #[allocative(skip)]
+    pub span: Option<starlark::codemap::ResolvedSpan>,
     pub pins: Vec<String>,
     pub pins_by_signal: Vec<(String, Vec<String>)>,
     pub soft: bool,
@@ -1230,6 +1276,43 @@ fn parse_pin_spec<'v>(ctx: &str, v: Value<'v>, heap: Heap<'v>) -> anyhow::Result
 }
 
 /// `(inner, lock, soft)` of an `at()` wrapper (mutable or frozen), if `v` is one.
+/// `(inner, lock, soft, site, span)` of an `at()` wrapper.
+#[allow(clippy::type_complexity)]
+fn unpack_pin_at_full<'v>(
+    v: Value<'v>,
+) -> Option<(
+    Value<'v>,
+    PinLock,
+    bool,
+    String,
+    Option<starlark::codemap::ResolvedSpan>,
+)> {
+    if let Some(w) = v.downcast_ref::<PinAt<'v>>() {
+        return Some((
+            w.inner.to_value(),
+            PinLock {
+                any: w.pins.clone(),
+                by_signal: w.pins_by_signal.clone(),
+            },
+            w.soft,
+            w.site.clone(),
+            w.span,
+        ));
+    }
+    v.downcast_ref::<FrozenPinAt>().map(|w| {
+        (
+            w.inner.to_value(),
+            PinLock {
+                any: w.pins.clone(),
+                by_signal: w.pins_by_signal.clone(),
+            },
+            w.soft,
+            w.site.clone(),
+            w.span,
+        )
+    })
+}
+
 fn unpack_pin_at<'v>(v: Value<'v>) -> Option<(Value<'v>, PinLock, bool)> {
     if let Some(w) = v.downcast_ref::<PinAt<'v>>() {
         Some((
@@ -1261,8 +1344,8 @@ pub(crate) fn unwrap_pin_at<'v>(
     value: Value<'v>,
     eval: &mut Evaluator<'v, '_, '_>,
 ) -> Value<'v> {
-    match unpack_pin_at(value) {
-        Some((inner, lock, soft)) => {
+    match unpack_pin_at_full(value) {
+        Some((inner, lock, soft, site, span)) => {
             let mut nets = Vec::new();
             collect_net_ids(inner, &mut nets);
             if nets.is_empty() {
@@ -1282,15 +1365,20 @@ pub(crate) fn unwrap_pin_at<'v>(
             if !nets.is_empty()
                 && let Some(store) = eval.eval_context().map(|c| c.pin_constraints())
             {
-                let module = eval.source_path().unwrap_or_default();
+                let module = site.clone();
                 let owner = eval
                     .context_value()
                     .map(|ctx| ctx.module().path().segments.clone())
                     .unwrap_or_default();
-                store
-                    .lock()
-                    .unwrap()
-                    .record(name.to_owned(), module, owner, &nets, lock, soft);
+                store.lock().unwrap().record(
+                    name.to_owned(),
+                    module,
+                    span,
+                    owner,
+                    &nets,
+                    lock,
+                    soft,
+                );
             }
             inner
         }
@@ -1301,6 +1389,7 @@ pub(crate) fn unwrap_pin_at<'v>(
 /// Shared construction of a peripheral dict (used by `peripheral()` and `pool()`).
 #[allow(clippy::too_many_arguments)]
 fn make_peripheral_dict<'v>(
+    ids: &InterfaceIds,
     heap: Heap<'v>,
     name: &str,
     provides: &[Value<'v>],
@@ -1325,7 +1414,7 @@ fn make_peripheral_dict<'v>(
     // A declaration cannot overstate the datasheet: every field of every
     // provided interface (closure included) needs a non-empty candidate list.
     for p in provides {
-        for info in iface_closure(*p)? {
+        for info in iface_closure(*p, ids)? {
             for sig in &info.signals {
                 let ok = signals
                     .iter()
@@ -1352,7 +1441,7 @@ fn make_peripheral_dict<'v>(
     // "baud_max" the same way, with a Frequency.
     let mut declared: Vec<(String, pcb_sch::physical::PhysicalUnitDims, String)> = Vec::new();
     for p in provides {
-        for info in iface_closure(*p)? {
+        for info in iface_closure(*p, ids)? {
             for (aname, ty) in &info.attr_specs {
                 if let Some(t) = ty.downcast_ref::<pcb_sch::physical::PhysicalValueType>() {
                     match declared.iter().find(|(n, _, _)| n == aname) {
@@ -1519,8 +1608,14 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<Value<'v>> {
         let (pin_list, by_signal) = parse_pin_spec("at()", pins, eval.heap())?;
+        let (site, span) = eval
+            .call_stack_top_location()
+            .map(|loc| (loc.file.filename().to_string(), Some(loc.resolve_span())))
+            .unwrap_or_else(|| (eval.source_path().unwrap_or_default(), None));
         Ok(eval.heap().alloc(PinAt {
             inner: value,
+            site,
+            span,
             pins: pin_list,
             pins_by_signal: by_signal,
             soft,
@@ -1577,8 +1672,9 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<Value<'v>> {
         let heap = eval.heap();
+        let ids = interface_ids(eval);
         for p in &provides.items {
-            if iface_info(*p).is_none() {
+            if iface_info(*p, &ids).is_none() {
                 return Err(anyhow::anyhow!(
                     "peripheral `{name}`: provides entries must be interface types, got `{}`",
                     p.get_type()
@@ -1590,6 +1686,7 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
             normalized.push((sig.clone(), normalize_candidates(heap, &name, sig, *cands)?));
         }
         make_peripheral_dict(
+            &ids,
             heap,
             &name,
             &provides.items,
@@ -1613,13 +1710,14 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<Value<'v>> {
         let heap = eval.heap();
+        let ids = interface_ids(eval);
         let part = part.into_option();
         if provides.items.len() != 1 {
             return Err(anyhow::anyhow!(
                 "pool `{name}`: provides must list exactly one interface type"
             ));
         }
-        let info = iface_info(provides.items[0]).ok_or_else(|| {
+        let info = iface_info(provides.items[0], &ids).ok_or_else(|| {
             anyhow::anyhow!("pool `{name}`: provides entry must be an interface type")
         })?;
         check_signal_names(&info)?;
@@ -1647,6 +1745,7 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                 .and_then(|d| dict_get_str(&d, heap, "name"))
                 .ok_or_else(|| anyhow::anyhow!("pool `{name}`: invalid pin entry"))?;
             units.push(make_peripheral_dict(
+                &ids,
                 heap,
                 &format!("{name}.{pin_name}"),
                 &provides.items,
@@ -1706,7 +1805,8 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                 v.get_type()
             ));
         }
-        let info = iface_info(iface).ok_or_else(|| {
+        let ids = interface_ids(eval);
+        let info = iface_info(iface, &ids).ok_or_else(|| {
             anyhow::anyhow!(
                 "pin_request `{name}`: expected an interface type, got `{}`",
                 iface.get_type()
@@ -1830,6 +1930,7 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
     ) -> anyhow::Result<Value<'v>> {
         let heap = eval.heap();
 
+        let ids = interface_ids(eval);
         // One level of nesting is flattened: `pool()` yields a list of units,
         // so `[usart1, gpio_pool]` is one table.
         let plist = ListRef::from_value(peripherals).ok_or_else(|| {
@@ -1840,10 +1941,10 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
             match ListRef::from_value(entry) {
                 Some(nested) => {
                     for e in nested.iter() {
-                        periphs.push(parse_rperiph(e, heap)?);
+                        periphs.push(parse_rperiph(e, heap, &ids)?);
                     }
                 }
-                None => periphs.push(parse_rperiph(entry, heap)?),
+                None => periphs.push(parse_rperiph(entry, heap, &ids)?),
             }
         }
         // Pads belong to a part: peripherals declaring the same `part=` share a
@@ -1871,7 +1972,7 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
             .ok_or_else(|| anyhow::anyhow!("pin_solve: requests must be a list"))?;
         let mut reqs: Vec<RReq> = Vec::new();
         for entry in rlist.iter() {
-            reqs.push(parse_rreq(entry, heap)?);
+            reqs.push(parse_rreq(entry, heap, &ids)?);
         }
         let mut seen_reqs = HashSet::new();
         for r in &reqs {
@@ -2029,22 +2130,29 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
             })
             .collect();
         let mut claimed_instances: HashSet<String> = HashSet::new();
-        let mut claimed_pins: HashSet<String> = HashSet::new();
+        let mut claimed_pads: HashSet<(usize, String)> = HashSet::new();
         if let Some(ctx) = eval.context_value() {
             let ours: HashSet<&str> = periphs.iter().map(|p| p.name.as_str()).collect();
             let current: HashSet<String> = reqs.iter().map(|r| r.name.clone()).collect();
-            for (instance, pins) in ctx.pin_claims_excluding(&current) {
-                if ours.contains(instance.as_str()) {
-                    claimed_instances.insert(instance);
-                    claimed_pins.extend(pins);
+            for claim in ctx.pin_claims_excluding(&current) {
+                if !ours.contains(claim.instance.as_str()) {
+                    continue;
                 }
+                // The claim's pads belong to its own part, found by scope.
+                let Some(part) = scopes.iter().position(|s| *s == claim.scope) else {
+                    continue;
+                };
+                claimed_instances.insert(claim.instance);
+                claimed_pads.extend(claim.pins.into_iter().map(|p| (part, p)));
             }
         }
-        if !(claimed_instances.is_empty() && claimed_pins.is_empty()) {
+        if !(claimed_instances.is_empty() && claimed_pads.is_empty()) {
             for (i, combos) in all_combos.iter_mut().enumerate() {
                 combos.retain(|c| {
                     !claimed_instances.contains(&periphs[c.periph_idx].name)
-                        && !c.pins.iter().any(|(_, p)| claimed_pins.contains(&p.name))
+                        && !c.pins.iter().any(|(_, p)| {
+                            claimed_pads.contains(&(part_of[c.periph_idx], p.name.clone()))
+                        })
                 });
                 if combos.is_empty() {
                     return Err(anyhow::anyhow!(
@@ -2124,12 +2232,10 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
         // Build results (JSON first; the Starlark value mirrors it). Pins
         // claimed by earlier solves count as used: alternates, spares and
         // free_pins must never offer a pin another request already owns.
-        let mut used_pins: HashSet<String> = claimed_pins;
-        let mut used_pads: HashSet<(usize, String)> = HashSet::new();
+        let mut used_pads: HashSet<(usize, String)> = claimed_pads;
         for (i, &ci) in chosen.iter().enumerate() {
             let part = part_of[all_combos[i][ci].periph_idx];
             for (_, p) in &all_combos[i][ci].pins {
-                used_pins.insert(p.name.clone());
                 used_pads.insert((part, p.name.clone()));
             }
         }
@@ -2163,7 +2269,7 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                     .map(|cands| {
                         cands
                             .iter()
-                            .filter(|c| !used_pins.contains(&c.name))
+                            .filter(|c| !used_pads.contains(&(periph.part_idx, c.name.clone())))
                             .map(|c| serde_json::Value::String(c.name.clone()))
                             .collect()
                     })
@@ -2243,9 +2349,14 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                 let mut spares: Vec<String> = periphs
                     .iter()
                     .filter(|p| p.pool.as_deref() == Some(pool.as_str()))
-                    .filter_map(|p| p.signals.first().and_then(|(_, c)| c.first()))
-                    .map(|c| c.name.clone())
-                    .filter(|n| !used_pins.contains(n))
+                    .filter_map(|p| {
+                        p.signals
+                            .first()
+                            .and_then(|(_, c)| c.first())
+                            .map(|c| (p.part_idx, c.name.clone()))
+                    })
+                    .filter(|pad| !used_pads.contains(pad))
+                    .map(|(_, n)| n)
                     .collect();
                 spares.sort();
                 let rebind = periphs
@@ -2347,8 +2458,6 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
             // Pin and unit names belong to a part. A prior entry built on
             // silicon this solve never touched keeps its freedom verbatim.
             let ours: HashSet<&str> = periphs.iter().map(|p| p.name.as_str()).collect();
-            let our_pools: HashSet<&str> =
-                periphs.iter().filter_map(|p| p.pool.as_deref()).collect();
             let prior = |key: &str| {
                 ctx.module()
                     .properties()
@@ -2367,19 +2476,24 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                         // Prior alternates net of pins this solve claimed, but
                         // only when the entry sits on a part of this table.
                         let mut v = v.clone();
-                        let mine = v
+                        // Pads belong to a part, found through the instance
+                        // that took them; an entry on other silicon is left be.
+                        let Some(part) = v
                             .get("instance")
                             .and_then(|i| i.as_str())
-                            .is_some_and(|i| ours.contains(i));
-                        if !mine {
+                            .and_then(|i| periphs.iter().find(|p| p.name == i))
+                            .map(|p| p.part_idx)
+                        else {
                             return v;
-                        }
+                        };
                         if let Some(alts) = v.get_mut("alternates").and_then(|a| a.as_object_mut())
                         {
                             for list in alts.values_mut() {
                                 if let Some(arr) = list.as_array_mut() {
                                     arr.retain(|p| {
-                                        p.as_str().map(|n| !used_pins.contains(n)).unwrap_or(true)
+                                        p.as_str()
+                                            .map(|n| !used_pads.contains(&(part, n.to_owned())))
+                                            .unwrap_or(true)
                                     });
                                 }
                             }
@@ -2432,14 +2546,21 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                         }
                         // Pool this solve did not place on: keep it, net of the
                         // pins this solve claimed only if it is the same part.
-                        let mine = our_pools.contains(pool);
+                        let mine = periphs
+                            .iter()
+                            .find(|p| p.pool.as_deref() == Some(pool))
+                            .map(|p| p.part_idx);
                         let spares: Vec<String> = prior_class
                             .get("spare_pins")
                             .and_then(|s| s.as_array())
                             .map(|s| {
                                 s.iter()
                                     .filter_map(|p| p.as_str())
-                                    .filter(|n| !mine || !used_pins.contains(*n))
+                                    .filter(|n| {
+                                        mine.is_none_or(|part| {
+                                            !used_pads.contains(&(part, (*n).to_owned()))
+                                        })
+                                    })
                                     .map(str::to_owned)
                                     .collect()
                             })
@@ -2541,7 +2662,7 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                     .flat_map(|p| p.signals.iter())
                     .flat_map(|(_, cands)| cands.iter())
                     .map(|c| c.name.clone())
-                    .filter(|n| !used_pads.contains(&(i, n.clone())) && !used_pins.contains(n))
+                    .filter(|n| !used_pads.contains(&(i, n.clone())))
                     .collect::<HashSet<_>>()
                     .into_iter()
                     .collect();
@@ -2755,6 +2876,25 @@ mod tests {
         segs.iter().map(|s| (*s).to_owned()).collect()
     }
 
+    fn record(
+        c: &mut PinConstraints,
+        input: &str,
+        module: &str,
+        owner: Vec<String>,
+        net: u64,
+        pin: &str,
+    ) {
+        c.record(
+            input.to_owned(),
+            module.to_owned(),
+            None,
+            owner,
+            &[net],
+            lock(pin),
+            false,
+        );
+    }
+
     /// Inline because the scenario is not reachable from `.zen`: whether a
     /// second constraint on the same net is recorded before or after the early
     /// solve depends on child-evaluation order, which a design cannot control.
@@ -2765,8 +2905,8 @@ mod tests {
         let (a, b) = (path(&["A"]), path(&["B"]));
         let mut c = PinConstraints::default();
         c.preconsume(&a, "IO", &[5]);
-        c.record("IO".into(), "a.zen".into(), a, &[5], lock("PA1"), false);
-        c.record("IO".into(), "b.zen".into(), b, &[5], lock("PA2"), false);
+        record(&mut c, "IO", "a.zen", a, 5, "PA1");
+        record(&mut c, "IO", "b.zen", b, 5, "PA2");
 
         let left = c.unconsumed_hard();
         assert_eq!(left.len(), 1, "only the sibling's remains, got {left:?}");
@@ -2783,13 +2923,14 @@ mod tests {
         c.record(
             "X".into(),
             "m".into(),
+            None,
             a.clone(),
             &[1, 2],
             lock("PA1"),
             false,
         );
         c.preconsume(&a, "X", &[1]);
-        c.record("X".into(), "m".into(), a, &[1, 2], lock("PA2"), false);
+        c.record("X".into(), "m".into(), None, a, &[1, 2], lock("PA2"), false);
     }
 
     /// Settling an entry that already exists must not also leave a credit: the
@@ -2798,16 +2939,9 @@ mod tests {
     fn settling_an_existing_entry_leaves_no_stray_credit() {
         let (a, b) = (path(&["A"]), path(&["B"]));
         let mut c = PinConstraints::default();
-        c.record(
-            "IO".into(),
-            "a.zen".into(),
-            a.clone(),
-            &[9],
-            lock("P1"),
-            false,
-        );
+        record(&mut c, "IO", "a.zen", a.clone(), 9, "P1");
         c.settle(&[9], &a, "IO");
-        c.record("IO".into(), "b.zen".into(), b, &[9], lock("P2"), false);
+        record(&mut c, "IO", "b.zen", b, 9, "P2");
 
         let left = c.unconsumed_hard();
         assert_eq!(
@@ -2826,14 +2960,7 @@ mod tests {
         let other = path(&["SOM", "U2"]);
 
         let mut c = PinConstraints::default();
-        c.record(
-            "LED".into(),
-            "som.zen".into(),
-            som,
-            &[9],
-            lock("PA7"),
-            false,
-        );
+        record(&mut c, "LED", "som.zen", som, 9, "PA7");
         assert!(
             c.claim(&[9], &leaf, "LED").is_some(),
             "first solve takes it"
@@ -2855,15 +2982,8 @@ mod tests {
         let leaf = path(&["SOM", "U1"]);
 
         let mut c = PinConstraints::default();
-        c.record(
-            "A".into(),
-            "som.zen".into(),
-            som.clone(),
-            &[9],
-            lock("PA1"),
-            false,
-        );
-        c.record("B".into(), "som.zen".into(), som, &[9], lock("PA2"), false);
+        record(&mut c, "A", "som.zen", som.clone(), 9, "PA1");
+        record(&mut c, "B", "som.zen", som, 9, "PA2");
 
         assert!(c.claim(&[9], &leaf, "LED").is_none(), "ambiguous, no guess");
         let (input, names) = c.take_ambiguous().expect("ambiguity reported");

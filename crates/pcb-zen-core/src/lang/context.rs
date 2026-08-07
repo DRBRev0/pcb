@@ -230,16 +230,17 @@ impl<'v> ContextValue<'v> {
         self.pin_claims.borrow().get(req).map(|c| c.scope.clone())
     }
 
-    /// `(instance, pins)` claimed by requests other than `except`.
+    /// Claims from requests other than `except`, scope included: pin names
+    /// only mean something inside the part that owns them.
     pub(crate) fn pin_claims_excluding(
         &self,
         except: &std::collections::HashSet<String>,
-    ) -> Vec<(String, Vec<String>)> {
+    ) -> Vec<PinClaim> {
         self.pin_claims
             .borrow()
             .iter()
             .filter(|(req, _)| !except.contains(*req))
-            .map(|(_, c)| (c.instance.clone(), c.pins.clone()))
+            .map(|(_, c)| c.clone())
             .collect()
     }
 
