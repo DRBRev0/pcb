@@ -4,7 +4,7 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
 };
 
 use anyhow::anyhow;
@@ -59,7 +59,6 @@ use super::{
     interface::interface_globals,
     module::{ModuleLoader, module_globals},
     path::format_relative_path_as_package_uri,
-    pinmux::pinmux_globals,
     spice_model::model_globals,
     test_bench::test_bench_globals,
 };
@@ -453,6 +452,9 @@ pub struct EvalSession {
     module_deps: Arc<RwLock<HashMap<PathBuf, HashSet<PathBuf>>>>,
     /// Tree of all frozen child modules indexed by fully qualified path.
     module_tree: Arc<RwLock<BTreeMap<ModulePath, FrozenModule>>>,
+    /// `at()` pin constraints for the whole build, keyed by net identity so a
+    /// descendant's `pin_solve` can claim one recorded further up.
+    pub(crate) pin_constraints: Arc<Mutex<crate::lang::pinmux::PinConstraints>>,
 }
 
 /// Configuration for creating an EvalContext. Send + Sync safe for passing across threads.
@@ -931,6 +933,7 @@ impl Default for EvalSession {
             symbol_meta: Arc::new(RwLock::new(HashMap::new())),
             module_deps: Arc::new(RwLock::new(HashMap::new())),
             module_tree: Arc::new(RwLock::new(BTreeMap::new())),
+            pin_constraints: Arc::default(),
         }
     }
 }
@@ -1284,7 +1287,6 @@ impl EvalContext {
                 .with(file_globals)
                 .with(model_globals)
                 .with(test_bench_globals)
-                .with(pinmux_globals)
                 .build()
             })
             .clone()
@@ -1298,6 +1300,10 @@ impl EvalContext {
     /// Record that `from` references `to` via a `Module()` call.
     pub(crate) fn record_module_dependency(&self, from: &Path, to: &Path) {
         self.session.record_module_dependency(from, to);
+    }
+
+    pub(crate) fn pin_constraints(&self) -> Arc<Mutex<crate::lang::pinmux::PinConstraints>> {
+        self.session.pin_constraints.clone()
     }
 
     fn load_cache_scope(&self, path: &Path) -> Option<PackageScopeKey> {
@@ -1566,27 +1572,6 @@ impl EvalContext {
 
             match eval_result {
                 Ok(_) => {
-                    if let Some(ctx) = module
-                        .extra_value()
-                        .and_then(|e| e.downcast_ref::<ContextValue>())
-                    {
-                        let unconsumed = ctx.unconsumed_hard_pin_constraints();
-                        if !unconsumed.is_empty() {
-                            diagnostics.extend(ctx.diagnostics_snapshot());
-                            for name in unconsumed {
-                                diagnostics.push(
-                                    anyhow!(
-                                        "at() pin constraint on input `{name}` was never consumed: no pin_request of that name reached pin_solve"
-                                    )
-                                    .into(),
-                                );
-                            }
-                            return WithDiagnostics {
-                                output: None,
-                                diagnostics: Diagnostics::from(diagnostics),
-                            };
-                        }
-                    }
                     let frozen_module = {
                         let _span = info_span!("freeze_module").entered();
                         module
@@ -1695,6 +1680,30 @@ impl EvalContext {
 
                     // Module's own diagnostics (from ContextValue)
                     diagnostics.extend(extra.diagnostics().iter().cloned());
+
+                    // Every solve in the tree has run by now, so a hard
+                    // constraint still unclaimed is one nothing ever wanted.
+                    if is_root {
+                        for (module, input) in self
+                            .session
+                            .pin_constraints
+                            .lock()
+                            .unwrap()
+                            .unconsumed_hard()
+                        {
+                            let where_ = if module.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" of `{module}`")
+                            };
+                            diagnostics.push(
+                                anyhow!(
+                                    "at() pin constraint on input `{input}`{where_} was never consumed: no pin_request named `{input}` reached a pin_solve"
+                                )
+                                .into(),
+                            );
+                        }
+                    }
 
                     if !diagnostics.iter().any(Diagnostic::is_error) {
                         diagnostics.extend(ast_style_lints(&ast));

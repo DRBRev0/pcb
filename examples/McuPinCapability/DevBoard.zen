@@ -7,6 +7,7 @@ assigns instances and pins, and the solved `pin_assignment` / `swap_classes`
 land on the MCU instance as properties.
 """
 
+load("@stdlib/pinmux.zen", "at")
 load("@stdlib/interfaces.zen", "Uart", "Spi", "Swd")
 
 Mcu = Module("./STM32G030.zen")

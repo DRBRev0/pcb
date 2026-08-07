@@ -13,6 +13,8 @@ OUT4=13, OUT3=14. Channels 1 and 2 cross on the die: unit 1 is IN1+/- (7/6)
 to OUT1 (1), unit 2 is IN2+/- (5/4) to OUT2 (2).
 """
 
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_map", "pin_request", "pin_solve")
+
 Comparator = interface(INP = Net(), INN = Net(), OUT = Net())
 
 def _unit(name, inp, inn, out):

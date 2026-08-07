@@ -19,9 +19,17 @@ Spi = interface(SCK = Net, MISO = Net, MOSI = Net)
 Gpio = interface(PIN = Net)
 AdcIn = interface(IN = Net)
 Comparator = interface(INP = Net, INN = Net, OUT = Net)
+
+DiffPair = interface(P = Net, N = Net, impedance = field(int, default = 0))
+# Nested as an instance (the stdlib spelling) and as a type.
+Usb2 = interface(D = DiffPair(impedance = 90), VBUS = Net)
+Lvds = interface(CLK = DiffPair, DATA = DiffPair)
+# `D` flattens onto the sibling `D_P`.
+Ambiguous = interface(D = DiffPair, D_P = Net)
 "#;
 
 const STM32: &str = r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pool")
 load("./ifaces.zen", "Uart", "Usart", "UartFlow", "I2c", "Spi", "Gpio", "AdcIn")
 
 USART1 = peripheral(
@@ -87,6 +95,7 @@ PERIPHS = [USART1, USART2, SPI1, I2C1, ADC1_IN0, ADC1_IN1, GPIO_POOL]
 "#;
 
 const ESP32C3: &str = r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pool")
 load("./ifaces.zen", "Uart", "Gpio", "AdcIn")
 
 _MATRIX = [
@@ -132,6 +141,7 @@ PERIPHS = [UART0, UART1, ADC1_CH0, ADC1_CH1, ADC1_CH2, ADC1_CH3, ADC1_CH4, ADC2_
 "#;
 
 const COMPARATOR: &str = r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin")
 load("./ifaces.zen", "Comparator")
 
 UNIT_A = peripheral("A", provides = [Comparator], rebind = "none",
@@ -193,6 +203,7 @@ fn json_property(result: &WithDiagnostics<EvalOutput>, key: &str) -> serde_json:
 fn downgrade_and_poorest_instance() {
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
 load("./stm32.zen", "PERIPHS")
 load("./ifaces.zen", "Uart", "Usart")
 
@@ -222,6 +233,7 @@ check(not ("PA9" in res["free_pins"]), "claimed pin must not be free")
 fn upgrade_is_impossible() {
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
 load("./stm32.zen", "PERIPHS")
 load("./ifaces.zen", "Usart")
 
@@ -235,6 +247,7 @@ pin_solve(PERIPHS, [pin_request("SC1", Usart), pin_request("SC2", Usart)])
 fn instance_exclusive_even_on_disjoint_pins() {
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
 load("./stm32.zen", "PERIPHS")
 load("./ifaces.zen", "Uart")
 
@@ -252,6 +265,7 @@ pin_solve(PERIPHS, [
 fn intra_instance_pin_mixing() {
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
 load("./stm32.zen", "PERIPHS")
 load("./ifaces.zen", "Uart", "Gpio")
 
@@ -272,6 +286,7 @@ check(a["COM"]["signals"]["RX"]["pin"] == "PB7", "COM RX " + a["COM"]["signals"]
 fn joint_contention_is_infeasible() {
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
 load("./stm32.zen", "PERIPHS")
 load("./ifaces.zen", "Uart", "I2c", "Gpio")
 
@@ -290,6 +305,7 @@ pin_solve(PERIPHS, [
 fn where_predicate_on_unit_attrs() {
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
 load("./stm32.zen", "PERIPHS")
 load("./ifaces.zen", "Uart")
 
@@ -307,6 +323,7 @@ check(res["assignment"]["FAST"]["instance"] == "USART1", "FAST got " + res["assi
 fn where_predicate_starves() {
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
 load("./stm32.zen", "PERIPHS")
 load("./ifaces.zen", "Uart", "Usart")
 
@@ -326,6 +343,7 @@ pin_solve(PERIPHS, [
 fn gpio_vs_peripheral_exclusivity() {
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
 load("./stm32.zen", "PERIPHS")
 load("./ifaces.zen", "Spi", "Gpio")
 
@@ -340,6 +358,7 @@ check(res["assignment"]["FLASH"]["signals"]["SCK"]["pin"] == "PB3", "SCK fallbac
 
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
 load("./stm32.zen", "PERIPHS")
 load("./ifaces.zen", "Spi", "Gpio")
 
@@ -357,6 +376,7 @@ pin_solve(PERIPHS, [
 fn deterministic_and_stable_across_builds() {
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
 load("./stm32.zen", "PERIPHS")
 load("./ifaces.zen", "Uart", "Usart", "Gpio", "AdcIn")
 
@@ -378,6 +398,7 @@ check(r3["assignment"]["MES"]["signals"] == r1["assignment"]["MES"]["signals"], 
 fn declaration_cannot_overstate() {
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin")
 load("./ifaces.zen", "UartFlow")
 
 peripheral("UARTX", provides = [UartFlow], rebind = "firmware",
@@ -391,6 +412,7 @@ peripheral("UARTX", provides = [UartFlow], rebind = "firmware",
 fn esp32_iomux_preferred_over_matrix() {
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
 load("./esp32c3.zen", "PERIPHS")
 load("./ifaces.zen", "Uart")
 
@@ -413,6 +435,7 @@ check(len(a["GPS"]["alternates"]["TX"]) > 0, "matrix alternates missing")
 fn esp32_conditional_capability() {
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
 load("./esp32c3.zen", "PERIPHS")
 load("./ifaces.zen", "AdcIn")
 
@@ -427,6 +450,7 @@ pin_solve(
 
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
 load("./esp32c3.zen", "PERIPHS")
 load("./ifaces.zen", "AdcIn")
 
@@ -446,6 +470,7 @@ check("ADC2_CH0" in insts, "ADC2 not used: " + str(insts))
 fn forced_strap_pin_warns() {
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
 load("./esp32c3.zen", "PERIPHS")
 load("./ifaces.zen", "Gpio")
 
@@ -465,6 +490,7 @@ check(res["assignment"]["BOOT_BTN"]["signals"]["PIN"]["pin"] == "GPIO9", "locked
 fn hard_lock_single_pin_on_multi_signal_role() {
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
 load("./stm32.zen", "PERIPHS")
 load("./ifaces.zen", "Uart")
 
@@ -481,6 +507,7 @@ check(a["signals"]["TX"]["pin"] == "PA2", "TX must land on the locked pin")
 fn empty_uses_rejected() {
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
 load("./stm32.zen", "PERIPHS")
 load("./ifaces.zen", "Uart")
 
@@ -494,6 +521,7 @@ pin_solve(PERIPHS, [pin_request("X", Uart, uses = [])])
 fn infeasible_after_truncation_mentions_the_cap() {
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
 load("./ifaces.zen", "Uart")
 
 WIDE = peripheral(
@@ -517,6 +545,7 @@ pin_solve([WIDE], [pin_request("A", Uart), pin_request("B", Uart)])
 fn locked_pin_beyond_the_cap_is_still_found() {
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
 load("./ifaces.zen", "Gpio")
 
 P = peripheral(
@@ -537,6 +566,7 @@ check(res["assignment"]["R"]["signals"]["PIN"]["pin"] == "P599", "locked pin mus
 fn mandatory_pin_beyond_the_cap_is_still_found() {
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
 load("./ifaces.zen", "Uart")
 
 W = peripheral(
@@ -560,13 +590,17 @@ check(res["assignment"]["U"]["signals"]["TX"]["pin"] == "T29", "mandatory pin mu
 fn failed_lock_names_the_pins_in_the_rejection() {
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
 load("./stm32.zen", "PERIPHS")
 load("./ifaces.zen", "Gpio")
 
 pin_solve(PERIPHS, [pin_request("LED", Gpio, prefer = ["NOPE"], lock = True)])
 "#,
     );
-    assert_fails_with(&result, "no pin combination satisfies the locked pins");
+    assert_fails_with(
+        &result,
+        "signal `PIN` has no candidate among the locked pins `NOPE`",
+    );
 }
 
 #[test]
@@ -577,6 +611,7 @@ fn at_constraint_survives_solve_before_io() {
         (
             "/mcu_early.zen".to_string(),
             r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
 load("./ifaces.zen", "Gpio")
 load("./stm32.zen", "PERIPHS")
 
@@ -591,6 +626,7 @@ IO0 = io(Net, optional = True)
         (
             "/test.zen".to_string(),
             r#"
+load("@stdlib/pinmux.zen", "at")
 Mcu = Module("/mcu_early.zen")
 Mcu(name = "M1", IO0 = at(Net("LED"), "PA10"))
 "#
@@ -605,6 +641,7 @@ Mcu(name = "M1", IO0 = at(Net("LED"), "PA10"))
 fn duplicate_uses_rejected() {
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
 load("./stm32.zen", "PERIPHS")
 load("./ifaces.zen", "Uart")
 
@@ -618,6 +655,7 @@ pin_solve(PERIPHS, [pin_request("X", Uart, uses = ["TX", "TX"])])
 fn raw_pin_dict_with_reserved_data_key_rejected() {
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin_request", "pin_solve")
 load("./ifaces.zen", "Gpio")
 
 forged = {"kind": "pin", "name": "X1", "data": {"pin": "LIE"}, "cost": 0, "input_only": False, "strap": False}
@@ -632,6 +670,7 @@ pin_solve([P], [pin_request("R", Gpio)])
 fn exclusivity_spans_solves_in_one_module() {
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
 load("./ifaces.zen", "Gpio")
 
 P = peripheral("P", provides = [Gpio], rebind = "fixed", signals = {"PIN": [pin("X1")]})
@@ -643,6 +682,7 @@ pin_solve([P], [pin_request("B", Gpio)])
 
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve", "pool")
 load("./ifaces.zen", "Gpio")
 
 POOL = pool("GPIO", provides = [Gpio], pins = ["X1", "X2", "X3"])
@@ -661,6 +701,7 @@ fn residual_freedom_excludes_prior_solve_claims() {
     // free_pins and pool spare_pins must not list a pin an earlier solve owns.
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve", "pool")
 load("./ifaces.zen", "Gpio")
 
 POOL = pool("GPIO", provides = [Gpio], pins = ["X1", "X2", "X3"])
@@ -679,6 +720,7 @@ check(p1 not in pools[0]["spare_pins"], "spare_pins must exclude the pin claimed
     // Per-signal alternates must not offer a pin an earlier solve owns.
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
 load("./ifaces.zen", "Gpio")
 
 P1 = peripheral("P1", provides = [Gpio], rebind = "firmware",
@@ -698,6 +740,7 @@ check(p1 not in alts.get("PIN", []), "alternates must exclude the pin claimed by
     // both comparator units taken across two solves, no swap class remains.
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
 load("./comparator.zen", "PERIPHS")
 load("./ifaces.zen", "Comparator")
 
@@ -714,6 +757,7 @@ check(len(clusters) == 0, "no residual cluster freedom once both units are claim
 fn misused_previous_warns() {
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
 load("./stm32.zen", "PERIPHS")
 load("./ifaces.zen", "Uart")
 
@@ -733,6 +777,7 @@ pin_solve(PERIPHS, [pin_request("DEBUG", Uart)], previous = r1)
 fn conflicting_attr_dims_rejected() {
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin")
 load("./ifaces.zen", "Frequency")
 
 A = interface(X = Net, attrs = {"m": Frequency})
@@ -749,6 +794,7 @@ peripheral("P", provides = [A, B], rebind = "fixed",
 fn two_solves_merge_into_the_module_properties() {
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
 load("./stm32.zen", "PERIPHS")
 load("./ifaces.zen", "Uart", "Gpio")
 
@@ -771,6 +817,7 @@ fn swap_classes_property_merges_pool_solves() {
     // reflect every claim in the module, not just the last solve's.
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve", "pool")
 load("./ifaces.zen", "Gpio")
 
 POOL = pool("GPIO", provides = [Gpio], pins = ["X1", "X2", "X3", "X4"])
@@ -811,6 +858,7 @@ fn resolving_one_member_keeps_its_siblings_in_the_property() {
     // Re-solving A must not drop B's membership from the shared class.
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve", "pool")
 load("./ifaces.zen", "Gpio")
 
 POOL = pool("GPIO", provides = [Gpio], pins = ["X1", "X2"])
@@ -841,6 +889,7 @@ fn cluster_property_merges_and_refreshes_spares_across_solves() {
     // spare units drop out as later solves occupy them.
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
 load("./ifaces.zen", "Comparator")
 
 UNIT_A = peripheral("A", provides = [Comparator], rebind = "none",
@@ -903,6 +952,7 @@ fn unconsumed_at_failure_keeps_module_warnings() {
         (
             "/mcu.zen".to_string(),
             r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
 load("./esp32c3.zen", "PERIPHS")
 load("./ifaces.zen", "Gpio")
 
@@ -914,6 +964,7 @@ pin_solve(PERIPHS, [pin_request("BOOT_BTN", Gpio, prefer = ["GPIO9"], lock = Tru
         (
             "/test.zen".to_string(),
             r#"
+load("@stdlib/pinmux.zen", "at")
 Mcu = Module("/mcu.zen")
 Mcu(name = "M1", IO0 = at(Net("LED"), "GPIO4"))
 "#
@@ -939,6 +990,7 @@ fn unconsumed_hard_at_fails_the_build() {
         (
             "/test.zen".to_string(),
             r#"
+load("@stdlib/pinmux.zen", "at")
 Mcu = Module("/plain.zen")
 Mcu(name = "M1", IO0 = at(Net("LED"), "PA10"))
 "#
@@ -959,6 +1011,7 @@ fn unconsumed_soft_at_is_tolerated() {
         (
             "/test.zen".to_string(),
             r#"
+load("@stdlib/pinmux.zen", "at")
 Mcu = Module("/plain.zen")
 Mcu(name = "M1", IO0 = at(Net("LED"), "PA10", soft = True))
 "#
@@ -972,6 +1025,7 @@ Mcu(name = "M1", IO0 = at(Net("LED"), "PA10", soft = True))
 fn bind_at_overrides_request_prefer() {
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "at", "pin_request", "pin_solve")
 load("./stm32.zen", "PERIPHS")
 load("./ifaces.zen", "Gpio")
 
@@ -988,6 +1042,7 @@ check(res["assignment"]["LED"]["signals"]["PIN"]["pin"] == "PA10", "caller at() 
 fn symmetric_parameter_is_rejected() {
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "peripheral")
 load("./ifaces.zen", "Gpio")
 
 peripheral("P", provides = [Gpio], rebind = "none", signals = {"PIN": ["X1"]}, symmetric = [["A"]])
@@ -1000,6 +1055,7 @@ peripheral("P", provides = [Gpio], rebind = "none", signals = {"PIN": ["X1"]}, s
 fn pin_data_large_int_roundtrip() {
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
 load("./ifaces.zen", "Gpio")
 
 P = peripheral(
@@ -1020,6 +1076,7 @@ check(res["assignment"]["R"]["signals"]["PIN"]["big"] == 5000000000, "large data
 fn pinmap_cap_truncation_warns() {
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
 load("./ifaces.zen", "Uart")
 
 WIDE = peripheral(
@@ -1048,6 +1105,7 @@ check(res["assignment"]["LINK"]["instance"] == "WIDE", "assigned despite cap")
 fn gpio_pool_swap_class() {
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
 load("./esp32c3.zen", "PERIPHS")
 load("./ifaces.zen", "Gpio")
 
@@ -1070,6 +1128,7 @@ check(pools[0]["rebind"] == "firmware", "rebind")
 fn gate_swap_cluster_class() {
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
 load("./comparator.zen", "PERIPHS")
 load("./ifaces.zen", "Comparator")
 
@@ -1084,6 +1143,7 @@ check(clusters[0]["rebind"] == "none", "cluster rebind")
 
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
 load("./comparator.zen", "PERIPHS")
 load("./ifaces.zen", "Comparator")
 
@@ -1097,6 +1157,7 @@ pin_solve(PERIPHS, [pin_request("C" + str(i), Comparator) for i in range(3)])
 fn unconnected_signals_leave_pins_free() {
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
 load("./stm32.zen", "PERIPHS")
 load("./ifaces.zen", "Uart", "Gpio")
 
@@ -1120,6 +1181,7 @@ fn optimal_not_merely_greedy() {
     // optimum (total 1): A on P2/X, B on P1/Y.
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
 load("./ifaces.zen", "Gpio")
 
 P1 = peripheral("P1", provides = [Gpio], rebind = "firmware",
@@ -1137,6 +1199,7 @@ check(not ("Z" in pins), "suboptimal: Z (cost 10) used while X+Y (cost 1) was fe
 }
 
 const MCU_SLOTS: &str = r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
 load("./ifaces.zen", "Uart", "Usart")
 load("./stm32.zen", "PERIPHS")
 
@@ -1192,6 +1255,7 @@ Mcu(name = "MCU1", DEBUG = Uart("DBG"))
 fn pin_map_builds_component_pins() {
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "pin_map", "pin_request", "pin_solve")
 load("./stm32.zen", "PERIPHS")
 load("./ifaces.zen", "Uart", "Gpio")
 
@@ -1213,6 +1277,7 @@ check(m["PB0"] == LED, "PB0 must carry the LED net")
 }
 
 const MCU_AT: &str = r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
 load("./ifaces.zen", "Gpio")
 load("./stm32.zen", "PERIPHS")
 
@@ -1245,6 +1310,7 @@ fn io0_pin(result: &WithDiagnostics<EvalOutput>) -> String {
 fn at_constrains_pin_on_the_connection() {
     let result = eval_mcu_at(
         r#"
+load("@stdlib/pinmux.zen", "at")
 Mcu = Module("/mcu_at.zen")
 Mcu(name = "M1", IO0 = at(Net("LED"), "PA10"))
 "#,
@@ -1258,6 +1324,7 @@ fn at_hard_constraint_fails_loudly() {
     // PA13 is deliberately absent from the fixture's GPIO pool.
     let result = eval_mcu_at(
         r#"
+load("@stdlib/pinmux.zen", "at")
 Mcu = Module("/mcu_at.zen")
 Mcu(name = "M1", IO0 = at(Net("LED"), "PA13"))
 "#,
@@ -1269,6 +1336,7 @@ Mcu(name = "M1", IO0 = at(Net("LED"), "PA13"))
 fn at_soft_constraint_falls_back() {
     let result = eval_mcu_at(
         r#"
+load("@stdlib/pinmux.zen", "at")
 Mcu = Module("/mcu_at.zen")
 Mcu(name = "M1", IO0 = at(Net("LED"), "PA13", soft = True))
 "#,
@@ -1282,6 +1350,7 @@ Mcu(name = "M1", IO0 = at(Net("LED"), "PA13", soft = True))
 }
 
 const MCU_ROLES: &str = r#"
+load("@stdlib/pinmux.zen", "pin_map", "pin_request", "pin_solve")
 load("./ifaces.zen", "Gpio", "AdcIn")
 load("./stm32.zen", "PERIPHS")
 
@@ -1313,6 +1382,7 @@ fn dict_of_roles_demands() {
         (
             "/test.zen".to_string(),
             r#"
+load("@stdlib/pinmux.zen", "at")
 Mcu = Module("/mcu_roles.zen")
 Mcu(name = "M1", gpio = {"LED": at(Net("LED"), "PA10")}, adc = {"VBAT": Net("VBAT")})
 "#
@@ -1341,6 +1411,7 @@ Mcu(name = "M1", gpio = {"LED": at(Net("LED"), "PA10")}, adc = {"VBAT": Net("VBA
 fn attr_vocabulary_is_enforced() {
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin")
 load("./ifaces.zen", "Uart")
 
 peripheral("U9", provides = [Uart], rebind = "firmware",
@@ -1352,6 +1423,7 @@ peripheral("U9", provides = [Uart], rebind = "firmware",
 
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin")
 load("./ifaces.zen", "Uart")
 
 peripheral("U9", provides = [Uart], rebind = "firmware",
@@ -1363,6 +1435,7 @@ peripheral("U9", provides = [Uart], rebind = "firmware",
 
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin")
 load("./ifaces.zen", "Spi")
 
 peripheral("S9", provides = [Spi], rebind = "firmware",
@@ -1377,6 +1450,7 @@ peripheral("S9", provides = [Spi], rebind = "firmware",
 fn vio_attr_selects_fixed_level_provider() {
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
 load("./ifaces.zen", "I2c")
 
 B3V3 = peripheral("B3V3", provides = [I2c], rebind = "fixed",
@@ -1397,6 +1471,7 @@ check(res["assignment"]["BUS"]["instance"] == "B3V3", "3V3 provider expected")
 
     let result = eval_with_fixtures(
         r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin")
 load("./ifaces.zen", "I2c")
 
 peripheral("B9", provides = [I2c], rebind = "fixed",
@@ -1405,4 +1480,601 @@ peripheral("B9", provides = [I2c], rebind = "fixed",
 "#,
     );
     assert_fails_with(&result, "expects");
+}
+
+// --- Signals are the net-typed leaves, not every interface field -------------
+
+#[test]
+fn metadata_field_is_not_a_signal() {
+    // Neither demanded of the declaration nor consuming a pin in the solve.
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
+load("./ifaces.zen", "DiffPair")
+
+LVDS0 = peripheral("LVDS0", provides = [DiffPair], rebind = "fixed",
+    signals = {"P": [pin("A1")], "N": [pin("A2")]})
+
+res = pin_solve([LVDS0], [pin_request("D", DiffPair)])
+sigs = res["assignment"]["D"]["signals"]
+check(len(sigs) == 2, "impedance must not consume a pin, got " + str(len(sigs)))
+check(sigs["P"]["pin"] == "A1", "P -> A1")
+check(sigs["N"]["pin"] == "A2", "N -> A2")
+"#,
+    );
+    assert_ok(&result);
+}
+
+#[test]
+fn metadata_field_cannot_be_named_in_uses() {
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "pin_request")
+load("./ifaces.zen", "DiffPair")
+pin_request("D", DiffPair, uses = ["impedance"])
+"#,
+    );
+    assert_fails_with(&result, "`impedance` is not a signal of DiffPair");
+}
+
+#[test]
+fn nested_interface_flattens_into_signals() {
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_map", "pin_request", "pin_solve")
+load("./ifaces.zen", "Usb2")
+
+USB0 = peripheral("USB0", provides = [Usb2], rebind = "fixed",
+    signals = {"D_P": [pin("PA12")], "D_N": [pin("PA11")], "VBUS": [pin("PA9")]})
+
+BUS = Usb2("BUS")
+res = pin_solve([USB0], [pin_request("U", Usb2)])
+sigs = res["assignment"]["U"]["signals"]
+check(len(sigs) == 3, "expected 3 signals, got " + str(len(sigs)))
+
+m = pin_map(res["assignment"], {"U": BUS})
+check(m["PA12"] == BUS.D.P, "PA12 must carry the nested D.P net")
+check(m["PA11"] == BUS.D.N, "PA11 must carry the nested D.N net")
+check(m["PA9"] == BUS.VBUS, "PA9 must carry VBUS")
+check(type(m["PA12"]) == "Net", "a mapped pin must be a Net, got " + type(m["PA12"]))
+"#,
+    );
+    assert_ok(&result);
+}
+
+#[test]
+fn nested_interface_type_field_flattens_too() {
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_map", "pin_request", "pin_solve")
+load("./ifaces.zen", "Lvds")
+
+LV = peripheral("LV", provides = [Lvds], rebind = "fixed",
+    signals = {
+        "CLK_P": [pin("B1")], "CLK_N": [pin("B2")],
+        "DATA_P": [pin("B3")], "DATA_N": [pin("B4")],
+    })
+
+LINK = Lvds("LINK")
+res = pin_solve([LV], [pin_request("L", Lvds)])
+m = pin_map(res["assignment"], {"L": LINK})
+check(m["B1"] == LINK.CLK.P, "B1 must carry CLK.P")
+check(m["B4"] == LINK.DATA.N, "B4 must carry DATA.N")
+"#,
+    );
+    assert_ok(&result);
+}
+
+#[test]
+fn nested_interface_declared_as_one_signal_names_the_flattened_signal() {
+    // The pre-fix spelling: `D` as if the whole pair were one pin.
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin")
+load("./ifaces.zen", "Usb2")
+peripheral("USB0", provides = [Usb2], rebind = "fixed",
+    signals = {"D": [pin("PA12")], "VBUS": [pin("PA9")]})
+"#,
+    );
+    assert_fails_with(
+        &result,
+        "peripheral `USB0` claims Usb2 but has no candidate for signal `D_P`",
+    );
+}
+
+#[test]
+fn uses_can_select_a_flattened_signal() {
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
+load("./ifaces.zen", "Usb2")
+
+USB0 = peripheral("USB0", provides = [Usb2], rebind = "fixed",
+    signals = {"D_P": [pin("PA12")], "D_N": [pin("PA11")], "VBUS": [pin("PA9")]})
+
+res = pin_solve([USB0], [pin_request("U", Usb2, uses = ["D_P", "D_N"])])
+sigs = res["assignment"]["U"]["signals"]
+check(len(sigs) == 2, "VBUS must stay free, got " + str(len(sigs)))
+check("VBUS" not in sigs, "VBUS must not be assigned")
+"#,
+    );
+    assert_ok(&result);
+}
+
+#[test]
+fn flattened_signal_name_collision_is_rejected() {
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "pin_request")
+load("./ifaces.zen", "Ambiguous")
+pin_request("X", Ambiguous)
+"#,
+    );
+    assert_fails_with(
+        &result,
+        "nested fields flatten to two signals named `D_P` — rename one of them",
+    );
+}
+
+#[test]
+fn pin_map_error_lists_the_available_signals() {
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_map", "pin_request", "pin_solve")
+load("./ifaces.zen", "Usb2", "DiffPair")
+
+USB0 = peripheral("USB0", provides = [Usb2], rebind = "fixed",
+    signals = {"D_P": [pin("PA12")], "D_N": [pin("PA11")], "VBUS": [pin("PA9")]})
+
+res = pin_solve([USB0], [pin_request("U", Usb2)])
+pin_map(res["assignment"], {"U": DiffPair("WRONG")})
+"#,
+    );
+    assert_fails_with(&result, "it carries `P`, `N`");
+}
+
+#[test]
+fn stdlib_differential_interface_backs_a_capability_table() {
+    // Real stdlib shapes: `impedance` is a nullable physical, not the int above.
+    let result = eval_zen(vec![(
+        "/test.zen".to_string(),
+        r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_map", "pin_request", "pin_solve")
+load("@stdlib/interfaces.zen", "Usb2")
+
+USB_OTG = peripheral("USB_OTG", provides = [Usb2], rebind = "fixed",
+    signals = {"D_P": [pin("PA12")], "D_N": [pin("PA11")]})
+
+BUS = Usb2("BUS")
+res = pin_solve([USB_OTG], [pin_request("U", Usb2)])
+m = pin_map(res["assignment"], {"U": BUS})
+check(len(m) == 2, "expected 2 mapped pins, got " + str(len(m)))
+check(m["PA12"] == BUS.D.P, "PA12 must carry D.P")
+
+Component(
+    name = "U1",
+    footprint = File("@kicad-footprints/Resistor_SMD.pretty/R_0402_1005Metric.kicad_mod"),
+    pin_defs = {"PA11": "1", "PA12": "2"},
+    pins = m,
+    skip_bom = True,
+)
+"#
+        .to_string(),
+    )]);
+    assert_ok(&result);
+}
+
+// --- Capability identity is per declaration, not per evaluation --------------
+
+const ONE_IFACE: &str = r#"
+Uart = interface(TX = Net, RX = Net)
+"#;
+
+const ONE_PERIPH: &str = r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin")
+load("./ifaces.zen", "Uart")
+PERIPHS = [peripheral("U0", provides = [Uart], rebind = "fixed",
+    signals = {"TX": [pin("A1")], "RX": [pin("A2")]})]
+"#;
+
+#[test]
+fn capability_identity_crosses_file_boundaries() {
+    let result = eval_zen(vec![
+        ("/ifaces.zen".to_string(), ONE_IFACE.to_string()),
+        ("/lib.zen".to_string(), ONE_PERIPH.to_string()),
+        (
+            "/test.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
+load("./lib.zen", "PERIPHS")
+load("./ifaces.zen", "Uart")
+res = pin_solve(PERIPHS, [pin_request("C", Uart)])
+check(res["assignment"]["C"]["instance"] == "U0", "must match across files")
+"#
+            .to_string(),
+        ),
+    ]);
+    assert_ok(&result);
+}
+
+#[test]
+fn separately_declared_interfaces_stay_distinct() {
+    // Matching is nominal: identical text in two files is two capabilities.
+    // Also pins down that identity keys on the declaring file, not on nothing.
+    let result = eval_zen(vec![
+        ("/a.zen".to_string(), ONE_IFACE.to_string()),
+        ("/b.zen".to_string(), ONE_IFACE.to_string()),
+        (
+            "/test.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
+load("./a.zen", "Uart")
+load("./b.zen", Uart2 = "Uart")
+P = [peripheral("U0", provides = [Uart], rebind = "fixed",
+    signals = {"TX": [pin("A1")], "RX": [pin("A2")]})]
+pin_solve(P, [pin_request("C", Uart2)])
+"#
+            .to_string(),
+        ),
+    ]);
+    assert_fails_with(&result, "U0: rejected — does not provide Uart");
+}
+
+#[test]
+fn superseded_assignment_cannot_remap_a_pin() {
+    // Re-solving `COM` releases its claims, so a later solve may take PA9 —
+    // mapping the stale result would put two nets on it.
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "pin_map", "pin_request", "pin_solve")
+load("./stm32.zen", "PERIPHS")
+load("./ifaces.zen", "Uart", "Gpio")
+
+BUS = Uart("BUS")
+LED = Net("LED")
+
+r1 = pin_solve(PERIPHS, [pin_request("COM", Uart, instance = "USART1")])
+r2 = pin_solve(PERIPHS, [pin_request("COM", Uart, instance = "USART2")])
+r3 = pin_solve(PERIPHS, [pin_request("LED", Gpio, prefer = ["PA9"], lock = True)])
+
+pin_map(r3["assignment"], {"LED": LED})
+pin_map(r1["assignment"], {"COM": BUS})
+"#,
+    );
+    assert_fails_with(&result, "already mapped to net `LED` in this module");
+}
+
+#[test]
+fn same_request_mapped_to_two_nets_across_solves_is_rejected() {
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "pin_map", "pin_request", "pin_solve")
+load("./stm32.zen", "PERIPHS")
+load("./ifaces.zen", "Uart")
+
+r1 = pin_solve(PERIPHS, [pin_request("COM", Uart, instance = "USART1")])
+r2 = pin_solve(PERIPHS, [pin_request("COM", Uart, instance = "USART1")])
+pin_map(r1["assignment"], {"COM": Uart("A")})
+pin_map(r2["assignment"], {"COM": Uart("B")})
+"#,
+    );
+    assert_fails_with(&result, "already mapped to net");
+}
+
+#[test]
+fn remapping_the_same_net_stays_allowed() {
+    // The `previous=` widening pattern: the stable requests land on the same
+    // pins and the same nets, so mapping either result is harmless.
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "pin_map", "pin_request", "pin_solve")
+load("./stm32.zen", "PERIPHS")
+load("./ifaces.zen", "Uart", "Usart")
+
+BUS = Uart("BUS")
+reqs = [pin_request("DEBUG", Uart)]
+r1 = pin_solve(PERIPHS, reqs)
+r2 = pin_solve(PERIPHS, reqs + [pin_request("SC", Usart)], previous = r1["assignment"])
+pin_map(r1["assignment"], {"DEBUG": BUS})
+pin_map(r2["assignment"], {"DEBUG": BUS})
+"#,
+    );
+    assert_ok(&result);
+}
+
+#[test]
+fn unconsumed_at_names_the_requests_that_were_solved() {
+    // The at() pairing is nominal: io("debug_uart") is not served by
+    // pin_request("DEBUG"), and the message must show that mismatch.
+    let result = eval_zen(vec![
+        ("/ifaces.zen".to_string(), IFACES.to_string()),
+        ("/stm32.zen".to_string(), STM32.to_string()),
+        (
+            "/mcu.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "pin_map", "pin_request", "pin_solve")
+load("./stm32.zen", "PERIPHS")
+load("./ifaces.zen", "Uart")
+debug_uart = io("debug_uart", Uart)
+res = pin_solve(PERIPHS, [pin_request("DEBUG", Uart)])
+pin_map(res["assignment"], {"DEBUG": debug_uart})
+"#
+            .to_string(),
+        ),
+        (
+            "/test.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "at")
+load("./ifaces.zen", "Uart")
+Mcu = Module("./mcu.zen")
+Mcu(name = "U1", debug_uart = at(Uart("BUS"), ["PA9", "PA10"]))
+"#
+            .to_string(),
+        ),
+    ]);
+    assert_fails_with(
+        &result,
+        "constraint on input `debug_uart` of `/mcu.zen` was never consumed: no pin_request named `debug_uart` reached a pin_solve",
+    );
+}
+
+#[test]
+fn at_reaches_a_solve_through_a_forwarding_module() {
+    // The intermediate owns no solve and just forwards the value; the
+    // constraint rides the net down to the leaf that does solve.
+    let result = eval_zen(vec![
+        ("/ifaces.zen".to_string(), IFACES.to_string()),
+        (
+            "/mcu.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve", "pool")
+load("./ifaces.zen", "Gpio")
+POOL = pool("GPIO", provides = [Gpio], pins = ["PA5", "PA6", "PA7"])
+LED = io("LED", Gpio)
+res = pin_solve([POOL], [pin_request("LED", Gpio)])
+builtin.add_property("led_pin", res["assignment"]["LED"]["signals"]["PIN"]["pin"])
+"#
+            .to_string(),
+        ),
+        (
+            "/som.zen".to_string(),
+            r#"
+load("./ifaces.zen", "Gpio")
+LED = io("LED", Gpio)
+Mcu = Module("./mcu.zen")
+Mcu(name = "U1", LED = LED)
+"#
+            .to_string(),
+        ),
+        (
+            "/test.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "at")
+load("./ifaces.zen", "Gpio")
+Som = Module("./som.zen")
+Som(name = "SOM", LED = at(Gpio("LED_NET"), "PA7"))
+"#
+            .to_string(),
+        ),
+    ]);
+    assert_ok(&result);
+    let tree = result.output.as_ref().unwrap().module_tree();
+    let pin = tree
+        .values()
+        .filter_map(|m| m.properties().get("led_pin").cloned())
+        .filter_map(|v| v.to_value().unpack_str().map(|s| s.to_owned()))
+        .next()
+        .unwrap_or_default();
+    assert_eq!(pin, "PA7", "at() must reach the leaf solve two levels down");
+}
+
+#[test]
+fn soft_at_reaches_a_solve_through_a_forwarding_module() {
+    let result = eval_zen(vec![
+        ("/ifaces.zen".to_string(), IFACES.to_string()),
+        (
+            "/mcu.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve", "pool")
+load("./ifaces.zen", "Gpio")
+POOL = pool("GPIO", provides = [Gpio], pins = ["PA5", "PA6", "PA7"])
+LED = io("LED", Gpio)
+res = pin_solve([POOL], [pin_request("LED", Gpio)])
+builtin.add_property("led_pin", res["assignment"]["LED"]["signals"]["PIN"]["pin"])
+"#
+            .to_string(),
+        ),
+        (
+            "/som.zen".to_string(),
+            r#"
+load("./ifaces.zen", "Gpio")
+LED = io("LED", Gpio)
+Mcu = Module("./mcu.zen")
+Mcu(name = "U1", LED = LED)
+"#
+            .to_string(),
+        ),
+        (
+            "/test.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "at")
+load("./ifaces.zen", "Gpio")
+Som = Module("./som.zen")
+Som(name = "SOM", LED = at(Gpio("LED_NET"), "PA6", soft = True))
+"#
+            .to_string(),
+        ),
+    ]);
+    assert_ok(&result);
+    let tree = result.output.as_ref().unwrap().module_tree();
+    let pin = tree
+        .values()
+        .filter_map(|m| m.properties().get("led_pin").cloned())
+        .filter_map(|v| v.to_value().unpack_str().map(|s| s.to_owned()))
+        .next()
+        .unwrap_or_default();
+    assert_eq!(
+        pin, "PA6",
+        "a soft at() must bias the leaf solve, not vanish"
+    );
+}
+
+#[test]
+fn if_connected_ignores_a_config_of_the_same_name() {
+    let result = eval_zen(vec![
+        ("/ifaces.zen".to_string(), IFACES.to_string()),
+        ("/stm32.zen".to_string(), STM32.to_string()),
+        (
+            "/mcu.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
+load("./stm32.zen", "PERIPHS")
+load("./ifaces.zen", "Gpio")
+gpio = config("gpio", str)
+res = pin_solve(PERIPHS, [pin_request("gpio", Gpio, if_connected = True)])
+builtin.add_property("served", "yes" if "gpio" in res["assignment"] else "no")
+"#
+            .to_string(),
+        ),
+        (
+            "/test.zen".to_string(),
+            r#"
+Mcu = Module("./mcu.zen")
+Mcu(name = "U1", gpio = "not a connection")
+"#
+            .to_string(),
+        ),
+    ]);
+    assert_ok(&result);
+    let served = result
+        .output
+        .as_ref()
+        .unwrap()
+        .module_tree()
+        .values()
+        .filter_map(|m| m.properties().get("served").cloned())
+        .filter_map(|v| v.to_value().unpack_str().map(|s| s.to_owned()))
+        .next()
+        .unwrap_or_default();
+    assert_eq!(served, "no", "a config() must not count as a connection");
+}
+
+#[test]
+fn pin_map_warns_about_a_solved_request_it_was_not_given() {
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "pin_map", "pin_request", "pin_solve")
+load("./stm32.zen", "PERIPHS")
+load("./ifaces.zen", "Uart", "Gpio")
+
+res = pin_solve(PERIPHS, [pin_request("COM", Uart), pin_request("LED", Gpio)])
+pin_map(res["assignment"], {"COM": Uart("BUS")})
+"#,
+    );
+    assert_ok(&result);
+    assert!(
+        diag_text(&result).contains("solved request(s) `LED` are absent from the ifaces dict"),
+        "expected a warning naming LED, got:\n{}",
+        diag_text(&result)
+    );
+}
+
+// --- Locked pins: a list must be claimed in full, a dict bounds one signal ---
+
+#[test]
+fn locked_list_that_starves_a_signal_names_it() {
+    // Both pins are TX-only candidates, so RX is left with nothing.
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
+load("./ifaces.zen", "Uart")
+
+U = peripheral("U0", provides = [Uart], rebind = "firmware",
+    signals = {"TX": [pin("PA9"), pin("PB6")], "RX": [pin("PA10")]})
+pin_solve([U], [pin_request("COM", Uart, prefer = ["PA9", "PB6"], lock = True)])
+"#,
+    );
+    assert_fails_with(
+        &result,
+        "signal `RX` has no candidate among the locked pins `PA9`, `PB6`",
+    );
+}
+
+#[test]
+fn locked_dict_picks_one_of_several_pins_for_one_signal() {
+    // The intent a bare list could not express: either pin for TX, RX free.
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
+load("./ifaces.zen", "Uart")
+
+U = peripheral("U0", provides = [Uart], rebind = "firmware",
+    signals = {"TX": [pin("PA9"), pin("PB6")], "RX": [pin("PA10")]})
+res = pin_solve([U], [pin_request("COM", Uart, prefer = {"TX": ["PA9", "PB6"]}, lock = True)])
+sigs = res["assignment"]["COM"]["signals"]
+check(sigs["TX"]["pin"] in ["PA9", "PB6"], "TX must take one of the named pins")
+check(sigs["RX"]["pin"] == "PA10", "RX stays free, got " + sigs["RX"]["pin"])
+"#,
+    );
+    assert_ok(&result);
+}
+
+#[test]
+fn locked_dict_rejects_a_pin_outside_the_named_set() {
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
+load("./ifaces.zen", "Uart")
+
+U = peripheral("U0", provides = [Uart], rebind = "firmware",
+    signals = {"TX": [pin("PA9")], "RX": [pin("PA10")]})
+pin_solve([U], [pin_request("COM", Uart, prefer = {"TX": ["PB6"]}, lock = True)])
+"#,
+    );
+    assert_fails_with(
+        &result,
+        "signal `TX` has no candidate among the locked pins `PB6`",
+    );
+}
+
+#[test]
+fn at_accepts_a_per_signal_dict() {
+    let result = eval_zen(vec![
+        ("/ifaces.zen".to_string(), IFACES.to_string()),
+        (
+            "/mcu.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
+load("./ifaces.zen", "Uart")
+U = peripheral("U0", provides = [Uart], rebind = "firmware",
+    signals = {"TX": [pin("PA9"), pin("PB6")], "RX": [pin("PA10")]})
+COM = io("COM", Uart)
+res = pin_solve([U], [pin_request("COM", Uart)])
+builtin.add_property("tx", res["assignment"]["COM"]["signals"]["TX"]["pin"])
+"#
+            .to_string(),
+        ),
+        (
+            "/test.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "at")
+load("./ifaces.zen", "Uart")
+Mcu = Module("./mcu.zen")
+Mcu(name = "U1", COM = at(Uart("BUS"), {"TX": "PB6"}))
+"#
+            .to_string(),
+        ),
+    ]);
+    assert_ok(&result);
+    let tx = result
+        .output
+        .as_ref()
+        .unwrap()
+        .module_tree()
+        .values()
+        .filter_map(|m| m.properties().get("tx").cloned())
+        .filter_map(|v| v.to_value().unpack_str().map(|s| s.to_owned()))
+        .next()
+        .unwrap_or_default();
+    assert_eq!(tx, "PB6", "at() dict must pin the named signal");
 }

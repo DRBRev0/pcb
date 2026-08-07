@@ -68,6 +68,14 @@ pub fn builtin_globals(builder: &mut GlobalsBuilder) {
 
 #[starlark_module]
 fn builtin_methods(methods: &mut MethodsBuilder) {
+    /// Pin-capability builtins; see `@stdlib/pinmux.zen`.
+    #[starlark(attribute)]
+    fn pinmux(
+        #[allow(unused_variables)] this: &Builtin,
+    ) -> starlark::Result<crate::lang::pinmux::Pinmux> {
+        Ok(crate::lang::pinmux::Pinmux)
+    }
+
     #[allow(non_snake_case)]
     #[starlark(attribute)]
     fn Mass(#[allow(unused_variables)] this: &Builtin) -> starlark::Result<PhysicalValueType> {

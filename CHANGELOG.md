@@ -20,6 +20,10 @@ and this project adheres to Semantic Versioning (https://semver.org/spec/v2.0.0.
 - `pin_solve` now warns when a request's pin-combination enumeration hits the internal cap on wide pin matrices, since the chosen assignment may then be suboptimal.
 - `fab-panel create` now automatically balances copper in the gutters between placed assembly panels.
 
+### Changed
+
+- **Breaking:** `attrs` and `implies` are now reserved keywords of `interface()`. An interface declaring a connection field under either name must rename it.
+
 ### Fixed
 
 - Pad shapes with padstack offsets now land at the correct position on rotated pads across all IPC-2581 outputs.

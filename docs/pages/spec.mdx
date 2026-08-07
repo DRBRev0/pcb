@@ -311,7 +311,11 @@ Multi-function components (MCUs, multi-unit analog/logic parts) can declare
 what each pin *can do* and let elaboration solve the assignment. This covers
 GPIO matrices and classic gate/pin swap.
 
+These builtins are not in the prelude — load the ones you use:
+
 ```python
+load("@stdlib/pinmux.zen", "peripheral", "pool", "pin", "pin_request", "pin_solve", "pin_map", "at")
+
 UartFlow = interface(TX = Net, RX = Net, RTS = Net, CTS = Net, implies = [Uart])
 
 USART1 = peripheral(
@@ -371,12 +375,12 @@ demand: the interface type *is* the request.
 
 | Parameter | Required | Description |
 |-----------|----------|-------------|
-| `name` | yes | Request name; keys the result and the `if_connected` pairing |
+| `name` | yes | Request name; keys the result and pairs with the `io()` input of the same name (`if_connected`, caller `at()`) |
 | `Iface` | yes | Requested interface type; any provider, direct or through `implies`, can serve it |
 | `uses` | no | Signals that consume pins (default: all of the interface's signals) |
 | `where` | no | Predicate over the provider's attrs: `lambda a: a["baud_max"] >= "1MHz"` |
 | `instance` | no | Restrict to a named peripheral or pool |
-| `prefer` | no | Pins the solver favors when choosing |
+| `prefer` | no | Pins the solver favors: a name/list of names, or a `{signal: name-or-list}` dict |
 | `lock` | no | Make `prefer` mandatory instead of preferred |
 | `direction` | no | `"input"` or `"output"`; `"output"` excludes `input_only` pins |
 | `if_connected` | no | Serve the request only when the caller connected the module input of the same name; pair with `io(Iface, optional = True)` |
@@ -395,8 +399,16 @@ routed design in place.
 **`at(value, pins, soft=False)`** — constrain the physical pin(s) on the
 connection itself: `Mcu(IO0 = at(led_net, "PA8"))`. The wrapper is
 transparent: the inner value flows as if passed directly and the constraint
-reaches `pin_solve`. Hard by default (unsatisfiable → build error);
-`soft = True` is a preference the solver may fall back from.
+reaches the `pin_request` of the same name as the `io()` input it annotates.
+Hard by default (unsatisfiable → build error); `soft = True` is a preference
+the solver may fall back from.
+
+A name or list of names must be claimed *in full* — every pin listed ends up
+on some signal of the request, whatever the signal count, so
+`at(uart, "PA2")` pins one signal of a multi-signal role and leaves the rest
+free. To bound a single signal instead, pass a dict:
+`at(uart, {"TX": ["PA9", "PB6"]})` means "TX takes one of these, RX is
+free".
 
 **`pin_map(assignment, ifaces)`** — turn `pin_solve`'s `assignment` into a
 `Component(pins=...)`-ready dict (physical pin → net of the matching
@@ -408,7 +420,7 @@ absent from the assignment (e.g. dropped by `if_connected`) are skipped.
 | Key | Content |
 |-----|---------|
 | `assignment` | Per request: the chosen instance and pin per signal (with each pin's realization `data`), plus free alternates |
-| `swap_classes` | Residual swap freedom: pool classes with spare pins, gate-swap clusters |
+| `swap_classes` | Residual swap freedom of *this* solve: pool classes with spare pins, gate-swap clusters. The module property of the same name merges every solve, so the two differ once a module solves more than once |
 | `free_pins` | Candidate pins no request claimed, in this solve or any earlier `pin_solve` of the module — wire them with `{p: NotConnected() for p in res["free_pins"]}` |
 
 `assignment` and `swap_classes` are also stored as module properties (JSON) —

@@ -82,23 +82,16 @@ pub struct ContextValue<'v> {
     #[allocative(skip)]
     #[serde(skip)]
     pending_children: RefCell<Vec<PendingChild<'v>>>,
-    /// Pin constraints attached by the caller at the connection site via
-    /// `at()`, keyed by io() input name. Consumed by `pin_solve` during this
-    /// module's evaluation; not preserved across freeze.
-    #[allocative(skip)]
-    #[serde(skip)]
-    pin_constraints: RefCell<std::collections::HashMap<String, (Vec<String>, bool)>>,
-    /// Request names `pin_solve` served. A hard `at()` constraint whose name
-    /// is never served fails the module's evaluation, not silently dropped.
-    #[allocative(skip)]
-    #[serde(skip)]
-    served_pin_requests: RefCell<std::collections::HashSet<String>>,
     /// Instance and pins each solved request claimed, keyed by request name:
     /// pin/instance exclusivity spans every pin_solve of the module, and a
     /// re-solved request releases its own claims.
     #[allocative(skip)]
     #[serde(skip)]
     pin_claims: RefCell<std::collections::HashMap<String, (String, Vec<String>)>>,
+    /// Net (id, name) each physical pin has been mapped to by `pin_map`.
+    #[allocative(skip)]
+    #[serde(skip)]
+    mapped_pins: RefCell<std::collections::HashMap<String, (u64, String)>>,
 }
 
 #[derive(Debug, Trace, ProvidesStaticType, Allocative, Serialize)]
@@ -184,9 +177,8 @@ impl<'v> ContextValue<'v> {
             missing_inputs: RefCell::new(Vec::new()),
             diagnostics: RefCell::new(Vec::new()),
             pending_children: RefCell::new(Vec::new()),
-            pin_constraints: RefCell::new(std::collections::HashMap::new()),
-            served_pin_requests: RefCell::new(std::collections::HashSet::new()),
             pin_claims: RefCell::new(std::collections::HashMap::new()),
+            mapped_pins: RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -215,20 +207,6 @@ impl<'v> ContextValue<'v> {
         self.missing_inputs.borrow_mut().push(name);
     }
 
-    pub(crate) fn add_pin_constraint(&self, name: &str, pins: Vec<String>, soft: bool) {
-        self.pin_constraints
-            .borrow_mut()
-            .insert(name.to_owned(), (pins, soft));
-    }
-
-    pub(crate) fn pin_constraint(&self, name: &str) -> Option<(Vec<String>, bool)> {
-        self.pin_constraints.borrow().get(name).cloned()
-    }
-
-    pub(crate) fn diagnostics_snapshot(&self) -> Vec<crate::Diagnostic> {
-        self.diagnostics.borrow().clone()
-    }
-
     pub(crate) fn record_pin_claim(&self, req: &str, instance: String, pins: Vec<String>) {
         self.pin_claims
             .borrow_mut()
@@ -254,24 +232,14 @@ impl<'v> ContextValue<'v> {
         (instances, pins)
     }
 
-    pub(crate) fn mark_pin_request_served(&self, name: &str) {
-        self.served_pin_requests
-            .borrow_mut()
-            .insert(name.to_owned());
+    /// Net a physical pin was already mapped to, for the whole module: a
+    /// superseded solve's assignment must not re-map a pin to a second net.
+    pub(crate) fn pin_map_net(&self, pin: &str) -> Option<(u64, String)> {
+        self.mapped_pins.borrow().get(pin).cloned()
     }
 
-    /// Hard `at()` constraints no served pin_request ever matched, sorted.
-    pub(crate) fn unconsumed_hard_pin_constraints(&self) -> Vec<String> {
-        let served = self.served_pin_requests.borrow();
-        let mut names: Vec<String> = self
-            .pin_constraints
-            .borrow()
-            .iter()
-            .filter(|(name, (_, soft))| !soft && !served.contains(*name))
-            .map(|(name, _)| name.clone())
-            .collect();
-        names.sort();
-        names
+    pub(crate) fn record_pin_map(&self, pin: String, net: (u64, String)) {
+        self.mapped_pins.borrow_mut().insert(pin, net);
     }
 
     pub(crate) fn add_diagnostic<D: Into<crate::Diagnostic>>(&self, diag: D) {

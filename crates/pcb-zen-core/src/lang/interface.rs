@@ -12,7 +12,7 @@ use starlark::{starlark_complex_value, starlark_complex_values};
 use std::cell::OnceCell;
 
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::lang::context::ContextValue;
 use crate::lang::evaluator_ext::EvaluatorExt;
@@ -506,6 +506,8 @@ impl InterfaceCell for FrozenValue {
 #[derive(Clone, Debug, Trace, ProvidesStaticType, NoSerialize, Allocative)]
 pub struct InterfaceFactoryGen<V: InterfaceCell> {
     id: TypeInstanceId,
+    /// Declaring file, paired with the exported name to key nominal identity.
+    declaration_path: String,
     #[allocative(skip)]
     #[trace(unsafe_ignore)]
     interface_type_data: V::InterfaceTypeDataOpt,
@@ -528,6 +530,7 @@ impl Freeze for InterfaceFactory<'_> {
     ) -> starlark::values::FreezeResult<Self::Frozen> {
         Ok(FrozenInterfaceFactory {
             id: self.id,
+            declaration_path: self.declaration_path,
             interface_type_data: self.interface_type_data.into_inner(),
             fields: self.fields.freeze(freezer)?,
             post_init_fn: self.post_init_fn.freeze(freezer)?,
@@ -867,6 +870,7 @@ pub(crate) fn interface_globals(builder: &mut GlobalsBuilder) {
 
         let factory = heap.alloc(InterfaceFactory {
             id: TypeInstanceId::r#gen(),
+            declaration_path: eval.source_path().unwrap_or_default(),
             interface_type_data: OnceCell::new(),
             fields,
             post_init_fn,
@@ -950,10 +954,20 @@ impl<'v, V: ValueLike<'v> + InterfaceCell> InterfaceFactoryGen<V> {
         &self.attr_spec
     }
 
-    /// Globally unique nominal identity of this interface type.
-    #[inline]
+    /// Keyed on the declaration (file + exported name), not the evaluation: the
+    /// load cache is per package scope, so one file can be evaluated twice.
     pub fn type_instance_id(&self) -> TypeInstanceId {
-        self.id
+        let Some(name) = self.type_name() else {
+            return self.id;
+        };
+        type DeclCache = HashMap<(String, String), TypeInstanceId>;
+        static CACHE: OnceLock<Mutex<DeclCache>> = OnceLock::new();
+        *CACHE
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .entry((self.declaration_path.clone(), name))
+            .or_insert_with(TypeInstanceId::r#gen)
     }
 
     /// Best-effort display name: the exported variable name when known.

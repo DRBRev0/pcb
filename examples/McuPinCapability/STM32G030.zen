@@ -17,6 +17,7 @@ exclusivity is the package's, not the port matrix's; `data` records which
 port and AF realize each candidate (`remap` flags SYSCFG_CFGR1).
 """
 
+load("@stdlib/pinmux.zen", "at", "peripheral", "pin", "pin_map", "pin_request", "pin_solve", "pool")
 load("@stdlib/interfaces.zen", "Uart", "Usart", "Spi", "I2c", "Swd", "AdcIn", "GpioPin")
 load("@stdlib/checks.zen", "voltage_within")
 load("@stdlib/units.zen", "Voltage")

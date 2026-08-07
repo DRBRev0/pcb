@@ -11,7 +11,7 @@ use std::str::FromStr;
 use allocative::Allocative;
 use pcb_sch::physical::PhysicalValue;
 use starlark::collections::SmallMap;
-use starlark::environment::GlobalsBuilder;
+use starlark::environment::MethodsBuilder;
 use starlark::eval::Evaluator;
 use starlark::values::dict::{AllocDict, DictRef};
 use starlark::values::list::{ListRef, UnpackList};
@@ -27,28 +27,182 @@ use crate::lang::evaluator_ext::EvaluatorExt;
 use crate::lang::interface::{
     FrozenInterfaceFactory, FrozenInterfaceValue, InterfaceFactory, InterfaceValue,
 };
-use crate::lang::net::{FrozenNetValue, NetValue};
+use crate::lang::net::{FrozenNetType, FrozenNetValue, NetType, NetValue};
 
 const REBIND_VALUES: [&str; 3] = ["none", "firmware", "fixed"];
 const PINMAP_CAP: usize = 512;
-const SOLVER_BUDGET: usize = 200_000;
-const SOLVER_HARD_BUDGET: usize = 5_000_000;
+/// In conflict checks, not search nodes: a node scans up to `PINMAP_CAP`
+/// combos per providing instance.
+const SOLVER_BUDGET: usize = 2_000_000;
+const SOLVER_HARD_BUDGET: usize = 50_000_000;
 
 struct IfaceInfo<'v> {
     id: TypeInstanceId,
     name: String,
-    fields: Vec<String>,
+    /// Net-typed leaves only, nested interfaces flattened (`Usb2.D` -> `D_P`,
+    /// `D_N`). `field()` metadata like `DiffPair.impedance` consumes no pin;
+    /// it reaches the router via `convert.rs` instead.
+    signals: Vec<String>,
     implies: Vec<Value<'v>>,
     /// Declared capability-attribute vocabulary: name -> physical type value.
     attr_specs: Vec<(String, Value<'v>)>,
 }
 
+/// Fields of an interface *type* or *instance*, in declaration order.
+fn iface_fields<'v>(v: Value<'v>) -> Option<Vec<(String, Value<'v>)>> {
+    fn pairs<'v, V: ValueLike<'v>>(m: &SmallMap<String, V>) -> Vec<(String, Value<'v>)> {
+        m.iter().map(|(k, v)| (k.clone(), v.to_value())).collect()
+    }
+    if let Some(f) = v.downcast_ref::<InterfaceFactory<'v>>() {
+        Some(pairs(f.fields()))
+    } else if let Some(f) = v.downcast_ref::<FrozenInterfaceFactory>() {
+        Some(pairs(f.fields()))
+    } else if let Some(i) = v.downcast_ref::<InterfaceValue<'v>>() {
+        Some(pairs(i.fields()))
+    } else {
+        v.downcast_ref::<FrozenInterfaceValue>()
+            .map(|i| pairs(i.fields()))
+    }
+}
+
+/// `at()` constraints for the build, keyed by net: a net keeps its id across
+/// module boundaries, so a solve at any depth can claim one.
+#[derive(Default)]
+pub(crate) struct PinConstraints {
+    entries: Vec<PinConstraintEntry>,
+    by_net: HashMap<u64, usize>,
+    /// Nets a solve already handled straight off the `at()` wrapper.
+    preconsumed: HashSet<u64>,
+}
+
+struct PinConstraintEntry {
+    input: String,
+    module: String,
+    lock: PinLock,
+    soft: bool,
+    consumed: bool,
+}
+
+impl PinConstraints {
+    fn record(&mut self, input: String, module: String, nets: &[u64], lock: PinLock, soft: bool) {
+        let consumed = nets.iter().any(|n| self.preconsumed.contains(n));
+        let idx = self.entries.len();
+        self.entries.push(PinConstraintEntry {
+            input,
+            module,
+            lock,
+            soft,
+            consumed,
+        });
+        for n in nets {
+            self.by_net.insert(*n, idx);
+        }
+    }
+
+    fn preconsume(&mut self, nets: &[u64]) {
+        self.preconsumed.extend(nets.iter().copied());
+    }
+
+    /// Claim the constraint riding on any of `nets`, marking it consumed.
+    fn claim(&mut self, nets: &[u64]) -> Option<(PinLock, bool)> {
+        let idx = nets.iter().find_map(|n| self.by_net.get(n).copied())?;
+        let e = &mut self.entries[idx];
+        e.consumed = true;
+        Some((e.lock.clone(), e.soft))
+    }
+
+    /// Hard constraints no solve claimed, as `(module, input)`, sorted.
+    pub(crate) fn unconsumed_hard(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = self
+            .entries
+            .iter()
+            .filter(|e| !e.soft && !e.consumed)
+            .map(|e| (e.module.clone(), e.input.clone()))
+            .collect();
+        out.sort();
+        out
+    }
+}
+
+/// Net ids reachable in `v` (a net, or an interface instance's net leaves).
+fn collect_net_ids<'v>(v: Value<'v>, out: &mut Vec<u64>) {
+    if let Some((id, _)) = net_identity(v) {
+        out.push(id);
+        return;
+    }
+    if let Some(fields) = iface_fields(v) {
+        for (_, val) in fields {
+            collect_net_ids(val, out);
+        }
+    }
+}
+
+/// Net identity (id, display name), if `v` is a net instance.
+fn net_identity<'v>(v: Value<'v>) -> Option<(u64, String)> {
+    if let Some(n) = v.downcast_ref::<NetValue<'v>>() {
+        return Some((n.id(), n.name().to_owned()));
+    }
+    v.downcast_ref::<FrozenNetValue>()
+        .map(|n| (n.id(), n.name().to_owned()))
+}
+
+/// A connection field (net type or net instance) as opposed to metadata.
+fn is_net_field<'v>(v: Value<'v>) -> bool {
+    v.downcast_ref::<NetType<'v>>().is_some()
+        || v.downcast_ref::<FrozenNetType>().is_some()
+        || v.downcast_ref::<NetValue<'v>>().is_some()
+        || v.downcast_ref::<FrozenNetValue>().is_some()
+}
+
+/// Net-typed leaves, nested fields flattened into `_`-joined paths. Runs on a
+/// type and on an instance alike, so declarations and `pin_map()` agree on the
+/// signal names by construction.
+fn net_leaves<'v>(v: Value<'v>) -> Vec<(String, Value<'v>)> {
+    fn walk<'v>(v: Value<'v>, prefix: &str, out: &mut Vec<(String, Value<'v>)>) {
+        let Some(fields) = iface_fields(v) else {
+            return;
+        };
+        for (name, val) in fields {
+            let path = if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}_{name}")
+            };
+            if is_net_field(val) {
+                out.push((path, val));
+            } else {
+                // Nested interface; anything else is metadata and yields nothing.
+                walk(val, &path, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(v, "", &mut out);
+    out
+}
+
+/// Flattening can collide (`D: DiffPair` next to `D_P: Net`); one signal must
+/// not silently shadow the other.
+fn check_signal_names(info: &IfaceInfo<'_>) -> anyhow::Result<()> {
+    let mut seen = HashSet::new();
+    for s in &info.signals {
+        if !seen.insert(s.as_str()) {
+            return Err(anyhow::anyhow!(
+                "interface {}: nested fields flatten to two signals named `{s}` — rename one of them",
+                info.name
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn iface_info<'v>(v: Value<'v>) -> Option<IfaceInfo<'v>> {
+    let signals = || net_leaves(v).into_iter().map(|(k, _)| k).collect();
     if let Some(f) = v.downcast_ref::<InterfaceFactory<'v>>() {
         return Some(IfaceInfo {
             id: f.type_instance_id(),
             name: f.type_name().unwrap_or_else(|| v.to_string()),
-            fields: f.fields().iter().map(|(k, _)| k.clone()).collect(),
+            signals: signals(),
             implies: f.implies().iter().map(|x| x.to_value()).collect(),
             attr_specs: f
                 .attr_spec()
@@ -61,7 +215,7 @@ fn iface_info<'v>(v: Value<'v>) -> Option<IfaceInfo<'v>> {
         return Some(IfaceInfo {
             id: f.type_instance_id(),
             name: f.type_name().unwrap_or_else(|| v.to_string()),
-            fields: f.fields().iter().map(|(k, _)| k.clone()).collect(),
+            signals: signals(),
             implies: f.implies().iter().map(|x| x.to_value()).collect(),
             attr_specs: f
                 .attr_spec()
@@ -77,6 +231,7 @@ fn iface_info<'v>(v: Value<'v>) -> Option<IfaceInfo<'v>> {
 fn iface_closure<'v>(root: Value<'v>) -> anyhow::Result<Vec<IfaceInfo<'v>>> {
     let root_info = iface_info(root)
         .ok_or_else(|| anyhow::anyhow!("expected an interface type, got `{}`", root.get_type()))?;
+    check_signal_names(&root_info)?;
     let mut seen: HashSet<TypeInstanceId> = HashSet::new();
     seen.insert(root_info.id);
     let mut out = vec![root_info];
@@ -89,6 +244,7 @@ fn iface_closure<'v>(root: Value<'v>) -> anyhow::Result<Vec<IfaceInfo<'v>>> {
                 anyhow::anyhow!("interface(implies=...) entry is not an interface type")
             })?;
             if seen.insert(info.id) {
+                check_signal_names(&info)?;
                 out.push(info);
             }
         }
@@ -152,7 +308,7 @@ struct RReq<'v> {
     iface_closure_len: usize,
     uses: Vec<String>,
     instance: Option<String>,
-    prefer: Vec<String>,
+    prefer: PinLock,
     lock: bool,
     where_fn: Option<Value<'v>>,
     direction: Option<String>,
@@ -308,7 +464,7 @@ fn parse_rreq<'v>(v: Value<'v>, heap: Heap<'v>) -> anyhow::Result<RReq<'v>> {
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?,
-        _ => closure[0].fields.clone(),
+        _ => closure[0].signals.clone(),
     };
     if uses.is_empty() {
         return Err(anyhow::anyhow!(
@@ -323,7 +479,34 @@ fn parse_rreq<'v>(v: Value<'v>, heap: Heap<'v>) -> anyhow::Result<RReq<'v>> {
             ));
         }
     }
-    let prefer = match dict_get(&d, heap, "prefer") {
+    let prefer_by_signal = match dict_get(&d, heap, "prefer_by_signal") {
+        Some(v) if !v.is_none() => {
+            let dd = DictRef::from_value(v).ok_or_else(|| {
+                anyhow::anyhow!("request `{name}`: prefer_by_signal must be a dict")
+            })?;
+            let mut out = Vec::new();
+            for (k, val) in dd.iter() {
+                let sig = k
+                    .unpack_str()
+                    .ok_or_else(|| anyhow::anyhow!("request `{name}`: signal must be a string"))?;
+                let list = ListRef::from_value(val).ok_or_else(|| {
+                    anyhow::anyhow!("request `{name}`: prefer_by_signal values must be lists")
+                })?;
+                let pins: Vec<String> = list
+                    .iter()
+                    .map(|e| {
+                        e.unpack_str().map(|s| s.to_owned()).ok_or_else(|| {
+                            anyhow::anyhow!("request `{name}`: pin names must be strings")
+                        })
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                out.push((sig.to_owned(), pins));
+            }
+            out
+        }
+        _ => Vec::new(),
+    };
+    let prefer_any = match dict_get(&d, heap, "prefer") {
         Some(p) if !p.is_none() => ListRef::from_value(p)
             .ok_or_else(|| anyhow::anyhow!("request `{name}`: prefer must be a list"))?
             .iter()
@@ -334,6 +517,10 @@ fn parse_rreq<'v>(v: Value<'v>, heap: Heap<'v>) -> anyhow::Result<RReq<'v>> {
             })
             .collect::<anyhow::Result<Vec<_>>>()?,
         _ => Vec::new(),
+    };
+    let prefer = PinLock {
+        any: prefer_any,
+        by_signal: prefer_by_signal,
     };
     Ok(RReq {
         name,
@@ -455,25 +642,33 @@ fn combos_for_request<'v>(
             continue;
         }
 
-        // Pin constraints shape the enumeration so PINMAP_CAP truncation
-        // cannot drop the constrained combinations: a covering lock restricts
-        // each signal's candidates to the named pins (exact); otherwise
-        // preferred pins are enumerated first.
-        if req.lock && !req.prefer.is_empty() && req.prefer.len() >= req.uses.len() {
-            for (_, cands) in cand_lists.iter_mut() {
-                let restricted: Vec<&RPin> = cands
-                    .iter()
-                    .copied()
-                    .filter(|c| req.prefer.contains(&c.name))
-                    .collect();
-                if !restricted.is_empty() {
-                    *cands = restricted;
+        // Shape the enumeration so PINMAP_CAP truncation cannot drop the
+        // constrained combinations. A per-signal lock restricts that signal
+        // exactly; `any` pins can only be narrowed when they must fill every
+        // signal. Otherwise constrained pins are just enumerated first.
+        let mut starved: Option<(String, Vec<String>)> = None;
+        if req.lock {
+            let covering = !req.prefer.any.is_empty() && req.prefer.any.len() == req.uses.len();
+            for (sig, cands) in cand_lists.iter_mut() {
+                let allowed: Option<&[String]> = req
+                    .prefer
+                    .allowed(sig)
+                    .or_else(|| covering.then_some(req.prefer.any.as_slice()));
+                if let Some(allowed) = allowed {
+                    *cands = cands
+                        .iter()
+                        .copied()
+                        .filter(|c| allowed.contains(&c.name))
+                        .collect();
+                    if cands.is_empty() && starved.is_none() {
+                        starved = Some(((*sig).to_owned(), allowed.to_vec()));
+                    }
                 }
             }
         }
         if !req.prefer.is_empty() {
             for (_, cands) in cand_lists.iter_mut() {
-                cands.sort_by_key(|c| !req.prefer.contains(&c.name));
+                cands.sort_by_key(|c| !req.prefer.mentions(&c.name));
             }
         }
 
@@ -513,18 +708,20 @@ fn combos_for_request<'v>(
         let had_pinmaps = !pinmaps.is_empty();
         let combos_before = out.len();
         for pm in pinmaps {
-            // Locked pins: with fewer pins than signals each named pin must be
-            // claimed (at(uart, "PA2") pins one signal of a multi-signal role);
-            // with enough pins to cover every signal they are the allowed set.
+            // A bare pin list must be claimed in full, whatever the signal
+            // count; a per-signal entry bounds that signal's choice.
             if req.lock && !req.prefer.is_empty() {
-                let ok = if req.prefer.len() < req.uses.len() {
-                    req.prefer
-                        .iter()
-                        .all(|p| pm.iter().any(|(_, c)| c.name == *p))
-                } else {
-                    pm.iter().all(|(_, c)| req.prefer.contains(&c.name))
-                };
-                if !ok {
+                let all_claimed = req
+                    .prefer
+                    .any
+                    .iter()
+                    .all(|p| pm.iter().any(|(_, c)| c.name == *p));
+                let per_signal_ok = req.prefer.by_signal.iter().all(|(sig, allowed)| {
+                    pm.iter()
+                        .find(|(s, _)| s == sig)
+                        .is_none_or(|(_, c)| allowed.contains(&c.name))
+                });
+                if !(all_claimed && per_signal_ok) {
                     continue;
                 }
             }
@@ -534,7 +731,7 @@ fn combos_for_request<'v>(
                 if c.strap {
                     cost += 50;
                 }
-                if req.prefer.contains(&c.name) {
+                if req.prefer.mentions(&c.name) {
                     cost -= 10;
                 }
                 if let Some(prev) = prev
@@ -561,10 +758,15 @@ fn combos_for_request<'v>(
             });
         }
         if out.len() == combos_before {
-            let reason = if had_pinmaps {
+            let reason = if let Some((sig, allowed)) = &starved {
+                format!(
+                    "signal `{sig}` has no candidate among the locked pins `{}`",
+                    allowed.join("`, `")
+                )
+            } else if had_pinmaps {
                 format!(
                     "no pin combination satisfies the locked pins `{}`",
-                    req.prefer.join("`, `")
+                    req.prefer.names().join("`, `")
                 )
             } else {
                 "candidate pins collide within the instance".to_owned()
@@ -673,6 +875,8 @@ fn assign<'v>(reqs: &[RReq<'v>], all_combos: &[Vec<Combo>]) -> AssignOutcome {
             {
                 break;
             }
+            // Charged per check, not per node: this scan is where the time goes.
+            spent += 1;
             let clash = used_inst.contains(&c.periph_idx)
                 || c.pins.iter().any(|(_, p)| used_pin.contains(&p.name));
             if !clash {
@@ -761,6 +965,7 @@ fn warn_at_call_site(eval: &mut Evaluator<'_, '_, '_>, msg: String) {
 pub struct PinAtGen<V: ValueLifetimeless> {
     pub inner: V,
     pub pins: Vec<String>,
+    pub pins_by_signal: Vec<(String, Vec<String>)>,
     pub soft: bool,
 }
 
@@ -775,13 +980,118 @@ impl<'v, V: ValueLike<'v>> std::fmt::Display for PinAtGen<V> {
     }
 }
 
-/// `(inner, pins, soft)` of an `at()` wrapper (mutable or frozen), if `v` is one.
-fn unpack_pin_at<'v>(v: Value<'v>) -> Option<(Value<'v>, Vec<String>, bool)> {
+/// Pins a request is pinned to. `any` names pins that must each be claimed by
+/// some signal; `by_signal` bounds what one named signal may take.
+#[derive(Clone, Debug, Default)]
+struct PinLock {
+    any: Vec<String>,
+    by_signal: Vec<(String, Vec<String>)>,
+}
+
+impl PinLock {
+    fn is_empty(&self) -> bool {
+        self.any.is_empty() && self.by_signal.is_empty()
+    }
+
+    fn allowed(&self, signal: &str) -> Option<&[String]> {
+        self.by_signal
+            .iter()
+            .find(|(s, _)| s == signal)
+            .map(|(_, p)| p.as_slice())
+    }
+
+    /// Does `pin` appear anywhere in the lock? Drives the cost bias.
+    fn mentions(&self, pin: &str) -> bool {
+        self.any.iter().any(|p| p == pin)
+            || self
+                .by_signal
+                .iter()
+                .any(|(_, ps)| ps.iter().any(|p| p == pin))
+    }
+
+    fn names(&self) -> Vec<String> {
+        let mut out = self.any.clone();
+        for (s, ps) in &self.by_signal {
+            for p in ps {
+                out.push(format!("{s}={p}"));
+            }
+        }
+        out
+    }
+}
+
+/// `(pins to claim, per-signal allowed pins)`.
+type PinSpec = (Vec<String>, Vec<(String, Vec<String>)>);
+
+/// A pin spec: a pin name, a list of pin names (each must be claimed), or a
+/// dict of signal -> pin(s) bounding one signal's choice.
+fn parse_pin_spec<'v>(ctx: &str, v: Value<'v>, heap: Heap<'v>) -> anyhow::Result<PinSpec> {
+    fn names(ctx: &str, v: Value<'_>) -> anyhow::Result<Vec<String>> {
+        if let Some(s) = v.unpack_str() {
+            return Ok(vec![s.to_owned()]);
+        }
+        let list = ListRef::from_value(v).ok_or_else(|| {
+            anyhow::anyhow!(
+                "{ctx}: expected a pin name or a list of pin names, got `{}`",
+                v.get_type()
+            )
+        })?;
+        list.iter()
+            .map(|e| {
+                e.unpack_str()
+                    .map(|s| s.to_owned())
+                    .ok_or_else(|| anyhow::anyhow!("{ctx}: pin names must be strings"))
+            })
+            .collect()
+    }
+
+    if let Some(d) = DictRef::from_value(v) {
+        let mut by_signal = Vec::new();
+        for (k, val) in d.iter() {
+            let sig = k
+                .unpack_str()
+                .ok_or_else(|| anyhow::anyhow!("{ctx}: signal names must be strings"))?;
+            let pins = names(ctx, val)?;
+            if pins.is_empty() {
+                return Err(anyhow::anyhow!("{ctx}: signal `{sig}` lists no pin"));
+            }
+            by_signal.push((sig.to_owned(), pins));
+        }
+        if by_signal.is_empty() {
+            return Err(anyhow::anyhow!("{ctx}: pins must not be empty"));
+        }
+        let _ = heap;
+        return Ok((Vec::new(), by_signal));
+    }
+    let any = names(ctx, v)?;
+    if any.is_empty() {
+        return Err(anyhow::anyhow!("{ctx}: pins must not be empty"));
+    }
+    Ok((any, Vec::new()))
+}
+
+/// `(inner, lock, soft)` of an `at()` wrapper (mutable or frozen), if `v` is one.
+fn unpack_pin_at<'v>(v: Value<'v>) -> Option<(Value<'v>, PinLock, bool)> {
     if let Some(w) = v.downcast_ref::<PinAt<'v>>() {
-        Some((w.inner.to_value(), w.pins.clone(), w.soft))
+        Some((
+            w.inner.to_value(),
+            PinLock {
+                any: w.pins.clone(),
+                by_signal: w.pins_by_signal.clone(),
+            },
+            w.soft,
+        ))
     } else {
-        v.downcast_ref::<FrozenPinAt>()
-            .map(|w| (w.inner.to_value(), w.pins.clone(), w.soft))
+        v.downcast_ref::<FrozenPinAt>().map(|w| {
+            (
+                w.inner.to_value(),
+                PinLock {
+                    any: w.pins.clone(),
+                    by_signal: w.pins_by_signal.clone(),
+                },
+                w.soft,
+            )
+        })
     }
 }
 
@@ -793,9 +1103,17 @@ pub(crate) fn unwrap_pin_at<'v>(
     eval: &mut Evaluator<'v, '_, '_>,
 ) -> Value<'v> {
     match unpack_pin_at(value) {
-        Some((inner, pins, soft)) => {
-            if let Some(ctx) = eval.context_value() {
-                ctx.add_pin_constraint(name, pins, soft);
+        Some((inner, lock, soft)) => {
+            let mut nets = Vec::new();
+            collect_net_ids(inner, &mut nets);
+            if !nets.is_empty()
+                && let Some(store) = eval.eval_context().map(|c| c.pin_constraints())
+            {
+                let module = eval.source_path().unwrap_or_default();
+                store
+                    .lock()
+                    .unwrap()
+                    .record(name.to_owned(), module, &nets, lock, soft);
             }
             inner
         }
@@ -830,14 +1148,20 @@ fn make_peripheral_dict<'v>(
     // provided interface (closure included) needs a non-empty candidate list.
     for p in provides {
         for info in iface_closure(*p)? {
-            for field in &info.fields {
+            for sig in &info.signals {
                 let ok = signals
                     .iter()
-                    .any(|(s, cands)| s == field && !cands.is_empty());
+                    .any(|(s, cands)| s == sig && !cands.is_empty());
                 if !ok {
                     return Err(anyhow::anyhow!(
-                        "peripheral `{name}` claims {} but has no candidate for signal `{field}`",
-                        info.name
+                        "peripheral `{name}` claims {} but has no candidate for signal `{sig}` \
+                         (its signals are {})",
+                        info.name,
+                        info.signals
+                            .iter()
+                            .map(|s| format!("`{s}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     ));
                 }
             }
@@ -979,40 +1303,44 @@ fn alloc_pin_dict<'v>(
     heap.alloc(AllocDict(pairs))
 }
 
+/// The `builtin.pinmux` namespace.
+#[derive(Clone, Copy, Debug, ProvidesStaticType, Freeze, Allocative, NoSerialize)]
+pub struct Pinmux;
+
+impl std::fmt::Display for Pinmux {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "builtin.pinmux")
+    }
+}
+
+starlark::starlark_simple_value!(Pinmux);
+starlark::methods_static!(PINMUX_METHODS = pinmux_methods);
+
+#[starlark_value(type = "pinmux")]
+impl<'v> StarlarkValue<'v> for Pinmux {
+    fn get_methods() -> Option<&'static starlark::environment::Methods> {
+        Some(PINMUX_METHODS.methods())
+    }
+}
+
 #[starlark_module]
-pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
+fn pinmux_methods(methods: &mut MethodsBuilder) {
     /// Constrain which physical pin(s) a connection may use, at the
     /// connection site: `Mcu(IO0 = at(led_net, "PA8"))`. Hard by default
     /// (build error if unsatisfiable); `soft = True` makes it a preference
     /// the solver may fall back from.
     fn at<'v>(
+        #[allow(unused_variables)] this: &Pinmux,
         #[starlark(require = pos)] value: Value<'v>,
         #[starlark(require = pos)] pins: Value<'v>,
         #[starlark(require = named, default = false)] soft: bool,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<Value<'v>> {
-        let pin_list: Vec<String> = if let Some(s) = pins.unpack_str() {
-            vec![s.to_owned()]
-        } else if let Some(l) = ListRef::from_value(pins) {
-            l.iter()
-                .map(|v| {
-                    v.unpack_str().map(|s| s.to_owned()).ok_or_else(|| {
-                        anyhow::anyhow!("at(): pins must be a pin name or a list of pin names")
-                    })
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?
-        } else {
-            return Err(anyhow::anyhow!(
-                "at(): pins must be a pin name or a list of pin names, got `{}`",
-                pins.get_type()
-            ));
-        };
-        if pin_list.is_empty() {
-            return Err(anyhow::anyhow!("at(): pins must not be empty"));
-        }
+        let (pin_list, by_signal) = parse_pin_spec("at()", pins, eval.heap())?;
         Ok(eval.heap().alloc(PinAt {
             inner: value,
             pins: pin_list,
+            pins_by_signal: by_signal,
             soft,
         }))
     }
@@ -1020,6 +1348,7 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
     /// opaque realization info (e.g. `{"af": 1}` on STM32, `{"iomux_func": 0}`
     /// on ESP32) verbatim into the solved assignment; the solver ignores it.
     fn pin<'v>(
+        #[allow(unused_variables)] this: &Pinmux,
         #[starlark(require = pos)] name: String,
         #[starlark(require = named, default = SmallMap::default())] data: SmallMap<
             String,
@@ -1052,6 +1381,7 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
     /// rebind cost, attributes, optional config-conditional availability.
     #[allow(clippy::too_many_arguments)]
     fn peripheral<'v>(
+        #[allow(unused_variables)] this: &Pinmux,
         #[starlark(require = pos)] name: String,
         #[starlark(require = named)] provides: UnpackList<Value<'v>>,
         #[starlark(require = named)] signals: SmallMap<String, Value<'v>>,
@@ -1090,6 +1420,7 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
 
     /// Sugar for N interchangeable single-signal units over a pin set (GPIO pools).
     fn pool<'v>(
+        #[allow(unused_variables)] this: &Pinmux,
         #[starlark(require = pos)] name: String,
         #[starlark(require = named)] provides: UnpackList<Value<'v>>,
         #[starlark(require = named)] pins: UnpackList<Value<'v>>,
@@ -1105,14 +1436,15 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
         let info = iface_info(provides.items[0]).ok_or_else(|| {
             anyhow::anyhow!("pool `{name}`: provides entry must be an interface type")
         })?;
-        if info.fields.len() != 1 {
+        check_signal_names(&info)?;
+        if info.signals.len() != 1 {
             return Err(anyhow::anyhow!(
                 "pool `{name}`: the provided interface must have exactly one signal, `{}` has {}",
                 info.name,
-                info.fields.len()
+                info.signals.len()
             ));
         }
-        let field = info.fields[0].clone();
+        let field = info.signals[0].clone();
         let mut units: Vec<Value> = Vec::new();
         for entry in &pins.items {
             let pin_dict = if let Some(s) = entry.unpack_str() {
@@ -1148,11 +1480,12 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
     /// same name — the `io(Iface, optional=True)` slot pattern.
     #[allow(clippy::too_many_arguments)]
     fn pin_request<'v>(
+        #[allow(unused_variables)] this: &Pinmux,
         #[starlark(require = pos)] name: String,
         #[starlark(require = pos)] iface: Value<'v>,
         #[starlark(require = named, default = NoneOr::None)] uses: NoneOr<UnpackList<String>>,
         #[starlark(require = named, default = NoneOr::None)] instance: NoneOr<String>,
-        #[starlark(require = named, default = UnpackList::default())] prefer: UnpackList<String>,
+        #[starlark(require = named, default = NoneOr::None)] prefer: NoneOr<Value<'v>>,
         #[starlark(require = named, default = false)] lock: bool,
         #[starlark(require = named, default = NoneOr::None)] r#where: NoneOr<Value<'v>>,
         #[starlark(require = named, default = NoneOr::None)] direction: NoneOr<String>,
@@ -1199,14 +1532,20 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
                 "pin_request `{name}`: direction must be \"input\" or \"output\""
             ));
         }
+        check_signal_names(&info)?;
         let uses_vals: Vec<String> = match uses {
             NoneOr::Other(u) => {
                 let mut seen = HashSet::new();
                 for s in &u.items {
-                    if !info.fields.contains(s) {
+                    if !info.signals.contains(s) {
                         return Err(anyhow::anyhow!(
-                            "pin_request `{name}`: `{s}` is not a signal of {}",
-                            info.name
+                            "pin_request `{name}`: `{s}` is not a signal of {} (its signals are {})",
+                            info.name,
+                            info.signals
+                                .iter()
+                                .map(|s| format!("`{s}`"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         ));
                     }
                     if !seen.insert(s.as_str()) {
@@ -1217,7 +1556,7 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
                 }
                 u.items
             }
-            NoneOr::None => info.fields.clone(),
+            NoneOr::None => info.signals.clone(),
         };
         if uses_vals.is_empty() {
             return Err(anyhow::anyhow!(
@@ -1228,13 +1567,26 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
         // The caller's at() constraint overrides request-side prefer/lock
         // defaults — the same precedence as the io()-recorded constraints in
         // pin_solve, whichever path delivers the connection.
-        let (prefer_items, lock) = match &bind_pins {
+        let (pref, lock) = match &bind_pins {
             Some(pins) => (pins.clone(), !bind_soft),
-            None => (prefer.items.clone(), lock),
+            None => {
+                let (any, by_signal) = match prefer {
+                    NoneOr::Other(v) => {
+                        parse_pin_spec(&format!("pin_request `{name}`: prefer"), v, heap)?
+                    }
+                    NoneOr::None => (Vec::new(), Vec::new()),
+                };
+                (PinLock { any, by_signal }, lock)
+            }
         };
-        let prefer_alloc: Vec<Value> = prefer_items
+        let prefer_alloc: Vec<Value> = pref.any.iter().map(|s| heap.alloc(s.as_str())).collect();
+        let by_signal_alloc: Vec<(Value, Value)> = pref
+            .by_signal
             .iter()
-            .map(|s| heap.alloc(s.as_str()))
+            .map(|(sig, pins)| {
+                let list: Vec<Value> = pins.iter().map(|p| heap.alloc(p.as_str())).collect();
+                (heap.alloc(sig.as_str()), heap.alloc(list))
+            })
             .collect();
         let pairs: Vec<(Value, Value)> = vec![
             (heap.alloc("kind"), heap.alloc("request")),
@@ -1249,6 +1601,10 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
                 },
             ),
             (heap.alloc("prefer"), heap.alloc(prefer_alloc)),
+            (
+                heap.alloc("prefer_by_signal"),
+                heap.alloc(AllocDict(by_signal_alloc)),
+            ),
             (heap.alloc("lock"), Value::new_bool(lock)),
             (
                 heap.alloc("where"),
@@ -1274,6 +1630,7 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
     /// infeasible; records `pin_assignment` and `swap_classes` module
     /// properties (JSON) for downstream consumers.
     fn pin_solve<'v>(
+        #[allow(unused_variables)] this: &Pinmux,
         #[starlark(require = pos)] peripherals: Value<'v>,
         #[starlark(require = pos)] requests: Value<'v>,
         #[starlark(require = named, default = SmallMap::default())] config: SmallMap<
@@ -1325,6 +1682,21 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
             }
         }
 
+        // `inputs()` holds every caller-supplied argument, config() included;
+        // a request pairs with io() slots only. A config declared after this
+        // solve is not yet known, so pairing with one stays possible.
+        let configs: HashSet<String> = eval
+            .context_value()
+            .map(|ctx| {
+                ctx.module()
+                    .signature()
+                    .iter()
+                    .filter(|p| p.is_config)
+                    .map(|p| p.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+
         // io() slot pattern: an `if_connected` request is served only when the
         // caller actually connected the module input of the same name.
         let connected: HashSet<String> = eval
@@ -1334,25 +1706,47 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
                     .inputs()
                     .iter()
                     .map(|(k, _)| k.clone())
+                    .filter(|k| !configs.contains(k))
                     .collect()
             })
             .unwrap_or_default();
         reqs.retain(|r| !r.if_connected || connected.contains(&r.name));
 
-        // `at()` constraints recorded at io-binding time override any
-        // request-side prefer/lock defaults. When pin_solve runs before the
-        // matching io(), nothing is recorded yet: fall back to the raw caller
-        // input, where the at() wrapper still sits.
-        if let Some(ctx) = eval.context_value() {
+        // `at()` constraints override request-side prefer/lock. A request
+        // pairs with the io() input of its name; the constraint rides on the
+        // input's nets.
+        let store = eval.eval_context().map(|c| c.pin_constraints());
+        if let (Some(ctx), Some(store)) = (eval.context_value(), store) {
             for r in reqs.iter_mut() {
-                ctx.mark_pin_request_served(&r.name);
-                let constraint = ctx.pin_constraint(&r.name).or_else(|| {
-                    ctx.module()
-                        .inputs()
-                        .get(r.name.as_str())
-                        .and_then(|v| unpack_pin_at(v.to_value()))
-                        .map(|(_, pins, soft)| (pins, soft))
-                });
+                if configs.contains(&r.name) {
+                    continue;
+                }
+                let Some(input) = ctx
+                    .module()
+                    .inputs()
+                    .get(r.name.as_str())
+                    .map(|v| v.to_value())
+                else {
+                    continue;
+                };
+                // Solving before the io() binds: the wrapper is still here.
+                let (value, raw) = match unpack_pin_at(input) {
+                    Some((inner, pins, soft)) => (inner, Some((pins, soft))),
+                    None => (input, None),
+                };
+                let mut nets = Vec::new();
+                collect_net_ids(value, &mut nets);
+                let mut store = store.lock().unwrap();
+                let constraint = match raw {
+                    // Claim covers an io() that already bound, preconsume one
+                    // that binds after this solve.
+                    Some(c) => {
+                        store.claim(&nets);
+                        store.preconsume(&nets);
+                        Some(c)
+                    }
+                    None => store.claim(&nets),
+                };
                 if let Some((pins, soft)) = constraint {
                     r.prefer = pins;
                     r.lock = !soft;
@@ -1403,9 +1797,10 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
 
         // Pin/instance exclusivity spans every pin_solve of the module:
         // candidates claimed by another solve's requests are unavailable
-        // (a re-solved request releases its own claims). The claimed sets
-        // also seed the reported residual freedom below, so free/alternate/
-        // spare listings match the exclusivity the solver enforces.
+        // (a re-solved request releases its own claims, so `previous=` can
+        // widen an earlier solve). The claimed sets also seed the reported
+        // residual freedom below, so free/alternate/spare listings match the
+        // exclusivity the solver enforces.
         let (claimed_instances, claimed_pins) = eval
             .context_value()
             .map(|ctx| {
@@ -1453,7 +1848,7 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
                     warn_at_call_site(
                         eval,
                         format!(
-                            "pin_solve: solver budget ({SOLVER_BUDGET} steps) exhausted; the assignment is feasible but may be suboptimal"
+                            "pin_solve: solver budget ({SOLVER_BUDGET} conflict checks) exhausted; the assignment is feasible but may be suboptimal"
                         ),
                     );
                 }
@@ -1900,6 +2295,7 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
     /// absent from the assignment (e.g. dropped by `if_connected`) are
     /// skipped, so the two dicts can be declared side by side.
     fn pin_map<'v>(
+        #[allow(unused_variables)] this: &Pinmux,
         #[starlark(require = pos)] assignment: Value<'v>,
         #[starlark(require = pos)] ifaces: SmallMap<String, Value<'v>>,
         eval: &mut Evaluator<'v, '_, '_>,
@@ -1926,6 +2322,8 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
                     anyhow::anyhow!("pin_map: malformed assignment entry for `{req_name}`")
                 })?;
             let sig_count = sigs.iter().count();
+            // Declaration-side flattening applied to the instance.
+            let leaves = net_leaves(*iface_val);
             for (s, pv) in sigs.iter() {
                 let sig = s.unpack_str().unwrap_or_default().to_owned();
                 let pin_name = DictRef::from_value(pv)
@@ -1935,7 +2333,7 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
                             "pin_map: malformed assignment entry for `{req_name}`/`{sig}`"
                         )
                     })?;
-                let net = match interface_field(*iface_val, &sig) {
+                let net = match leaves.iter().find(|(n, _)| *n == sig).map(|(_, v)| *v) {
                     Some(n) => n,
                     None if sig_count == 1
                         && (iface_val.downcast_ref::<NetValue>().is_some()
@@ -1944,9 +2342,22 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
                         *iface_val
                     }
                     None => {
+                        let carried = if leaves.is_empty() {
+                            "it carries no signal".to_owned()
+                        } else {
+                            format!(
+                                "it carries {}",
+                                leaves
+                                    .iter()
+                                    .map(|(n, _)| format!("`{n}`"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )
+                        };
                         return Err(anyhow::anyhow!(
-                            "pin_map: request `{req_name}`: no field `{sig}` on the provided value \
-                             (pass the io()/interface instance, or a bare Net for single-signal requests)"
+                            "pin_map: request `{req_name}`: no signal `{sig}` on the provided \
+                             value — {carried} (pass the io()/interface instance, or a bare Net \
+                             for single-signal requests)"
                         ));
                     }
                 };
@@ -1955,20 +2366,46 @@ pub(crate) fn pinmux_globals(builder: &mut GlobalsBuilder) {
                         "pin_map: physical pin `{pin_name}` mapped by two requests"
                     ));
                 }
+                // Across calls too: a request re-solved by a later pin_solve
+                // releases its claims, so a superseded assignment can still
+                // hand this pin to a different net.
+                if let Some(id) = net_identity(net)
+                    && let Some(ctx) = eval.context_value()
+                {
+                    if let Some(prev) = ctx.pin_map_net(&pin_name)
+                        && prev.0 != id.0
+                    {
+                        return Err(anyhow::anyhow!(
+                            "pin_map: physical pin `{pin_name}` already mapped to net `{}` in \
+                             this module, now `{}` — map the result of the last pin_solve for \
+                             each request",
+                            prev.1,
+                            id.1
+                        ));
+                    }
+                    ctx.record_pin_map(pin_name.clone(), id);
+                }
                 out.push((heap.alloc(pin_name.as_str()), net));
             }
         }
+        // The reverse of the skip above. Not an error: mapping an assignment
+        // in several calls is legitimate, and so is mapping a superseded one.
+        let mut unmapped: Vec<String> = ad
+            .keys()
+            .filter_map(|k| k.unpack_str())
+            .filter(|k| !ifaces.contains_key(*k))
+            .map(|k| k.to_owned())
+            .collect();
+        if !unmapped.is_empty() {
+            unmapped.sort();
+            warn_at_call_site(
+                eval,
+                format!(
+                    "pin_map: solved request(s) `{}` are absent from the ifaces dict; their pins are in no Component(pins=...) and not in free_pins either",
+                    unmapped.join("`, `")
+                ),
+            );
+        }
         Ok(heap.alloc(AllocDict(out)))
     }
-}
-
-/// Field of an interface *instance* (mutable or frozen), if `v` is one.
-fn interface_field<'v>(v: Value<'v>, field: &str) -> Option<Value<'v>> {
-    if let Some(i) = v.downcast_ref::<InterfaceValue<'v>>() {
-        return i.fields().get(field).map(|x| x.to_value());
-    }
-    if let Some(i) = v.downcast_ref::<FrozenInterfaceValue>() {
-        return i.fields().get(field).map(|x| x.to_value());
-    }
-    None
 }
