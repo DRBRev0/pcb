@@ -2110,25 +2110,10 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
         // The claimed sets also seed the reported residual freedom below, so
         // free/alternate/spare listings match the exclusivity enforced here.
         let part_of: Vec<usize> = periphs.iter().map(|p| p.part_idx).collect();
-        // Pads belong to a part. A named part scopes claims by its name; an
-        // unnamed one (the list form) by its sorted peripheral set, so two
-        // solves over the same table still see each other.
-        let scopes: Vec<String> = part_names
-            .iter()
-            .enumerate()
-            .map(|(i, name)| {
-                if !name.is_empty() {
-                    return name.clone();
-                }
-                let mut ns: Vec<&str> = periphs
-                    .iter()
-                    .filter(|p| p.part_idx == i)
-                    .map(|p| p.name.as_str())
-                    .collect();
-                ns.sort_unstable();
-                ns.join("\u{1}")
-            })
-            .collect();
+        // A part names its own pad namespace; peripherals declaring no part
+        // share the module's single anonymous one, so pads keep colliding
+        // across solves exactly as they did before parts existed.
+        let scopes: Vec<String> = part_names.clone();
         let mut claimed_instances: HashSet<String> = HashSet::new();
         let mut claimed_pads: HashSet<(usize, String)> = HashSet::new();
         if let Some(ctx) = eval.context_value() {
@@ -2138,12 +2123,11 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                 if !ours.contains(claim.instance.as_str()) {
                     continue;
                 }
-                // The claim's pads belong to its own part, found by scope.
-                let Some(part) = scopes.iter().position(|s| *s == claim.scope) else {
-                    continue;
-                };
+                // An instance serves one request whatever its pads scope to.
                 claimed_instances.insert(claim.instance);
-                claimed_pads.extend(claim.pins.into_iter().map(|p| (part, p)));
+                if let Some(part) = scopes.iter().position(|s| *s == claim.scope) {
+                    claimed_pads.extend(claim.pins.into_iter().map(|p| (part, p)));
+                }
             }
         }
         if !(claimed_instances.is_empty() && claimed_pads.is_empty()) {
@@ -2208,10 +2192,12 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                 chosen
             }
             AssignOutcome::Infeasible => {
-                // A single-part solve treats every pin name as one pad, which
-                // is what collides when two components are merged into it.
-                let hint = if part_names.len() == 1 {
-                    "\nnote: all these peripherals share one pin namespace; if they belong to                      different components, pass a dict of part name -> list so each keeps its own"
+                // Undeclared peripherals form one part, so identically named
+                // pads of two components collide.
+                let hint = if part_names.len() == 1 && part_names[0].is_empty() {
+                    "\nnote: these peripherals share one pin namespace; if they belong to \
+                     different components, give each `peripheral(part = ...)` so its pads \
+                     stay its own"
                 } else {
                     ""
                 };

@@ -2478,13 +2478,13 @@ pin_solve([U2], [pin_request("L2", Gpio)])
 }
 
 #[test]
-fn pin_map_allows_two_parts_to_share_a_pin_name() {
+fn pin_map_allows_two_declared_parts_to_share_a_pin_name() {
     let result = eval_with_fixtures(
         r#"
 load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve", "pin_map")
 load("./ifaces.zen", "Gpio")
-U1 = peripheral("U1.P", provides = [Gpio], rebind = "fixed", signals = {"PIN": [pin("7")]})
-U2 = peripheral("U2.P", provides = [Gpio], rebind = "fixed", signals = {"PIN": [pin("7")]})
+U1 = peripheral("U1.P", part = "U1", provides = [Gpio], rebind = "fixed", signals = {"PIN": [pin("7")]})
+U2 = peripheral("U2.P", part = "U2", provides = [Gpio], rebind = "fixed", signals = {"PIN": [pin("7")]})
 r1 = pin_solve([U1], [pin_request("A", Gpio)])
 r2 = pin_solve([U2], [pin_request("B", Gpio)])
 m1 = pin_map(r1["assignment"], {"A": Net("NA")})
@@ -2705,5 +2705,33 @@ r = pin_solve(ALL, [pin_request("R3", Comparator)])
 check(r["assignment"]["R3"]["instance"] == "U2.A", "R3 must reach the idle chip")
 "#,
     );
+    assert_ok(&result);
+}
+
+#[test]
+fn the_unsolvable_hint_points_at_advice_that_works() {
+    let undeclared = r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
+load("./ifaces.zen", "Comparator")
+def u(ref):
+    return peripheral(ref, provides = [Comparator], rebind = "none",
+        signals = {"INP": [pin("7")], "INN": [pin("6")], "OUT": [pin("1")]})
+pin_solve([u("U1"), u("U2")], [pin_request("R1", Comparator), pin_request("R2", Comparator)])
+"#;
+    let result = eval_with_fixtures(undeclared);
+    assert_fails_with(
+        &result,
+        "give each `peripheral(part = ...)` so its pads stay its own",
+    );
+
+    // And taking the advice actually solves it.
+    let declared = undeclared.replace(
+        "provides = [Comparator]",
+        "part = ref, provides = [Comparator]",
+    );
+    let result = eval_with_fixtures(&format!(
+        r#"{declared}
+"#
+    ));
     assert_ok(&result);
 }
