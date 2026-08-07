@@ -701,7 +701,7 @@ check(p1 != p2, "second solve must avoid the claimed pin, got " + p1 + " twice")
 
 #[test]
 fn residual_freedom_excludes_prior_solve_claims() {
-    // free_pins and pool spare_pins must not list a pin an earlier solve owns.
+    // Tied-off pads and pool spare_pins must not list a pin an earlier solve owns.
     let result = eval_with_fixtures(
         r#"
 load("@stdlib/pinmux.zen", "pin_request", "pin_solve", "pool", "pin_map")
@@ -2734,4 +2734,101 @@ pin_solve([u("U1"), u("U2")], [pin_request("R1", Comparator), pin_request("R2", 
 "#
     ));
     assert_ok(&result);
+}
+
+#[test]
+fn two_parts_may_name_a_resource_alike() {
+    // `part=` separates pad namespaces; resource names may then repeat, so
+    // instance exclusivity has to be per part too — and the assignment says
+    // which part each one is on.
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "pool", "pin_request", "pin_solve")
+load("./ifaces.zen", "Gpio")
+U1 = pool("GPIO", part = "U1", provides = [Gpio], pins = ["PA0"])
+U2 = pool("GPIO", part = "U2", provides = [Gpio], pins = ["PA0"])
+
+a = pin_solve([U1, U2], [pin_request("A", Gpio)])
+b = pin_solve([U1, U2], [pin_request("B", Gpio)])
+check(a["assignment"]["A"]["instance"] == "GPIO.PA0", "A on the shared name")
+check(b["assignment"]["B"]["instance"] == "GPIO.PA0", "B too")
+check(a["assignment"]["A"]["part"] != b["assignment"]["B"]["part"],
+      "but on different parts, got " + str(a["assignment"]["A"]["part"]))
+"#,
+    );
+    assert_ok(&result);
+}
+
+/// Re-analysing files on one `EvalContext` — the editor path — must not carry
+/// one design's unmet `at()` into the next one's diagnostics.
+#[test]
+fn repeated_analysis_keeps_designs_apart() {
+    let mut files = common::stdlib_test_files();
+    files.insert(
+        "/leaf.zen".to_string(),
+        "IO0 = io(\"IO0\", Net, optional = True)\n".to_string(),
+    );
+    files.insert(
+        "/bad.zen".to_string(),
+        r#"
+load("@stdlib/pinmux.zen", "at")
+Leaf = Module("./leaf.zen")
+Leaf(name = "L", IO0 = at(Net("LED"), "PA9"))
+"#
+        .to_string(),
+    );
+    files.insert("/good.zen".to_string(), "N = Net(\"OK\")\n".to_string());
+
+    let file_provider: Arc<dyn pcb_zen_core::FileProvider> =
+        Arc::new(common::InMemoryFileProvider::new(files.clone()));
+    let ctx = EvalContext::from_session_and_config(
+        EvalSession::default(),
+        EvalContextConfig::new(file_provider, Arc::new(common::test_resolution())),
+    );
+
+    let analyze = |name: &str| ctx.parse_and_analyze_file(PathBuf::from(name), files[name].clone());
+    assert!(!analyze("/bad.zen").is_success(), "bad.zen owns its error");
+    for _ in 0..2 {
+        let r = analyze("/good.zen");
+        assert!(
+            r.is_success(),
+            "good.zen must stay clean, got: {:#?}",
+            r.diagnostics
+        );
+    }
+}
+
+#[test]
+fn an_at_in_a_role_dict_nobody_reads_is_reported() {
+    // The module wires only the roles it knows, so a mistyped key would
+    // otherwise drop its pin constraint without a word.
+    let result = eval_zen(vec![
+        ("/ifaces.zen".to_string(), IFACES.to_string()),
+        (
+            "/mcu.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "pool", "pin_request", "pin_solve")
+load("./ifaces.zen", "Gpio")
+P = pool("GPIO", provides = [Gpio], pins = ["PA0", "PA1", "PA8"])
+gpio = config("gpio", dict, default = {})
+reqs = [pin_request("LED", Gpio, bind = gpio["LED"])] if "LED" in gpio else []
+pin_solve([P], reqs)
+"#
+            .to_string(),
+        ),
+        (
+            "/test.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "at")
+load("./ifaces.zen", "Gpio")
+Mcu = Module("./mcu.zen")
+Mcu(name = "U1", gpio = {"LED": at(Gpio("L"), "PA8"), "TYPO": at(Gpio("T"), "PA1")})
+"#
+            .to_string(),
+        ),
+    ]);
+    assert_fails_with(
+        &result,
+        "at() pin constraint on input `TYPO` was never consumed",
+    );
 }

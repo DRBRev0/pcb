@@ -458,6 +458,8 @@ struct RReq<'v> {
     /// Serve this request only when the module input of the same name was
     /// actually connected by the caller (io() slot pattern).
     if_connected: bool,
+    /// Value bound on the request itself (dict-of-roles pattern).
+    bind: Option<Value<'v>>,
 }
 
 #[derive(Clone)]
@@ -690,6 +692,7 @@ fn parse_rreq<'v>(v: Value<'v>, heap: Heap<'v>, ids: &InterfaceIds) -> anyhow::R
         if_connected: dict_get(&d, heap, "if_connected")
             .map(|v| v.to_bool())
             .unwrap_or(false),
+        bind: dict_get(&d, heap, "bind").filter(|v| !v.is_none()),
     })
 }
 
@@ -1335,6 +1338,62 @@ fn unpack_pin_at<'v>(v: Value<'v>) -> Option<(Value<'v>, PinLock, bool)> {
             )
         })
     }
+}
+
+/// Record, without unwrapping, every `at()` a caller tucked inside a config
+/// value — the dict-of-roles pattern. `pin_request(bind=)` unwraps it later;
+/// registering it here is what lets the root check notice one nobody used.
+pub(crate) fn record_pin_at_in_config<'v>(
+    name: &str,
+    value: Value<'v>,
+    eval: &mut Evaluator<'v, '_, '_>,
+) {
+    let mut found: Vec<(String, Value<'v>)> = Vec::new();
+    if let Some(d) = DictRef::from_value(value) {
+        for (k, v) in d.iter() {
+            if unpack_pin_at(v).is_some() {
+                found.push((k.unpack_str().unwrap_or(name).to_owned(), v));
+            }
+        }
+    } else if unpack_pin_at(value).is_some() {
+        found.push((name.to_owned(), value));
+    }
+    for (role, wrapper) in found {
+        record_pin_at(&role, wrapper, eval);
+    }
+}
+
+/// Register an `at()` wrapper's constraint against `name`.
+fn record_pin_at<'v>(name: &str, wrapper: Value<'v>, eval: &mut Evaluator<'v, '_, '_>) {
+    let Some((inner, lock, soft, site, span)) = unpack_pin_at_full(wrapper) else {
+        return;
+    };
+    let mut nets = Vec::new();
+    collect_net_ids(inner, &mut nets);
+    if nets.is_empty() {
+        let path = eval.source_path().unwrap_or_default();
+        eval.add_diagnostic(crate::Diagnostic::categorized(
+            &path,
+            &format!(
+                "at() on input `{name}` carries no net, so its pin constraint can never \
+                 apply — wrap the connection itself"
+            ),
+            "pinmux.at_without_net",
+            starlark::errors::EvalSeverity::Error,
+        ));
+        return;
+    }
+    let Some(store) = eval.eval_context().map(|c| c.pin_constraints()) else {
+        return;
+    };
+    let owner = eval
+        .context_value()
+        .map(|ctx| ctx.module().path().segments.clone())
+        .unwrap_or_default();
+    store
+        .lock()
+        .unwrap()
+        .record(name.to_owned(), site, span, owner, &nets, lock, soft);
 }
 
 /// If `value` is an `at()` wrapper, record its constraint against the io()
@@ -2024,11 +2083,14 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                 if configs.contains(&r.name) {
                     continue;
                 }
+                // The io() input of this name, or the value bound on the
+                // request itself when the caller passed a dict of roles.
                 let Some(input) = ctx
                     .module()
                     .inputs()
                     .get(r.name.as_str())
                     .map(|v| v.to_value())
+                    .or(r.bind)
                 else {
                     continue;
                 };
@@ -2114,17 +2176,21 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
         // share the module's single anonymous one, so pads keep colliding
         // across solves exactly as they did before parts existed.
         let scopes: Vec<String> = part_names.clone();
-        let mut claimed_instances: HashSet<String> = HashSet::new();
+        let mut claimed_instances: HashSet<(String, String)> = HashSet::new();
         let mut claimed_pads: HashSet<(usize, String)> = HashSet::new();
         if let Some(ctx) = eval.context_value() {
-            let ours: HashSet<&str> = periphs.iter().map(|p| p.name.as_str()).collect();
+            // A peripheral is identified by its part and its name: two chips
+            // may legitimately name a resource alike.
+            let ours: HashSet<(&str, &str)> = periphs
+                .iter()
+                .map(|p| (scopes[p.part_idx].as_str(), p.name.as_str()))
+                .collect();
             let current: HashSet<String> = reqs.iter().map(|r| r.name.clone()).collect();
             for claim in ctx.pin_claims_excluding(&current) {
-                if !ours.contains(claim.instance.as_str()) {
+                if !ours.contains(&(claim.scope.as_str(), claim.instance.as_str())) {
                     continue;
                 }
-                // An instance serves one request whatever its pads scope to.
-                claimed_instances.insert(claim.instance);
+                claimed_instances.insert((claim.scope.clone(), claim.instance));
                 if let Some(part) = scopes.iter().position(|s| *s == claim.scope) {
                     claimed_pads.extend(claim.pins.into_iter().map(|p| (part, p)));
                 }
@@ -2133,10 +2199,12 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
         if !(claimed_instances.is_empty() && claimed_pads.is_empty()) {
             for (i, combos) in all_combos.iter_mut().enumerate() {
                 combos.retain(|c| {
-                    !claimed_instances.contains(&periphs[c.periph_idx].name)
-                        && !c.pins.iter().any(|(_, p)| {
-                            claimed_pads.contains(&(part_of[c.periph_idx], p.name.clone()))
-                        })
+                    !claimed_instances.contains(&(
+                        scopes[part_of[c.periph_idx]].clone(),
+                        periphs[c.periph_idx].name.clone(),
+                    )) && !c.pins.iter().any(|(_, p)| {
+                        claimed_pads.contains(&(part_of[c.periph_idx], p.name.clone()))
+                    })
                 });
                 if combos.is_empty() {
                     return Err(anyhow::anyhow!(
@@ -2216,8 +2284,8 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
         };
 
         // Build results (JSON first; the Starlark value mirrors it). Pins
-        // claimed by earlier solves count as used: alternates, spares and
-        // free_pins must never offer a pin another request already owns.
+        // claimed by earlier solves count as used: alternates, spares and the
+        // tie-off list must never offer a pad another request already owns.
         let mut used_pads: HashSet<(usize, String)> = claimed_pads;
         for (i, &ci) in chosen.iter().enumerate() {
             let part = part_of[all_combos[i][ci].periph_idx];
@@ -2269,6 +2337,15 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                 "instance".into(),
                 serde_json::Value::String(periph.name.clone()),
             );
+            // Two components may name a resource alike, so the part is what
+            // makes the instance unambiguous.
+            entry.insert(
+                "part".into(),
+                match part_names[periph.part_idx].as_str() {
+                    "" => serde_json::Value::Null,
+                    p => serde_json::Value::String(p.to_owned()),
+                },
+            );
             entry.insert(
                 "iface".into(),
                 serde_json::Value::String(r.iface_name.clone()),
@@ -2293,10 +2370,13 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
         // Instances occupied module-wide: this solve's choices plus earlier
         // solves' claims. Spare-unit listings (and the property merge below)
         // must never offer an occupied unit.
-        let assigned_instances: HashSet<String> = chosen
+        let assigned_instances: HashSet<(String, String)> = chosen
             .iter()
             .enumerate()
-            .map(|(i, &ci)| periphs[all_combos[i][ci].periph_idx].name.clone())
+            .map(|(i, &ci)| {
+                let p = &periphs[all_combos[i][ci].periph_idx];
+                (scopes[p.part_idx].clone(), p.name.clone())
+            })
             .chain(claimed_instances.iter().cloned())
             .collect();
 
@@ -2378,15 +2458,16 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
             }
             by_cluster.sort_by(|a, b| a.1.cmp(&b.1));
             for (key, members) in by_cluster {
-                let units: HashSet<String> = periphs
+                let scoped: Vec<(String, String)> = periphs
                     .iter()
                     .filter(|p| p.rebind == "none" && p.pool.is_none() && p.provides_key() == key)
-                    .map(|p| p.name.clone())
+                    .map(|p| (scopes[p.part_idx].clone(), p.name.clone()))
                     .collect();
-                let mut spares: Vec<String> = units
+                let units: HashSet<String> = scoped.iter().map(|(_, n)| n.clone()).collect();
+                let mut spares: Vec<String> = scoped
                     .iter()
-                    .filter(|n| !assigned_instances.contains(*n))
-                    .cloned()
+                    .filter(|u| !assigned_instances.contains(u))
+                    .map(|(_, n)| n.clone())
                     .collect();
                 spares.sort();
                 cluster_classes.push((units, members, spares));
@@ -2443,7 +2524,6 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
         if let Some(ctx) = eval.context_value() {
             // Pin and unit names belong to a part. A prior entry built on
             // silicon this solve never touched keeps its freedom verbatim.
-            let ours: HashSet<&str> = periphs.iter().map(|p| p.name.as_str()).collect();
             let prior = |key: &str| {
                 ctx.module()
                     .properties()
@@ -2590,14 +2670,24 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                         }
                         // Cluster this solve did not place on: same rule, the
                         // units must belong to silicon this table knows.
-                        let mine = prior_units.iter().any(|u| ours.contains(u.as_str()));
+                        // Which part of this table the prior cluster sits on,
+                        // if any: its units name it.
+                        let mine = prior_units
+                            .iter()
+                            .find_map(|u| periphs.iter().find(|p| p.name == *u))
+                            .map(|p| p.part_idx);
                         let spares: Vec<String> = prior_class
                             .get("spare_units")
                             .and_then(|s| s.as_array())
                             .map(|s| {
                                 s.iter()
                                     .filter_map(|u| u.as_str())
-                                    .filter(|n| !mine || !assigned_instances.contains(*n))
+                                    .filter(|n| {
+                                        mine.is_none_or(|part| {
+                                            !assigned_instances
+                                                .contains(&(scopes[part].clone(), (*n).to_owned()))
+                                        })
+                                    })
                                     .map(str::to_owned)
                                     .collect()
                             })
@@ -2826,7 +2916,7 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
             warn_at_call_site(
                 eval,
                 format!(
-                    "pin_map: solved request(s) `{}` are absent from the ifaces dict; their pins are in no Component(pins=...) and not in free_pins either",
+                    "pin_map: solved request(s) `{}` are absent from the ifaces dict, so their pads are wired nowhere — a claimed pad is not tied off either",
                     unmapped.join("`, `")
                 ),
             );

@@ -311,6 +311,12 @@ Multi-function components (MCUs, multi-unit analog/logic parts) can declare
 what each pin *can do* and let elaboration solve the assignment. This covers
 GPIO matrices and classic gate/pin swap.
 
+Matching is nominal: a capability is the `interface()` **declaration**, not its
+shape. Two files declaring identical fields are two capabilities, and an
+interface built by a factory function is a fresh one per binding. Declare a
+capability interface once, at a file's top level, and `load()` it wherever it
+is provided or requested.
+
 These builtins are not in the prelude — load the ones you use:
 
 ```python
@@ -426,7 +432,7 @@ spans several; it is required then.
 
 | Key | Content |
 |-----|---------|
-| `assignment` | Per request: the chosen instance and pin per signal (with each pin's realization `data`), plus free alternates |
+| `assignment` | Per request: the chosen instance, its `part`, and the pin per signal (with each pin's realization `data`), plus free alternates |
 | `swap_classes` | Residual swap freedom of *this* solve: pool classes with spare pins, gate-swap clusters. The module property of the same name merges every solve, so the two differ once a module solves more than once |
 
 Several `pin_solve` calls may share a module: every result stays live, so a
