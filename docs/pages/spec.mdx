@@ -433,7 +433,7 @@ spans several; it is required then.
 | Key | Content |
 |-----|---------|
 | `assignment` | Per request: the chosen instance, its `part`, and the pin per signal (with each pin's realization `data`), plus free alternates |
-| `swap_classes` | Residual swap freedom of *this* solve: pool classes with spare pins, gate-swap clusters. The module property of the same name merges every solve, so the two differ once a module solves more than once |
+| `swap_classes` | Residual swap freedom of *this* solve: pool classes with spare pins, gate-swap clusters. Each class names its `part` and never spans two of them. The module property of the same name merges every solve, so the two differ once a module solves more than once |
 
 Several `pin_solve` calls may share a module: every result stays live, so a
 later call never re-uses a pin or an instance an earlier one took. A request

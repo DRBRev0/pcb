@@ -2759,6 +2759,140 @@ check(a["assignment"]["A"]["part"] != b["assignment"]["B"]["part"],
     assert_ok(&result);
 }
 
+#[test]
+fn a_pool_class_merged_across_solves_keeps_its_part() {
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "pool", "pin_request", "pin_solve")
+load("./ifaces.zen", "Gpio", "AdcIn")
+U1 = pool("GPIO", part = "U1", provides = [Gpio], pins = ["PA0", "PA1"])
+U2 = pool("GPIO", part = "U2", provides = [AdcIn], pins = ["PB0", "PB1"])
+
+a = pin_solve([U1, U2], [pin_request("A", Gpio)])
+b = pin_solve([U1, U2], [pin_request("B", AdcIn)])
+"#,
+    );
+    assert_ok(&result);
+
+    let swaps = json_property(&result, "swap_classes");
+    let classes = swaps.as_array().unwrap();
+    assert_eq!(classes.len(), 2, "one class per component, got {swaps}");
+    for c in classes {
+        let part = c["part"].as_str().unwrap_or("?");
+        let spare = c["spare_pins"][0].as_str().unwrap_or("?");
+        let expect = if part == "U1" { "PA1" } else { "PB1" };
+        assert_eq!(spare, expect, "spares stay on their component, got {swaps}");
+    }
+}
+
+#[test]
+fn a_class_merged_across_solves_keeps_its_part() {
+    // The module property folds every solve together; a prior class must not
+    // land on the class of the same-named units of another component.
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
+load("./ifaces.zen", "Comparator")
+def unit(name, part, pads):
+    return peripheral(name, part = part, provides = [Comparator], rebind = "none",
+        signals = {"INP": [pin(pads[0])], "INN": [pin(pads[1])], "OUT": [pin(pads[2])]})
+
+P = [unit("A", "U1", ["1", "2", "3"]), unit("B", "U1", ["5", "6", "7"]),
+     unit("A", "U2", ["1", "2", "3"]), unit("B", "U2", ["5", "6", "7"])]
+
+x = pin_solve(P, [pin_request("X", Comparator)])
+y = pin_solve(P, [pin_request("Y", Comparator)])
+"#,
+    );
+    assert_ok(&result);
+
+    let swaps = json_property(&result, "swap_classes");
+    let classes = swaps.as_array().unwrap();
+    assert_eq!(classes.len(), 2, "one class per component, got {swaps}");
+    let mut parts: Vec<&str> = classes
+        .iter()
+        .map(|c| c["part"].as_str().unwrap_or("?"))
+        .collect();
+    parts.sort();
+    assert_eq!(
+        parts,
+        ["U1", "U2"],
+        "each class names its component, got {swaps}"
+    );
+}
+
+#[test]
+fn a_gate_swap_class_never_spans_two_parts() {
+    // Same story for gate swap: X may move to U1's spare comparator, never to
+    // the identically named one on U2.
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
+load("./ifaces.zen", "Comparator")
+def unit(name, part, pads):
+    return peripheral(name, part = part, provides = [Comparator], rebind = "none",
+        signals = {"INP": [pin(pads[0])], "INN": [pin(pads[1])], "OUT": [pin(pads[2])]})
+
+U1A = unit("A", "U1", ["1", "2", "3"])
+U1B = unit("B", "U1", ["5", "6", "7"])
+U2A = unit("A", "U2", ["1", "2", "3"])
+U2B = unit("B", "U2", ["5", "6", "7"])
+
+r = pin_solve([U1A, U1B, U2A, U2B], [pin_request("X", Comparator), pin_request("Y", Comparator)])
+"#,
+    );
+    assert_ok(&result);
+
+    let swaps = json_property(&result, "swap_classes");
+    let classes = swaps.as_array().unwrap();
+    assert_eq!(classes.len(), 2, "one class per component, got {swaps}");
+    for c in classes {
+        assert_eq!(c["members"].as_array().unwrap().len(), 1, "got {swaps}");
+        assert_eq!(c["spare_units"].as_array().unwrap(), &["B"], "got {swaps}");
+    }
+    let parts: Vec<&str> = classes
+        .iter()
+        .map(|c| c["part"].as_str().unwrap_or("?"))
+        .collect();
+    assert!(
+        parts.contains(&"U1") && parts.contains(&"U2"),
+        "each class names its component, got {swaps}"
+    );
+}
+
+#[test]
+fn a_swap_class_never_spans_two_parts() {
+    // Two components whose pools carry the same name: the residual freedom of
+    // a request on one is not freedom to move onto the other's pads.
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "pool", "pin_request", "pin_solve")
+load("./ifaces.zen", "Gpio", "AdcIn")
+U1 = pool("GPIO", part = "U1", provides = [Gpio], pins = ["PA0", "PA1"])
+U2 = pool("GPIO", part = "U2", provides = [AdcIn], pins = ["PA0", "PA1"])
+
+r = pin_solve([U1, U2], [pin_request("A", Gpio), pin_request("B", AdcIn)])
+"#,
+    );
+    assert_ok(&result);
+
+    let swaps = json_property(&result, "swap_classes");
+    let classes = swaps.as_array().unwrap();
+    assert_eq!(classes.len(), 2, "one class per component, got {swaps}");
+    for c in classes {
+        assert_eq!(c["members"].as_array().unwrap().len(), 1, "got {swaps}");
+        assert_eq!(c["spare_pins"].as_array().unwrap().len(), 1, "got {swaps}");
+    }
+    let parts: Vec<&str> = classes
+        .iter()
+        .map(|c| c["part"].as_str().unwrap_or("?"))
+        .collect();
+    assert!(
+        parts.contains(&"U1") && parts.contains(&"U2"),
+        "each class names its component, got {swaps}"
+    );
+}
+
 /// Re-analysing files on one `EvalContext` — the editor path — must not carry
 /// one design's unmet `at()` into the next one's diagnostics.
 #[test]
@@ -2925,4 +3059,28 @@ gpio = config("gpio", str)
         &result,
         "was served because the caller passed `gpio`, but that input is a config()",
     );
+}
+
+#[test]
+fn a_pad_shared_by_two_tables_of_one_part_is_claimed_once() {
+    // P1 and P2 belong to the same (anonymous) part and both expose PA0.
+    // Solved separately, the second must not be handed the pad the first took.
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve", "pin_map")
+load("./ifaces.zen", "Gpio")
+P1 = peripheral("P1", provides = [Gpio], rebind = "fixed",
+    signals = {"PIN": [pin("PA0")]})
+P2 = peripheral("P2", provides = [Gpio], rebind = "fixed",
+    signals = {"PIN": [pin("PA0"), pin("PA1")]})
+a = pin_solve([P1], [pin_request("A", Gpio)])
+b = pin_solve([P2], [pin_request("B", Gpio)])
+check(a["assignment"]["A"]["signals"]["PIN"]["pin"] == "PA0", "A takes PA0")
+check(b["assignment"]["B"]["signals"]["PIN"]["pin"] == "PA1",
+      "B must avoid PA0, got " + b["assignment"]["B"]["signals"]["PIN"]["pin"])
+m = pin_map(b["assignment"], {"B": Net("NB")})
+check(not ("PA0" in m), "and PA0 must not be tied off as free")
+"#,
+    );
+    assert_ok(&result);
 }

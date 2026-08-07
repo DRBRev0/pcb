@@ -2194,12 +2194,14 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                 .collect();
             let current: HashSet<String> = reqs.iter().map(|r| r.name.clone()).collect();
             for claim in ctx.pin_claims_excluding(&current) {
-                if !ours.contains(&(claim.scope.as_str(), claim.instance.as_str())) {
-                    continue;
-                }
-                claimed_instances.insert((claim.scope.clone(), claim.instance));
+                // A pad belongs to the part, not to the peripheral that took
+                // it: another table of the same part still owns it.
                 if let Some(part) = scopes.iter().position(|s| *s == claim.scope) {
-                    claimed_pads.extend(claim.pins.into_iter().map(|p| (part, p)));
+                    claimed_pads.extend(claim.pins.iter().map(|p| (part, p.clone())));
+                }
+                // An instance is only ours to reserve when this table has it.
+                if ours.contains(&(claim.scope.as_str(), claim.instance.as_str())) {
+                    claimed_instances.insert((claim.scope, claim.instance));
                 }
             }
         }
@@ -2393,14 +2395,17 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
         // returned value now, and again on the merged module property once
         // prior solves' members are folded in — a class below the threshold
         // alone can cross it combined with an earlier solve's members.
-        // (pool, rebind, members as (request, pin), spare pins)
-        type PoolClass = (String, String, Vec<(String, String)>, Vec<String>);
-        // (unit names, members as (request, unit), spare units)
-        type ClusterClass = (HashSet<String>, Vec<(String, String)>, Vec<String>);
+        // (part, pool, rebind, members as (request, pin), spare pins)
+        type PoolClass = (String, String, String, Vec<(String, String)>, Vec<String>);
+        // (part, unit names, members as (request, unit), spare units)
+        type ClusterClass = (String, HashSet<String>, Vec<(String, String)>, Vec<String>);
+        // Members grouped by (part, class key).
+        type Grouped = Vec<((String, String), Vec<(String, String)>)>;
         let mut pool_classes: Vec<PoolClass> = Vec::new();
         let mut cluster_classes: Vec<ClusterClass> = Vec::new();
         {
-            let mut by_pool: Vec<(String, Vec<(String, String)>)> = Vec::new();
+            // Keyed by part too: two components may hold a pool of one name.
+            let mut by_pool: Grouped = Vec::new();
             for (i, r) in reqs.iter().enumerate() {
                 // A lock with pins removes the request from the swap freedom;
                 // a bare lock=True constrains nothing and swaps normally.
@@ -2411,17 +2416,21 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                 let periph = &periphs[combo.periph_idx];
                 let Some(pool) = &periph.pool else { continue };
                 let pin = combo.pins[0].1.name.clone();
-                match by_pool.iter_mut().find(|(p, _)| p == pool) {
+                let key = (scopes[periph.part_idx].clone(), pool.clone());
+                match by_pool.iter_mut().find(|(k, _)| *k == key) {
                     Some((_, members)) => members.push((r.name.clone(), pin)),
-                    None => by_pool.push((pool.clone(), vec![(r.name.clone(), pin)])),
+                    None => by_pool.push((key, vec![(r.name.clone(), pin)])),
                 }
             }
             by_pool.sort_by(|a, b| a.0.cmp(&b.0));
-            for (pool, mut members) in by_pool {
+            for ((part, pool), mut members) in by_pool {
                 members.sort();
+                let same_pool = |p: &&RPeriph| {
+                    p.pool.as_deref() == Some(pool.as_str()) && scopes[p.part_idx] == part
+                };
                 let mut spares: Vec<String> = periphs
                     .iter()
-                    .filter(|p| p.pool.as_deref() == Some(pool.as_str()))
+                    .filter(same_pool)
                     .filter_map(|p| {
                         p.signals
                             .first()
@@ -2434,13 +2443,13 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                 spares.sort();
                 let rebind = periphs
                     .iter()
-                    .find(|p| p.pool.as_deref() == Some(pool.as_str()))
+                    .find(same_pool)
                     .map(|p| p.rebind.clone())
                     .unwrap_or_else(|| "firmware".to_owned());
-                pool_classes.push((pool, rebind, members, spares));
+                pool_classes.push((part, pool, rebind, members, spares));
             }
 
-            let mut by_cluster: Vec<(String, Vec<(String, String)>)> = Vec::new();
+            let mut by_cluster: Grouped = Vec::new();
             for (i, r) in reqs.iter().enumerate() {
                 if r.lock && !r.prefer.is_empty() {
                     continue;
@@ -2452,6 +2461,7 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                 }
                 let key = periph.provides_key();
                 let member = (r.name.clone(), periph.name.clone());
+                let key = (scopes[periph.part_idx].clone(), key);
                 match by_cluster.iter_mut().find(|(k, _)| *k == key) {
                     Some((_, members)) => members.push(member),
                     None => by_cluster.push((key, vec![member])),
@@ -2464,10 +2474,15 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                 members.sort();
             }
             by_cluster.sort_by(|a, b| a.1.cmp(&b.1));
-            for (key, members) in by_cluster {
+            for ((part, key), members) in by_cluster {
                 let scoped: Vec<(String, String)> = periphs
                     .iter()
-                    .filter(|p| p.rebind == "none" && p.pool.is_none() && p.provides_key() == key)
+                    .filter(|p| {
+                        p.rebind == "none"
+                            && p.pool.is_none()
+                            && p.provides_key() == key
+                            && scopes[p.part_idx] == part
+                    })
                     .map(|p| (scopes[p.part_idx].clone(), p.name.clone()))
                     .collect();
                 let units: HashSet<String> = scoped.iter().map(|(_, n)| n.clone()).collect();
@@ -2477,16 +2492,17 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                     .map(|(_, n)| n.clone())
                     .collect();
                 spares.sort();
-                cluster_classes.push((units, members, spares));
+                cluster_classes.push((part, units, members, spares));
             }
         }
         let emits = |members: &[(String, String)], n_spares: usize| {
             members.len() >= 2 || (!members.is_empty() && n_spares > 0)
         };
-        let pool_class_json = |(pool, rebind, members, spares): &PoolClass| {
+        let pool_class_json = |(part, pool, rebind, members, spares): &PoolClass| {
             serde_json::json!({
                 "granularity": "pin",
                 "rebind": rebind,
+                "part": if part.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(part.clone()) },
                 "pool": pool,
                 "members": members
                     .iter()
@@ -2495,10 +2511,11 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                 "spare_pins": spares,
             })
         };
-        let cluster_class_json = |(_, members, spares): &ClusterClass| {
+        let cluster_class_json = |(part, _, members, spares): &ClusterClass| {
             serde_json::json!({
                 "granularity": "cluster",
                 "rebind": "none",
+                "part": if part.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(part.clone()) },
                 "members": members
                     .iter()
                     .map(|(r, u)| serde_json::json!({"request": r, "instance": u}))
@@ -2508,12 +2525,12 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
         };
         let mut swap_classes: Vec<serde_json::Value> = Vec::new();
         for c in &pool_classes {
-            if emits(&c.2, c.3.len()) {
+            if emits(&c.3, c.4.len()) {
                 swap_classes.push(pool_class_json(c));
             }
         }
         for c in &cluster_classes {
-            if emits(&c.1, c.2.len()) {
+            if emits(&c.2, c.3.len()) {
                 swap_classes.push(cluster_class_json(c));
             }
         }
@@ -2602,6 +2619,12 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                             })
                             .unwrap_or_default()
                     };
+                let class_part = |c: &serde_json::Value| {
+                    c.get("part")
+                        .and_then(|p| p.as_str())
+                        .unwrap_or_default()
+                        .to_owned()
+                };
                 let mut merged_pools = pool_classes.clone();
                 let mut merged_clusters = cluster_classes.clone();
                 let mut merged: Vec<serde_json::Value> = Vec::new();
@@ -2612,16 +2635,19 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                             .get("pool")
                             .and_then(|p| p.as_str())
                             .unwrap_or_default();
-                        if let Some(cur) = merged_pools.iter_mut().find(|c| c.0 == pool) {
-                            cur.2.extend(live);
-                            cur.2.sort();
+                        let part = class_part(prior_class);
+                        if let Some(cur) =
+                            merged_pools.iter_mut().find(|c| c.0 == part && c.1 == pool)
+                        {
+                            cur.3.extend(live);
+                            cur.3.sort();
                             continue;
                         }
                         // Pool this solve did not place on: keep it, net of the
                         // pins this solve claimed only if it is the same part.
                         let mine = periphs
                             .iter()
-                            .find(|p| p.pool.as_deref() == Some(pool))
+                            .find(|p| p.pool.as_deref() == Some(pool) && scopes[p.part_idx] == part)
                             .map(|p| p.part_idx);
                         let spares: Vec<String> = prior_class
                             .get("spare_pins")
@@ -2644,7 +2670,13 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                                 .and_then(|r| r.as_str())
                                 .unwrap_or("firmware")
                                 .to_owned();
-                            merged.push(pool_class_json(&(pool.to_owned(), rebind, live, spares)));
+                            merged.push(pool_class_json(&(
+                                part,
+                                pool.to_owned(),
+                                rebind,
+                                live,
+                                spares,
+                            )));
                         }
                     } else {
                         let live = parse_members(prior_class, "instance");
@@ -2667,12 +2699,13 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                                 spares.iter().filter_map(|s| s.as_str()).map(str::to_owned),
                             );
                         }
+                        let part = class_part(prior_class);
                         if let Some(cur) = merged_clusters
                             .iter_mut()
-                            .find(|c| !c.0.is_disjoint(&prior_units))
+                            .find(|c| c.0 == part && !c.1.is_disjoint(&prior_units))
                         {
-                            cur.1.extend(live);
-                            cur.1.sort();
+                            cur.2.extend(live);
+                            cur.2.sort();
                             continue;
                         }
                         // Cluster this solve did not place on: same rule, the
@@ -2681,7 +2714,11 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                         // if any: its units name it.
                         let mine = prior_units
                             .iter()
-                            .find_map(|u| periphs.iter().find(|p| p.name == *u))
+                            .find_map(|u| {
+                                periphs
+                                    .iter()
+                                    .find(|p| p.name == *u && scopes[p.part_idx] == part)
+                            })
                             .map(|p| p.part_idx);
                         let spares: Vec<String> = prior_class
                             .get("spare_units")
@@ -2700,17 +2737,17 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                             })
                             .unwrap_or_default();
                         if emits(&live, spares.len()) {
-                            merged.push(cluster_class_json(&(HashSet::new(), live, spares)));
+                            merged.push(cluster_class_json(&(part, HashSet::new(), live, spares)));
                         }
                     }
                 }
                 for c in &merged_pools {
-                    if emits(&c.2, c.3.len()) {
+                    if emits(&c.3, c.4.len()) {
                         merged.push(pool_class_json(c));
                     }
                 }
                 for c in &merged_clusters {
-                    if emits(&c.1, c.2.len()) {
+                    if emits(&c.2, c.3.len()) {
                         merged.push(cluster_class_json(c));
                     }
                 }
