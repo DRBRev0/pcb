@@ -411,7 +411,9 @@ connection itself: `Mcu(IO0 = at(led_net, "PA8"))`. The wrapper is
 transparent: the inner value flows as if passed directly and the constraint
 reaches the `pin_request` of the same name as the `io()` input it annotates.
 Hard by default (unsatisfiable → build error); `soft = True` is a preference
-the solver may fall back from.
+the solver may fall back from. A pin name answers for one component, so a
+constrained net that reaches two solves is an error rather than a race: give
+each side its own `at()`.
 
 A name or list of names must be claimed *in full* — every pin listed ends up
 on some signal of the request, whatever the signal count, so

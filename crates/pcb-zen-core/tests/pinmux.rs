@@ -1901,6 +1901,49 @@ Mcu(name = "U1", debug_uart = at(Uart("BUS"), ["PA9", "PA10"]))
 }
 
 #[test]
+fn a_forwarded_at_wanted_by_two_children_is_reported() {
+    // Both children solve on the pinned net. Children elaborate in parallel,
+    // so first-come-wins would hand the pin to a different one each build.
+    let result = eval_zen(vec![
+        ("/ifaces.zen".to_string(), IFACES.to_string()),
+        (
+            "/mcu.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve", "pool")
+load("./ifaces.zen", "Gpio")
+POOL = pool("GPIO", provides = [Gpio], pins = ["PA5", "PA6", "PA7"])
+LED = io("LED", Gpio)
+res = pin_solve([POOL], [pin_request("LED", Gpio)])
+builtin.add_property("led_pin", res["assignment"]["LED"]["signals"]["PIN"]["pin"])
+"#
+            .to_string(),
+        ),
+        (
+            "/som.zen".to_string(),
+            r#"
+load("./ifaces.zen", "Gpio")
+LED = io("LED", Gpio)
+Mcu = Module("./mcu.zen")
+Mcu(name = "U1", LED = LED)
+Mcu(name = "U2", LED = LED)
+"#
+            .to_string(),
+        ),
+        (
+            "/test.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "at")
+load("./ifaces.zen", "Gpio")
+Som = Module("./som.zen")
+Som(name = "SOM", LED = at(Gpio("LED_NET"), "PA7"))
+"#
+            .to_string(),
+        ),
+    ]);
+    assert_fails_with(&result, "already held by");
+}
+
+#[test]
 fn at_reaches_a_solve_through_a_forwarding_module() {
     // The intermediate owns no solve and just forwards the value; the
     // constraint rides the net down to the leaf that does solve.

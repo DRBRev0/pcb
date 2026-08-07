@@ -70,15 +70,23 @@ fn iface_fields<'v>(v: Value<'v>) -> Option<Vec<(String, Value<'v>)>> {
 /// module boundaries, so a solve at any depth can claim one.
 #[derive(Default)]
 pub(crate) struct PinConstraints {
-    /// Set when a claim could not be told apart from a sibling's; reported by
-    /// the solve rather than resolved arbitrarily.
-    ambiguous: Option<(String, String)>,
+    /// Set when a claim could not be settled; reported by the solve rather
+    /// than resolved arbitrarily.
+    ambiguous: Option<Ambiguity>,
     entries: Vec<PinConstraintEntry>,
     by_net: HashMap<u64, Vec<usize>>,
     /// Solves that read an `at()` wrapper before its io() bound, keyed by
     /// `(module, input, net)`: each pairs with exactly one later `record` of
     /// that module, so parallel siblings cannot spend each other's.
     preconsumed: HashMap<(Vec<String>, String, u64), usize>,
+}
+
+/// Why a claim could not be settled.
+enum Ambiguity {
+    /// Several inputs' constraints ride the net reaching this input.
+    Entries { input: String, names: String },
+    /// Another solve holds the one constraint on this net.
+    Contended { input: String, holder: String },
 }
 
 /// What claiming a caller constraint for one io() input yielded.
@@ -171,9 +179,11 @@ impl PinConstraints {
     /// owned by that very module must name the same io() input — sibling
     /// inputs often share a net and must not trade constraints. Entries owned
     /// higher up have no such name to match, so the closest one wins and
-    /// forwarded constraints keep reaching nested solves.
+    /// forwarded constraints keep reaching nested solves. A second solve
+    /// wanting one already taken is reported, never served first-come.
     fn claim(&mut self, nets: &[u64], solver: &[String], input: &str) -> Claimed {
         let mut eligible: Vec<usize> = Vec::new();
+        let mut held: Option<String> = None;
         for i in nets
             .iter()
             .filter_map(|n| self.by_net.get(n))
@@ -181,21 +191,36 @@ impl PinConstraints {
             .copied()
         {
             let e = &self.entries[i];
-            let free = e.claimant.as_deref().is_none_or(|c| c == solver);
-            if !free || !solver.starts_with(&e.owner) {
+            if !solver.starts_with(&e.owner) {
                 continue;
             }
             // Same module: only this very io() input's entry.
             if e.owner.len() == solver.len() && e.input != input {
                 continue;
             }
-            eligible.push(i);
+            match e.claimant.as_deref() {
+                // Another solve got here first. Children elaborate in
+                // parallel, so leaving it at that would hand the pin to
+                // whichever ran first.
+                Some(c) if c != solver => held = Some(c.join(".")),
+                _ => eligible.push(i),
+            }
         }
+        let contended = |input: &str, held: Option<String>| {
+            held.map(|holder| Ambiguity::Contended {
+                input: input.to_owned(),
+                holder,
+            })
+        };
         // Closest enclosing owner wins; among equals the matching input name
         // decides. Entries are appended by parallel child evaluations, so a
         // remaining tie is genuinely ambiguous rather than order-dependent.
         let Some(depth) = eligible.iter().map(|i| self.entries[*i].owner.len()).max() else {
-            return Claimed::No;
+            self.ambiguous = contended(input, held);
+            return match self.ambiguous {
+                Some(_) => Claimed::Ambiguous,
+                None => Claimed::No,
+            };
         };
         eligible.retain(|i| self.entries[*i].owner.len() == depth);
         if eligible.iter().any(|i| self.entries[*i].input == input) {
@@ -210,11 +235,18 @@ impl PinConstraints {
         names.sort_unstable();
         names.dedup();
         if names.len() > 1 {
-            self.ambiguous = Some((input.to_owned(), names.join("`, `")));
+            self.ambiguous = Some(Ambiguity::Entries {
+                input: input.to_owned(),
+                names: names.join("`, `"),
+            });
             return Claimed::Ambiguous;
         }
         let Some(&idx) = eligible.first() else {
-            return Claimed::No;
+            self.ambiguous = contended(input, held);
+            return match self.ambiguous {
+                Some(_) => Claimed::Ambiguous,
+                None => Claimed::No,
+            };
         };
         // The group is one declaration recorded several times; claiming all of
         // it keeps the duplicates from being reported as never consumed.
@@ -225,7 +257,7 @@ impl PinConstraints {
         Claimed::Yes(e.lock.clone(), e.soft)
     }
 
-    fn take_ambiguous(&mut self) -> Option<(String, String)> {
+    fn take_ambiguous(&mut self) -> Option<Ambiguity> {
         self.ambiguous.take()
     }
 
@@ -2146,11 +2178,19 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                         Claimed::No | Claimed::Ambiguous => None,
                     },
                 };
-                if let Some((bad, names)) = store.take_ambiguous() {
-                    return Err(anyhow::anyhow!(
-                        "pin_solve: at() constraints on `{names}` all ride the net reaching input \
-                         `{bad}`; name the io() inputs apart so each constraint has one owner"
-                    ));
+                if let Some(bad) = store.take_ambiguous() {
+                    return Err(match bad {
+                        Ambiguity::Entries { input, names } => anyhow::anyhow!(
+                            "pin_solve: at() constraints on `{names}` all ride the net reaching \
+                             input `{input}`; name the io() inputs apart so each constraint has \
+                             one owner"
+                        ),
+                        Ambiguity::Contended { input, holder } => anyhow::anyhow!(
+                            "pin_solve: the at() constraint on the net reaching input `{input}` \
+                             is already held by `{holder}`; a pin name answers for one component, \
+                             so give each side its own at()"
+                        ),
+                    });
                 }
                 if let Some((pins, soft)) = constraint {
                     pins.check_signals(&format!("pin_solve: at() on input `{}`", r.name), &r.uses)?;
@@ -3162,6 +3202,10 @@ mod tests {
         };
         assert!(took(&mut c, &leaf), "first solve takes it");
         assert!(!took(&mut c, &other), "a sibling may not");
+        assert!(
+            matches!(c.take_ambiguous(), Some(Ambiguity::Contended { .. })),
+            "and is told rather than left to solve unconstrained"
+        );
         assert!(took(&mut c, &leaf), "the same solve may take it again");
         assert!(c.unconsumed_hard().is_empty());
     }
@@ -3182,7 +3226,9 @@ mod tests {
             matches!(c.claim(&[9], &leaf, "LED"), Claimed::Ambiguous),
             "ambiguous, no guess"
         );
-        let (input, names) = c.take_ambiguous().expect("ambiguity reported");
+        let Some(Ambiguity::Entries { input, names }) = c.take_ambiguous() else {
+            panic!("ambiguity reported");
+        };
         assert_eq!(input, "LED");
         assert_eq!(names, "A`, `B");
     }
