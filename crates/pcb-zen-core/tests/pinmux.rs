@@ -1004,6 +1004,29 @@ Mcu(name = "M1", IO0 = at(Net("LED"), "PA10"))
 }
 
 #[test]
+fn an_at_inside_a_list_config_is_not_dropped() {
+    // Only the dict-of-roles shape reaches a request, so a wrapper handed in a
+    // list is reported rather than silently forgotten.
+    let result = eval_zen(vec![
+        ("/ifaces.zen".to_string(), IFACES.to_string()),
+        (
+            "/plain.zen".to_string(),
+            "GPIO = config(\"gpio\", list, optional = True)\n".to_string(),
+        ),
+        (
+            "/test.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "at")
+Mcu = Module("/plain.zen")
+Mcu(name = "M1", gpio = [at(Net("LED"), "PA10")])
+"#
+            .to_string(),
+        ),
+    ]);
+    assert_fails_with(&result, "never consumed");
+}
+
+#[test]
 fn unconsumed_soft_at_is_tolerated() {
     let result = eval_zen(vec![
         ("/ifaces.zen".to_string(), IFACES.to_string()),
@@ -1017,6 +1040,42 @@ fn unconsumed_soft_at_is_tolerated() {
 load("@stdlib/pinmux.zen", "at")
 Mcu = Module("/plain.zen")
 Mcu(name = "M1", IO0 = at(Net("LED"), "PA10", soft = True))
+"#
+            .to_string(),
+        ),
+    ]);
+    assert_ok(&result);
+}
+
+#[test]
+fn a_role_named_like_a_config_still_gets_its_at() {
+    // Role names come from caller data and may collide with a config() name;
+    // the role carries its own value, so the collision must not disarm it.
+    let result = eval_zen(vec![
+        ("/ifaces.zen".to_string(), IFACES.to_string()),
+        ("/stm32.zen".to_string(), STM32.to_string()),
+        (
+            "/mcu.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
+load("./stm32.zen", "PERIPHS")
+load("./ifaces.zen", "Gpio")
+
+LED = config("LED", str, optional = True)
+GPIO = config("gpio", dict, optional = True)
+res = pin_solve(PERIPHS, [pin_request(k, Gpio, bind = v) for k, v in (GPIO or {}).items()])
+if "LED" in res["assignment"]:
+    check(res["assignment"]["LED"]["signals"]["PIN"]["pin"] == "PA10",
+          "the role\'s at() must apply, got " + res["assignment"]["LED"]["signals"]["PIN"]["pin"])
+"#
+            .to_string(),
+        ),
+        (
+            "/test.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "at")
+Mcu = Module("/mcu.zen")
+Mcu(name = "M1", gpio = {"LED": at(Net("L"), "PA10")})
 "#
             .to_string(),
         ),
@@ -2430,8 +2489,8 @@ fn a_second_parts_pins_do_not_eat_the_firsts_spares() {
         r#"
 load("@stdlib/pinmux.zen", "pool", "pin_request", "pin_solve")
 load("./ifaces.zen", "Gpio")
-P1 = pool("U1.GPIO", provides = [Gpio], pins = ["A", "B", "C"])
-P2 = pool("U2.GPIO", provides = [Gpio], pins = ["B", "D"])
+P1 = pool("U1.GPIO", part = "U1", provides = [Gpio], pins = ["A", "B", "C"])
+P2 = pool("U2.GPIO", part = "U2", provides = [Gpio], pins = ["B", "D"])
 pin_solve([P1], [pin_request("L1", Gpio)])
 pin_solve([P2], [pin_request("L2", Gpio)])
 "#,
@@ -2454,7 +2513,10 @@ pin_solve([P2], [pin_request("L2", Gpio)])
 }
 
 #[test]
-fn a_second_parts_pins_do_not_eat_the_firsts_alternates() {
+fn undeclared_silicon_shares_one_pad_namespace() {
+    // Without `part=` there is one namespace, which is why the solver refuses
+    // `A` to L2 — so `B` is gone from L1's alternates too. `part=` is how a
+    // table says the pads sit on different components.
     let result = eval_with_fixtures(
         r#"
 load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
@@ -2462,6 +2524,30 @@ load("./ifaces.zen", "Gpio")
 U1 = peripheral("U1.P", provides = [Gpio], rebind = "fixed",
     signals = {"PIN": [pin("A"), pin("B")]})
 U2 = peripheral("U2.P", provides = [Gpio], rebind = "fixed",
+    signals = {"PIN": [pin("A"), pin("B")]})
+pin_solve([U1], [pin_request("L1", Gpio)])
+pin_solve([U2], [pin_request("L2", Gpio)])
+"#,
+    );
+    assert_ok(&result);
+
+    let a = json_property(&result, "pin_assignment");
+    assert_eq!(a["L2"]["signals"]["PIN"]["pin"], "B", "got {a}");
+    assert!(
+        a["L1"]["alternates"].as_object().unwrap().is_empty(),
+        "got {a}"
+    );
+}
+
+#[test]
+fn a_second_parts_pins_do_not_eat_the_firsts_alternates() {
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
+load("./ifaces.zen", "Gpio")
+U1 = peripheral("U1.P", part = "U1", provides = [Gpio], rebind = "fixed",
+    signals = {"PIN": [pin("A"), pin("B")]})
+U2 = peripheral("U2.P", part = "U2", provides = [Gpio], rebind = "fixed",
     signals = {"PIN": [pin("B")]})
 pin_solve([U1], [pin_request("L1", Gpio)])
 pin_solve([U2], [pin_request("L2", Gpio)])
@@ -2760,6 +2846,33 @@ check(a["assignment"]["A"]["part"] != b["assignment"]["B"]["part"],
 }
 
 #[test]
+fn an_inherited_entry_keeps_the_alternates_of_its_own_part() {
+    // X sits on U2, whose P2 stays free; the pad U1 took in the second solve
+    // has the same name and must not shrink X's freedom.
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
+load("./ifaces.zen", "Gpio", "AdcIn")
+U1A = peripheral("A", part = "U1", provides = [Gpio], rebind = "none",
+    signals = {"PIN": [pin("P2")]})
+U2A = peripheral("A", part = "U2", provides = [AdcIn], rebind = "none",
+    signals = {"IN": [pin("P1"), pin("P2")]})
+
+x = pin_solve([U1A, U2A], [pin_request("X", AdcIn)])
+y = pin_solve([U1A, U2A], [pin_request("Y", Gpio)])
+"#,
+    );
+    assert_ok(&result);
+
+    let assign = json_property(&result, "pin_assignment");
+    assert_eq!(
+        assign["X"]["alternates"]["IN"].as_array().unwrap(),
+        &["P2"],
+        "got {assign}"
+    );
+}
+
+#[test]
 fn a_pool_class_merged_across_solves_keeps_its_part() {
     let result = eval_with_fixtures(
         r#"
@@ -2858,6 +2971,47 @@ r = pin_solve([U1A, U1B, U2A, U2B], [pin_request("X", Comparator), pin_request("
         parts.contains(&"U1") && parts.contains(&"U2"),
         "each class names its component, got {swaps}"
     );
+}
+
+#[test]
+fn a_clobbered_result_property_is_reported() {
+    // pin_solve owns these names; overwriting one would otherwise cost the
+    // earlier solves their data with no word said.
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "pool", "pin_request", "pin_solve")
+load("./ifaces.zen", "Gpio")
+P = pool("GPIO", provides = [Gpio], pins = ["PA0", "PA1"])
+builtin.add_property("pin_assignment", "mine")
+r = pin_solve([P], [pin_request("A", Gpio)])
+"#,
+    );
+    assert_fails_with(&result, "written by pin_solve");
+}
+
+#[test]
+fn one_request_name_may_serve_two_parts() {
+    // A name identifies a request per component, not per module: solving `LED`
+    // on U2 must not release what `LED` took on U1.
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "pool", "pin_request", "pin_solve", "pin_map")
+load("./ifaces.zen", "Gpio")
+U1 = pool("GPIO", part = "U1", provides = [Gpio], pins = ["PA0", "PA1"])
+U2 = pool("GPIO", part = "U2", provides = [Gpio], pins = ["PA0", "PA1"])
+
+a = pin_solve([U1], [pin_request("LED", Gpio)])
+b = pin_solve([U2], [pin_request("LED", Gpio)])
+c = pin_solve([U1], [pin_request("BTN", Gpio)])
+
+led = a["assignment"]["LED"]["signals"]["PIN"]["pin"]
+check(c["assignment"]["BTN"]["signals"]["PIN"]["pin"] != led,
+      "BTN took the pad LED holds on U1")
+m = pin_map(a["assignment"], {"LED": Gpio("L")}, part = "U1")
+check(led in m, "U1 still maps the pad its own LED took, got " + str(sorted(m.keys())))
+"#,
+    );
+    assert_ok(&result);
 }
 
 #[test]

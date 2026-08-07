@@ -95,7 +95,7 @@ pub struct ContextValue<'v> {
     /// re-solved request releases its own claims.
     #[allocative(skip)]
     #[serde(skip)]
-    pin_claims: RefCell<std::collections::HashMap<String, PinClaim>>,
+    pin_claims: RefCell<std::collections::HashMap<(String, String), PinClaim>>,
     /// Requests served by the `if_connected` gate, for the post-eval check.
     #[allocative(skip)]
     #[serde(skip)]
@@ -226,25 +226,35 @@ impl<'v> ContextValue<'v> {
         self.missing_inputs.borrow_mut().push(name);
     }
 
-    pub(crate) fn record_pin_claim(&self, req: &str, claim: PinClaim) {
-        self.pin_claims.borrow_mut().insert(req.to_owned(), claim);
+    /// Record what `req` took. A name identifies one request per part, so a
+    /// solve that places it elsewhere among `table`'s parts supersedes the
+    /// earlier placement while another component's like-named request stands.
+    pub(crate) fn record_pin_claim(&self, req: &str, claim: PinClaim, table: &[String]) {
+        let mut claims = self.pin_claims.borrow_mut();
+        claims.retain(|(scope, name), _| name != req || !table.contains(scope));
+        claims.insert((claim.scope.clone(), req.to_owned()), claim);
     }
 
-    /// Which part's pad namespace a solved request belongs to.
+    /// Which part's pad namespace a solved request belongs to, when one name
+    /// answers for one part only.
     pub(crate) fn pin_claim_scope(&self, req: &str) -> Option<String> {
-        self.pin_claims.borrow().get(req).map(|c| c.scope.clone())
+        let claims = self.pin_claims.borrow();
+        let mut found = claims.iter().filter(|((_, name), _)| name == req);
+        let (_, claim) = found.next()?;
+        found.next().is_none().then(|| claim.scope.clone())
     }
 
-    /// Claims from requests other than `except`, scope included: pin names
-    /// only mean something inside the part that owns them.
+    /// Claims other than the ones `except` re-solves on `table`'s own parts:
+    /// pin names only mean something inside the part that owns them.
     pub(crate) fn pin_claims_excluding(
         &self,
         except: &std::collections::HashSet<String>,
+        table: &[String],
     ) -> Vec<PinClaim> {
         self.pin_claims
             .borrow()
             .iter()
-            .filter(|(req, _)| !except.contains(*req))
+            .filter(|((scope, name), _)| !(except.contains(name) && table.contains(scope)))
             .map(|(_, c)| c.clone())
             .collect()
     }

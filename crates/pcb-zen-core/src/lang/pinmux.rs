@@ -81,6 +81,15 @@ pub(crate) struct PinConstraints {
     preconsumed: HashMap<(Vec<String>, String, u64), usize>,
 }
 
+/// What claiming a caller constraint for one io() input yielded.
+enum Claimed {
+    /// The pins, and whether the `at()` was declared soft.
+    Yes(PinLock, bool),
+    No,
+    /// Several inputs' constraints ride the net; the solve reports it.
+    Ambiguous,
+}
+
 struct PinConstraintEntry {
     input: String,
     module: String,
@@ -142,7 +151,9 @@ impl PinConstraints {
     /// claim the entry when its io() already bound, else leave a credit for the
     /// record still to come. Exactly one of the two, never both.
     fn settle(&mut self, nets: &[u64], solver: &[String], input: &str) {
-        if self.claim(nets, solver, input).is_none() {
+        // Only an entry that truly is not there earns a credit: an ambiguity
+        // is reported, and crediting it would absolve a sibling's constraint.
+        if matches!(self.claim(nets, solver, input), Claimed::No) {
             self.preconsume(solver, input, nets);
         }
     }
@@ -161,7 +172,7 @@ impl PinConstraints {
     /// inputs often share a net and must not trade constraints. Entries owned
     /// higher up have no such name to match, so the closest one wins and
     /// forwarded constraints keep reaching nested solves.
-    fn claim(&mut self, nets: &[u64], solver: &[String], input: &str) -> Option<(PinLock, bool)> {
+    fn claim(&mut self, nets: &[u64], solver: &[String], input: &str) -> Claimed {
         let mut eligible: Vec<usize> = Vec::new();
         for i in nets
             .iter()
@@ -183,10 +194,9 @@ impl PinConstraints {
         // Closest enclosing owner wins; among equals the matching input name
         // decides. Entries are appended by parallel child evaluations, so a
         // remaining tie is genuinely ambiguous rather than order-dependent.
-        let depth = eligible
-            .iter()
-            .map(|i| self.entries[*i].owner.len())
-            .max()?;
+        let Some(depth) = eligible.iter().map(|i| self.entries[*i].owner.len()).max() else {
+            return Claimed::No;
+        };
         eligible.retain(|i| self.entries[*i].owner.len() == depth);
         if eligible.iter().any(|i| self.entries[*i].input == input) {
             eligible.retain(|i| self.entries[*i].input == input);
@@ -201,12 +211,18 @@ impl PinConstraints {
         names.dedup();
         if names.len() > 1 {
             self.ambiguous = Some((input.to_owned(), names.join("`, `")));
-            return None;
+            return Claimed::Ambiguous;
         }
-        let idx = *eligible.first()?;
-        let e = &mut self.entries[idx];
-        e.claimant = Some(solver.to_vec());
-        Some((e.lock.clone(), e.soft))
+        let Some(&idx) = eligible.first() else {
+            return Claimed::No;
+        };
+        // The group is one declaration recorded several times; claiming all of
+        // it keeps the duplicates from being reported as never consumed.
+        for i in &eligible {
+            self.entries[*i].claimant = Some(solver.to_vec());
+        }
+        let e = &self.entries[idx];
+        Claimed::Yes(e.lock.clone(), e.soft)
     }
 
     fn take_ambiguous(&mut self) -> Option<(String, String)> {
@@ -303,10 +319,12 @@ fn check_signal_names(info: &IfaceInfo<'_>) -> anyhow::Result<()> {
 
 /// The build's interface-identity map, or a private one when there is no
 /// evaluation context (identities then matter only within the call).
-fn interface_ids<'v>(eval: &Evaluator<'v, '_, '_>) -> std::sync::Arc<InterfaceIds> {
+fn interface_ids<'v>(eval: &Evaluator<'v, '_, '_>) -> anyhow::Result<std::sync::Arc<InterfaceIds>> {
+    // A private map per call would hand out ids nothing else shares, so two
+    // capabilities from one declaration would quietly stop matching.
     eval.eval_context()
         .map(|c| c.interface_ids())
-        .unwrap_or_default()
+        .ok_or_else(|| anyhow::anyhow!("pinmux: capability identity needs an evaluation context"))
 }
 
 /// Nominal interface identities for one build, keyed by declaration site.
@@ -1347,16 +1365,24 @@ pub(crate) fn record_pin_at_in_config<'v>(
     value: Value<'v>,
     eval: &mut Evaluator<'v, '_, '_>,
 ) {
-    let mut found: Vec<(String, Value<'v>)> = Vec::new();
-    if let Some(d) = DictRef::from_value(value) {
-        for (k, v) in d.iter() {
-            if unpack_pin_at(v).is_some() {
-                found.push((k.unpack_str().unwrap_or(name).to_owned(), v));
+    // A role is named by the dict key holding it; a wrapper found anywhere
+    // else keeps the config's own name, so a solve that cannot use it still
+    // reports it rather than dropping it.
+    fn walk<'v>(role: &str, v: Value<'v>, out: &mut Vec<(String, Value<'v>)>) {
+        if unpack_pin_at(v).is_some() {
+            out.push((role.to_owned(), v));
+        } else if let Some(d) = DictRef::from_value(v) {
+            for (k, val) in d.iter() {
+                walk(k.unpack_str().unwrap_or(role), val, out);
+            }
+        } else if let Some(l) = ListRef::from_value(v) {
+            for val in l.iter() {
+                walk(role, val, out);
             }
         }
-    } else if unpack_pin_at(value).is_some() {
-        found.push((name.to_owned(), value));
     }
+    let mut found: Vec<(String, Value<'v>)> = Vec::new();
+    walk(name, value, &mut found);
     for (role, wrapper) in found {
         record_pin_at(&role, wrapper, eval);
     }
@@ -1730,7 +1756,7 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<Value<'v>> {
         let heap = eval.heap();
-        let ids = interface_ids(eval);
+        let ids = interface_ids(eval)?;
         for p in &provides.items {
             if iface_info(*p, &ids).is_none() {
                 return Err(anyhow::anyhow!(
@@ -1768,7 +1794,7 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<Value<'v>> {
         let heap = eval.heap();
-        let ids = interface_ids(eval);
+        let ids = interface_ids(eval)?;
         let part = part.into_option();
         if provides.items.len() != 1 {
             return Err(anyhow::anyhow!(
@@ -1863,7 +1889,7 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                 v.get_type()
             ));
         }
-        let ids = interface_ids(eval);
+        let ids = interface_ids(eval)?;
         let info = iface_info(iface, &ids).ok_or_else(|| {
             anyhow::anyhow!(
                 "pin_request `{name}`: expected an interface type, got `{}`",
@@ -1988,7 +2014,7 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
     ) -> anyhow::Result<Value<'v>> {
         let heap = eval.heap();
 
-        let ids = interface_ids(eval);
+        let ids = interface_ids(eval)?;
         // One level of nesting is flattened: `pool()` yields a list of units,
         // so `[usart1, gpio_pool]` is one table.
         let plist = ListRef::from_value(peripherals).ok_or_else(|| {
@@ -2087,18 +2113,19 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
         if let (Some(ctx), Some(store)) = (eval.context_value(), store) {
             let solver: Vec<String> = ctx.module().path().segments.clone();
             for r in reqs.iter_mut() {
-                if configs.contains(&r.name) {
+                // A config() of the request's name is not a connection. A role
+                // carries its own value, so that name cannot mislead it.
+                if r.bind.is_none() && configs.contains(&r.name) {
                     continue;
                 }
-                // The io() input of this name, or the value bound on the
-                // request itself when the caller passed a dict of roles.
-                let Some(input) = ctx
-                    .module()
-                    .inputs()
-                    .get(r.name.as_str())
-                    .map(|v| v.to_value())
-                    .or(r.bind)
-                else {
+                // The value bound on the request itself when the caller passed
+                // a dict of roles, else the io() input of this name.
+                let Some(input) = r.bind.or_else(|| {
+                    ctx.module()
+                        .inputs()
+                        .get(r.name.as_str())
+                        .map(|v| v.to_value())
+                }) else {
                     continue;
                 };
                 // Solving before the io() binds: the wrapper is still here.
@@ -2114,7 +2141,10 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                         store.settle(&nets, &solver, &r.name);
                         Some(c)
                     }
-                    None => store.claim(&nets, &solver, &r.name),
+                    None => match store.claim(&nets, &solver, &r.name) {
+                        Claimed::Yes(pins, soft) => Some((pins, soft)),
+                        Claimed::No | Claimed::Ambiguous => None,
+                    },
                 };
                 if let Some((bad, names)) = store.take_ambiguous() {
                     return Err(anyhow::anyhow!(
@@ -2193,7 +2223,7 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                 .map(|p| (scopes[p.part_idx].as_str(), p.name.as_str()))
                 .collect();
             let current: HashSet<String> = reqs.iter().map(|r| r.name.clone()).collect();
-            for claim in ctx.pin_claims_excluding(&current) {
+            for claim in ctx.pin_claims_excluding(&current, &scopes) {
                 // A pad belongs to the part, not to the peripheral that took
                 // it: another table of the same part still owns it.
                 if let Some(part) = scopes.iter().position(|s| *s == claim.scope) {
@@ -2263,6 +2293,7 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                                 pins: combo.pins.iter().map(|(_, p)| p.name.clone()).collect(),
                                 scope: scopes[periphs[combo.periph_idx].part_idx].clone(),
                             },
+                            &scopes,
                         );
                     }
                 }
@@ -2548,14 +2579,26 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
         if let Some(ctx) = eval.context_value() {
             // Pin and unit names belong to a part. A prior entry built on
             // silicon this solve never touched keeps its freedom verbatim.
-            let prior = |key: &str| {
-                ctx.module()
-                    .properties()
-                    .get(key)
-                    .and_then(|v| v.to_value().unpack_str().map(str::to_owned))
-                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            // These names are pin_solve's own. A value it cannot read would be
+            // dropped without a word, so say so instead.
+            let prior = |key: &str, object: bool| -> anyhow::Result<Option<serde_json::Value>> {
+                let module = ctx.module();
+                let Some(v) = module.properties().get(key) else {
+                    return Ok(None);
+                };
+                v.to_value()
+                    .unpack_str()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                    .filter(|j| if object { j.is_object() } else { j.is_array() })
+                    .map(Some)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "pin_solve: module property `{key}` is written by pin_solve; \
+                             record your own data under another name"
+                        )
+                    })
             };
-            if let Some(prev) = prior("pin_assignment")
+            if let Some(prev) = prior("pin_assignment", true)?
                 && let Some(prev_obj) = prev.as_object()
             {
                 let cur = property_assignment
@@ -2566,14 +2609,10 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                         // Prior alternates net of pins this solve claimed, but
                         // only when the entry sits on a part of this table.
                         let mut v = v.clone();
-                        // Pads belong to a part, found through the instance
-                        // that took them; an entry on other silicon is left be.
-                        let Some(part) = v
-                            .get("instance")
-                            .and_then(|i| i.as_str())
-                            .and_then(|i| periphs.iter().find(|p| p.name == i))
-                            .map(|p| p.part_idx)
-                        else {
+                        // Pads belong to the part the entry names — instance
+                        // names repeat across parts. Other silicon is left be.
+                        let named = v.get("part").and_then(|p| p.as_str()).unwrap_or_default();
+                        let Some(part) = part_names.iter().position(|p| p == named) else {
                             return v;
                         };
                         if let Some(alts) = v.get_mut("alternates").and_then(|a| a.as_object_mut())
@@ -2593,7 +2632,7 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                     });
                 }
             }
-            if let Some(prev) = prior("swap_classes")
+            if let Some(prev) = prior("swap_classes", false)?
                 && let Some(prev_arr) = prev.as_array()
             {
                 // Prior classes stay live, minus what this solve consumed:
@@ -2645,10 +2684,7 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                         }
                         // Pool this solve did not place on: keep it, net of the
                         // pins this solve claimed only if it is the same part.
-                        let mine = periphs
-                            .iter()
-                            .find(|p| p.pool.as_deref() == Some(pool) && scopes[p.part_idx] == part)
-                            .map(|p| p.part_idx);
+                        let mine = part_names.iter().position(|p| *p == part);
                         let spares: Vec<String> = prior_class
                             .get("spare_pins")
                             .and_then(|s| s.as_array())
@@ -2710,16 +2746,7 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                         }
                         // Cluster this solve did not place on: same rule, the
                         // units must belong to silicon this table knows.
-                        // Which part of this table the prior cluster sits on,
-                        // if any: its units name it.
-                        let mine = prior_units
-                            .iter()
-                            .find_map(|u| {
-                                periphs
-                                    .iter()
-                                    .find(|p| p.name == *u && scopes[p.part_idx] == part)
-                            })
-                            .map(|p| p.part_idx);
+                        let mine = part_names.iter().position(|p| *p == part);
                         let spares: Vec<String> = prior_class
                             .get("spare_units")
                             .and_then(|s| s.as_array())
@@ -2828,9 +2855,16 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
         let mut seen: HashSet<String> = HashSet::new();
         // Which part this call maps: the one named, else the single part the
         // assignment's requests all belong to.
+        // The entry says which part it was solved on; the claim store only
+        // answers for dicts built by hand.
         let scope_of = |req: &str| {
-            eval.context_value()
-                .and_then(|ctx| ctx.pin_claim_scope(req))
+            dict_get(&ad, heap, req)
+                .and_then(|e| DictRef::from_value(e).and_then(|ed| dict_get(&ed, heap, "part")))
+                .map(|p| p.unpack_str().unwrap_or_default().to_owned())
+                .or_else(|| {
+                    eval.context_value()
+                        .and_then(|ctx| ctx.pin_claim_scope(req))
+                })
         };
         let scopes: Vec<String> = {
             let mut v: Vec<String> = ad
@@ -3077,6 +3111,42 @@ mod tests {
         );
     }
 
+    /// An ambiguity is reported, never credited: the credit would absolve the
+    /// constraint the module is about to record.
+    #[test]
+    fn an_ambiguous_settle_leaves_no_credit() {
+        let som = path(&["SOM"]);
+        let leaf = path(&["SOM", "U1"]);
+        let mut c = PinConstraints::default();
+        record(&mut c, "A", "som.zen", som.clone(), 9, "PA1");
+        record(&mut c, "B", "som.zen", som, 9, "PA2");
+
+        c.settle(&[9], &leaf, "IO");
+        c.take_ambiguous().expect("ambiguity reported");
+        record(&mut c, "IO", "u1.zen", leaf, 9, "PA3");
+
+        let left = c.unconsumed_hard();
+        assert!(
+            left.iter().any(|(_, input, _)| input == "IO"),
+            "the module\'s own constraint still stands, got {left:?}"
+        );
+    }
+
+    /// Re-evaluation records one declaration twice; the claim takes the whole
+    /// group, so no duplicate is left to be reported as never consumed.
+    #[test]
+    fn a_duplicated_record_is_claimed_with_its_group() {
+        let som = path(&["SOM"]);
+        let leaf = path(&["SOM", "U1"]);
+        let mut c = PinConstraints::default();
+        record(&mut c, "LED", "som.zen", som.clone(), 9, "PA7");
+        record(&mut c, "LED", "som.zen", som, 9, "PA7");
+
+        assert!(matches!(c.claim(&[9], &leaf, "LED"), Claimed::Yes(..)));
+        let left = c.unconsumed_hard();
+        assert!(left.is_empty(), "got {left:?}");
+    }
+
     /// A re-solve of the same request keeps its constraint, while a sibling
     /// request on the same net still cannot take it.
     #[test]
@@ -3087,15 +3157,12 @@ mod tests {
 
         let mut c = PinConstraints::default();
         record(&mut c, "LED", "som.zen", som, 9, "PA7");
-        assert!(
-            c.claim(&[9], &leaf, "LED").is_some(),
-            "first solve takes it"
-        );
-        assert!(c.claim(&[9], &other, "LED").is_none(), "a sibling may not");
-        assert!(
-            c.claim(&[9], &leaf, "LED").is_some(),
-            "the same solve may take it again"
-        );
+        let took = |c: &mut PinConstraints, who: &[String]| {
+            matches!(c.claim(&[9], who, "LED"), Claimed::Yes(..))
+        };
+        assert!(took(&mut c, &leaf), "first solve takes it");
+        assert!(!took(&mut c, &other), "a sibling may not");
+        assert!(took(&mut c, &leaf), "the same solve may take it again");
         assert!(c.unconsumed_hard().is_empty());
     }
 
@@ -3111,7 +3178,10 @@ mod tests {
         record(&mut c, "A", "som.zen", som.clone(), 9, "PA1");
         record(&mut c, "B", "som.zen", som, 9, "PA2");
 
-        assert!(c.claim(&[9], &leaf, "LED").is_none(), "ambiguous, no guess");
+        assert!(
+            matches!(c.claim(&[9], &leaf, "LED"), Claimed::Ambiguous),
+            "ambiguous, no guess"
+        );
         let (input, names) = c.take_ambiguous().expect("ambiguity reported");
         assert_eq!(input, "LED");
         assert_eq!(names, "A`, `B");

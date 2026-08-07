@@ -1536,6 +1536,14 @@ impl EvalContext {
         if self.config.source_path.is_none() {
             return anyhow::anyhow!("source_path not set on Context before eval()").into();
         }
+        // A root is a design boundary: elaboration state starts empty here
+        // whatever config the caller reused, so one design's `at()` constraints
+        // never surface as another's errors. Loads and children keep theirs —
+        // their module path is not empty.
+        if self.config.module_path.segments.is_empty() {
+            self.config.pin_constraints = Arc::default();
+            self.config.interface_ids = Arc::default();
+        }
 
         let ParsedSource { contents, ast } = match self.parsed_source() {
             Ok(source) => source,
@@ -1818,16 +1826,6 @@ impl EvalContext {
         self.session.clear_module_dependencies(path);
     }
 
-    /// A sibling context for a new root evaluation: same caches and
-    /// resolution, but its own elaboration state, so one design's `at()`
-    /// constraints never surface as another's errors.
-    fn root_context(&self) -> Self {
-        let mut ctx = self.child_context(None);
-        ctx.config.pin_constraints = Arc::default();
-        ctx.config.interface_ids = Arc::default();
-        ctx
-    }
-
     /// Parse and analyze a file, updating the symbol index and metadata
     pub fn parse_and_analyze_file(
         &self,
@@ -1840,7 +1838,7 @@ impl EvalContext {
 
         // Evaluate the file
         let result = self
-            .root_context()
+            .child_context(None)
             .set_source_path(path.clone())
             .set_source_contents(contents)
             .eval();

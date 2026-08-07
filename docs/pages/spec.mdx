@@ -437,9 +437,10 @@ spans several; it is required then.
 
 Several `pin_solve` calls may share a module: every result stays live, so a
 later call never re-uses a pin or an instance an earlier one took. A request
-name identifies its claim for the whole module, so solving the same name again
-replaces its earlier claim, which is how `previous=` widens a solve. Requests a
-call does not mention keep theirs.
+name identifies its claim on the parts of the table that solves it, so solving
+the same name again over the same component replaces its earlier claim — which
+is how `previous=` widens a solve — while a like-named request on another
+component keeps its own. Requests a call does not mention keep theirs.
 
 `assignment` and `swap_classes` are also stored as module properties (JSON) —
 several solves in one module merge, keyed by request name — and flow through
