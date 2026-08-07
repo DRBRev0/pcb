@@ -364,7 +364,7 @@ resource cluster (an MCU USART, one comparator of a dual package).
 | `signals` | yes | Signal name → list of `pin()` candidates (bare strings allowed); every signal of every provided interface needs at least one candidate |
 | `rebind` | yes | What a later swap costs: `"none"` (gate swap), `"firmware"` (a constant to regenerate), `"fixed"` (never movable) |
 | `attrs` | no | Capability attributes, validated against the interfaces' vocabulary |
-| `unless` | no | The peripheral is unavailable when this key is truthy in `pin_solve(config=...)` |
+| `unless` | no | The peripheral is unavailable when this key is truthy in `pin_solve(config=...)`; its exclusive pads are then left out of the tie-off `pin_map` produces |
 | `part` | no | Component these pads belong to; peripherals sharing a `part` share a pin namespace |
 
 **`pool(name, provides, pins, rebind="firmware")`** — sugar for N
@@ -428,6 +428,12 @@ spans several; it is required then.
 |-----|---------|
 | `assignment` | Per request: the chosen instance and pin per signal (with each pin's realization `data`), plus free alternates |
 | `swap_classes` | Residual swap freedom of *this* solve: pool classes with spare pins, gate-swap clusters. The module property of the same name merges every solve, so the two differ once a module solves more than once |
+
+Several `pin_solve` calls may share a module: every result stays live, so a
+later call never re-uses a pin or an instance an earlier one took. A request
+name identifies its claim for the whole module, so solving the same name again
+replaces its earlier claim, which is how `previous=` widens a solve. Requests a
+call does not mention keep theirs.
 
 `assignment` and `swap_classes` are also stored as module properties (JSON) —
 several solves in one module merge, keyed by request name — and flow through

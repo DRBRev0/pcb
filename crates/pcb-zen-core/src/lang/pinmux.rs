@@ -69,12 +69,15 @@ fn iface_fields<'v>(v: Value<'v>) -> Option<Vec<(String, Value<'v>)>> {
 /// module boundaries, so a solve at any depth can claim one.
 #[derive(Default)]
 pub(crate) struct PinConstraints {
+    /// Set when a claim could not be told apart from a sibling's; reported by
+    /// the solve rather than resolved arbitrarily.
+    ambiguous: Option<(String, String)>,
     entries: Vec<PinConstraintEntry>,
     by_net: HashMap<u64, Vec<usize>>,
-    /// Credits left by solves that read an `at()` wrapper before its io()
-    /// bound, keyed by `(input, net)`: one credit pairs with exactly one later
-    /// `record` for that same input.
-    preconsumed: HashMap<(String, u64), usize>,
+    /// Solves that read an `at()` wrapper before its io() bound, keyed by
+    /// `(module, input, net)`: each pairs with exactly one later `record` of
+    /// that module, so parallel siblings cannot spend each other's.
+    preconsumed: HashMap<(Vec<String>, String, u64), usize>,
 }
 
 struct PinConstraintEntry {
@@ -86,7 +89,10 @@ struct PinConstraintEntry {
     owner: Vec<String>,
     lock: PinLock,
     soft: bool,
-    consumed: bool,
+    /// Solve that took this constraint, if any. Only that same solve may take
+    /// it again, so re-solving a request keeps its pin while a sibling still
+    /// cannot steal it.
+    claimant: Option<Vec<String>>,
 }
 
 impl PinConstraints {
@@ -99,17 +105,19 @@ impl PinConstraints {
         lock: PinLock,
         soft: bool,
     ) {
-        let key = |n: &u64| (input.clone(), *n);
-        let consumed = nets
+        let key = |n: &u64| (owner.clone(), input.clone(), *n);
+        let credited = nets
             .iter()
             .any(|n| self.preconsumed.get(&key(n)).is_some_and(|c| *c > 0));
-        if consumed {
+        if credited {
             for n in nets {
                 if let Some(c) = self.preconsumed.get_mut(&key(n)).filter(|c| **c > 0) {
                     *c -= 1;
                 }
             }
         }
+        // The solve that left the credit is this very module.
+        let claimant = credited.then(|| owner.clone());
         let idx = self.entries.len();
         self.entries.push(PinConstraintEntry {
             input,
@@ -117,7 +125,7 @@ impl PinConstraints {
             owner,
             lock,
             soft,
-            consumed,
+            claimant,
         });
         for n in nets {
             self.by_net.entry(*n).or_default().push(idx);
@@ -126,6 +134,7 @@ impl PinConstraints {
 
     /// Clear everything: the store spans one root evaluation, not the session.
     pub(crate) fn clear(&mut self) {
+        self.ambiguous = None;
         self.entries.clear();
         self.by_net.clear();
         self.preconsumed.clear();
@@ -136,13 +145,16 @@ impl PinConstraints {
     /// record still to come. Exactly one of the two, never both.
     fn settle(&mut self, nets: &[u64], solver: &[String], input: &str) {
         if self.claim(nets, solver, input).is_none() {
-            self.preconsume(input, nets);
+            self.preconsume(solver, input, nets);
         }
     }
 
-    fn preconsume(&mut self, input: &str, nets: &[u64]) {
+    fn preconsume(&mut self, solver: &[String], input: &str, nets: &[u64]) {
         for n in nets {
-            *self.preconsumed.entry((input.to_owned(), *n)).or_default() += 1;
+            *self
+                .preconsumed
+                .entry((solver.to_vec(), input.to_owned(), *n))
+                .or_default() += 1;
         }
     }
 
@@ -152,7 +164,7 @@ impl PinConstraints {
     /// higher up have no such name to match, so the closest one wins and
     /// forwarded constraints keep reaching nested solves.
     fn claim(&mut self, nets: &[u64], solver: &[String], input: &str) -> Option<(PinLock, bool)> {
-        let mut ancestor: Option<usize> = None;
+        let mut eligible: Vec<usize> = Vec::new();
         for i in nets
             .iter()
             .filter_map(|n| self.by_net.get(n))
@@ -160,24 +172,47 @@ impl PinConstraints {
             .copied()
         {
             let e = &self.entries[i];
-            if e.consumed || !solver.starts_with(&e.owner) {
+            let free = e.claimant.as_deref().is_none_or(|c| c == solver);
+            if !free || !solver.starts_with(&e.owner) {
                 continue;
             }
-            if e.owner.len() == solver.len() {
-                if e.input == input {
-                    ancestor = Some(i);
-                    break;
-                }
+            // Same module: only this very io() input's entry.
+            if e.owner.len() == solver.len() && e.input != input {
                 continue;
             }
-            if ancestor.is_none_or(|b| self.entries[b].owner.len() < e.owner.len()) {
-                ancestor = Some(i);
-            }
+            eligible.push(i);
         }
-        let idx = ancestor?;
+        // Closest enclosing owner wins; among equals the matching input name
+        // decides. Entries are appended by parallel child evaluations, so a
+        // remaining tie is genuinely ambiguous rather than order-dependent.
+        let depth = eligible
+            .iter()
+            .map(|i| self.entries[*i].owner.len())
+            .max()?;
+        eligible.retain(|i| self.entries[*i].owner.len() == depth);
+        if eligible.iter().any(|i| self.entries[*i].input == input) {
+            eligible.retain(|i| self.entries[*i].input == input);
+        }
+        // Re-evaluation records the same declaration more than once, so only
+        // distinct input names are a genuine ambiguity.
+        let mut names: Vec<&str> = eligible
+            .iter()
+            .map(|i| self.entries[*i].input.as_str())
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        if names.len() > 1 {
+            self.ambiguous = Some((input.to_owned(), names.join("`, `")));
+            return None;
+        }
+        let idx = *eligible.first()?;
         let e = &mut self.entries[idx];
-        e.consumed = true;
+        e.claimant = Some(solver.to_vec());
         Some((e.lock.clone(), e.soft))
+    }
+
+    fn take_ambiguous(&mut self) -> Option<(String, String)> {
+        self.ambiguous.take()
     }
 
     /// Hard constraints no solve claimed, as `(module, input)`, sorted.
@@ -185,7 +220,7 @@ impl PinConstraints {
         let mut out: Vec<(String, String)> = self
             .entries
             .iter()
-            .filter(|e| !e.soft && !e.consumed)
+            .filter(|e| !e.soft && e.claimant.is_none())
             .map(|e| (e.module.clone(), e.input.clone()))
             .collect();
         out.sort();
@@ -662,6 +697,7 @@ fn combos_for_request<'v>(
 ) -> anyhow::Result<(Vec<Combo>, Vec<(String, String)>, bool)> {
     let mut out: Vec<Combo> = Vec::new();
     let mut any_truncated = false;
+    let mut capped_periphs: Vec<String> = Vec::new();
     let mut rejects: Vec<(String, String)> = Vec::new();
     let prev = previous.get(&req.name);
 
@@ -791,13 +827,7 @@ fn combos_for_request<'v>(
         }
         if truncated {
             any_truncated = true;
-            warn_at_call_site(
-                eval,
-                format!(
-                    "pin_solve: request `{}`: pin combinations for `{}` capped at {PINMAP_CAP}; the assignment may be suboptimal",
-                    req.name, p.name
-                ),
-            );
+            capped_periphs.push(p.name.clone());
         }
 
         let surplus = p.provides_ids.len() as i64 - req.iface_closure_len as i64;
@@ -869,6 +899,17 @@ fn combos_for_request<'v>(
             };
             rejects.push((p.name.clone(), reason));
         }
+    }
+
+    if !capped_periphs.is_empty() {
+        warn_at_call_site(
+            eval,
+            format!(
+                "pin_solve: request `{}`: pin combinations capped at {PINMAP_CAP} for `{}`; the assignment may be suboptimal",
+                req.name,
+                capped_periphs.join("`, `")
+            ),
+        );
     }
 
     out.sort_by(|a, b| {
@@ -1224,6 +1265,20 @@ pub(crate) fn unwrap_pin_at<'v>(
         Some((inner, lock, soft)) => {
             let mut nets = Vec::new();
             collect_net_ids(inner, &mut nets);
+            if nets.is_empty() {
+                // Nothing to pin: the constraint would vanish and the
+                // "never consumed" net would never catch it.
+                let path = eval.source_path().unwrap_or_default();
+                eval.add_diagnostic(crate::Diagnostic::categorized(
+                    &path,
+                    &format!(
+                        "at() on input `{name}` carries no net, so its pin constraint can never \
+                         apply — wrap the connection itself"
+                    ),
+                    "pinmux.at_without_net",
+                    starlark::errors::EvalSeverity::Error,
+                ));
+            }
             if !nets.is_empty()
                 && let Some(store) = eval.eval_context().map(|c| c.pin_constraints())
             {
@@ -1891,6 +1946,12 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                     }
                     None => store.claim(&nets, &solver, &r.name),
                 };
+                if let Some((bad, names)) = store.take_ambiguous() {
+                    return Err(anyhow::anyhow!(
+                        "pin_solve: at() constraints on `{names}` all ride the net reaching input \
+                         `{bad}`; name the io() inputs apart so each constraint has one owner"
+                    ));
+                }
                 if let Some((pins, soft)) = constraint {
                     pins.check_signals(&format!("pin_solve: at() on input `{}`", r.name), &r.uses)?;
                     r.prefer = pins;
@@ -2470,6 +2531,13 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                 let mut v: Vec<String> = periphs
                     .iter()
                     .filter(|p| p.part_idx == i)
+                    // A pad only reachable through a disabled peripheral is not
+                    // this design's to tie off.
+                    .filter(|p| {
+                        p.unless
+                            .as_deref()
+                            .is_none_or(|axis| !config_truthy(&config, axis))
+                    })
                     .flat_map(|p| p.signals.iter())
                     .flat_map(|(_, cands)| cands.iter())
                     .map(|c| c.name.clone())
@@ -2676,40 +2744,71 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
 mod tests {
     use super::*;
 
+    fn lock(pin: &str) -> PinLock {
+        PinLock {
+            any: vec![pin.to_owned()],
+            by_signal: Vec::new(),
+        }
+    }
+
+    fn path(segs: &[&str]) -> Vec<String> {
+        segs.iter().map(|s| (*s).to_owned()).collect()
+    }
+
     /// Inline because the scenario is not reachable from `.zen`: whether a
     /// second constraint on the same net is recorded before or after the early
     /// solve depends on child-evaluation order, which a design cannot control.
-    /// The credit is per `(input, net)`, so `B` keeps its own obligation.
+    /// A credit is per `(module, input, net)`, so it absolves one entry of its
+    /// own module and nothing of a sibling's.
+    #[test]
+    fn a_preconsume_credit_absolves_one_later_entry_only() {
+        let (a, b) = (path(&["A"]), path(&["B"]));
+        let mut c = PinConstraints::default();
+        c.preconsume(&a, "IO", &[5]);
+        c.record("IO".into(), "a.zen".into(), a, &[5], lock("PA1"), false);
+        c.record("IO".into(), "b.zen".into(), b, &[5], lock("PA2"), false);
+
+        let left = c.unconsumed_hard();
+        assert_eq!(left.len(), 1, "only the sibling's remains, got {left:?}");
+        assert_eq!(left[0].0, "b.zen");
+    }
+
     /// A credit spent on one net must not subtract from a sibling net already
-    /// at zero: `consumed` is decided by any net, the decrement is per net.
+    /// at zero: `credited` is decided by any net, the decrement is per net.
+    #[test]
+    fn spending_a_credit_never_underflows_a_zero_net() {
+        let a = path(&["A"]);
+        let mut c = PinConstraints::default();
+        c.preconsume(&a, "X", &[1, 2]);
+        c.record(
+            "X".into(),
+            "m".into(),
+            a.clone(),
+            &[1, 2],
+            lock("PA1"),
+            false,
+        );
+        c.preconsume(&a, "X", &[1]);
+        c.record("X".into(), "m".into(), a, &[1, 2], lock("PA2"), false);
+    }
+
     /// Settling an entry that already exists must not also leave a credit: the
     /// stray one would absolve a sibling instance's constraint on the same net.
     #[test]
     fn settling_an_existing_entry_leaves_no_stray_credit() {
-        let lock = PinLock {
-            any: vec!["P1".to_owned()],
-            by_signal: Vec::new(),
-        };
+        let (a, b) = (path(&["A"]), path(&["B"]));
         let mut c = PinConstraints::default();
-        // Instance A: its io() bound before the solve, so the entry is there.
         c.record(
-            "IO0".into(),
+            "IO".into(),
             "a.zen".into(),
-            vec!["A".into()],
+            a.clone(),
             &[9],
-            lock.clone(),
+            lock("P1"),
             false,
         );
-        c.settle(&[9], &["A".to_owned()], "IO0");
-        // Instance B, same input name and net, nothing ever applies it.
-        c.record(
-            "IO0".into(),
-            "b.zen".into(),
-            vec!["B".into()],
-            &[9],
-            lock,
-            false,
-        );
+        c.settle(&[9], &a, "IO");
+        c.record("IO".into(), "b.zen".into(), b, &[9], lock("P2"), false);
+
         let left = c.unconsumed_hard();
         assert_eq!(
             left.len(),
@@ -2718,53 +2817,57 @@ mod tests {
         );
     }
 
+    /// A re-solve of the same request keeps its constraint, while a sibling
+    /// request on the same net still cannot take it.
     #[test]
-    fn spending_a_credit_never_underflows_a_zero_net() {
-        let lock = PinLock {
-            any: vec!["P1".to_owned()],
-            by_signal: Vec::new(),
-        };
+    fn a_claim_is_reserved_for_the_solve_that_took_it() {
+        let som = path(&["SOM"]);
+        let leaf = path(&["SOM", "U1"]);
+        let other = path(&["SOM", "U2"]);
+
         let mut c = PinConstraints::default();
-        c.preconsume("X", &[1, 2]);
-        c.record("X".into(), "m".into(), vec![], &[1, 2], lock.clone(), false);
-        // Net 1 gets a fresh credit; net 2 is still at zero.
-        c.preconsume("X", &[1]);
-        c.record("X".into(), "m".into(), vec![], &[1, 2], lock, false);
+        c.record(
+            "LED".into(),
+            "som.zen".into(),
+            som,
+            &[9],
+            lock("PA7"),
+            false,
+        );
+        assert!(
+            c.claim(&[9], &leaf, "LED").is_some(),
+            "first solve takes it"
+        );
+        assert!(c.claim(&[9], &other, "LED").is_none(), "a sibling may not");
+        assert!(
+            c.claim(&[9], &leaf, "LED").is_some(),
+            "the same solve may take it again"
+        );
+        assert!(c.unconsumed_hard().is_empty());
     }
 
+    /// Two ancestor-owned constraints on one net at the same depth cannot be
+    /// told apart by owner, and entry order is not stable under parallel child
+    /// evaluation, so the solve reports rather than picks.
     #[test]
-    fn a_preconsume_credit_absolves_one_later_entry_only() {
-        let lock = |pin: &str| PinLock {
-            any: vec![pin.to_owned()],
-            by_signal: Vec::new(),
-        };
-        let owner = |seg: &str| vec![seg.to_owned()];
+    fn two_forwarded_constraints_on_one_net_are_reported_not_guessed() {
+        let som = path(&["SOM"]);
+        let leaf = path(&["SOM", "U1"]);
 
         let mut c = PinConstraints::default();
-        c.preconsume("A", &[5]);
         c.record(
             "A".into(),
-            "a.zen".into(),
-            owner("A"),
-            &[5],
+            "som.zen".into(),
+            som.clone(),
+            &[9],
             lock("PA1"),
             false,
         );
-        c.record(
-            "B".into(),
-            "b.zen".into(),
-            owner("B"),
-            &[5],
-            lock("PA2"),
-            false,
-        );
+        c.record("B".into(), "som.zen".into(), som, &[9], lock("PA2"), false);
 
-        let left = c.unconsumed_hard();
-        assert_eq!(
-            left.len(),
-            1,
-            "only the unapplied one remains, got {left:?}"
-        );
-        assert_eq!(left[0].1, "B");
+        assert!(c.claim(&[9], &leaf, "LED").is_none(), "ambiguous, no guess");
+        let (input, names) = c.take_ambiguous().expect("ambiguity reported");
+        assert_eq!(input, "LED");
+        assert_eq!(names, "A`, `B");
     }
 }

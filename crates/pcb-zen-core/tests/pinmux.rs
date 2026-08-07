@@ -2587,3 +2587,62 @@ check(pins["IN2P"] == VCC, "an open pad can be overridden")
     );
     assert_ok(&result);
 }
+
+#[test]
+fn an_ancestors_constraint_survives_a_second_solve() {
+    // The at() came from the board and was forwarded down, so the leaf can
+    // only read it from the constraint store — re-solving must not lose it.
+    let result = eval_zen(vec![
+        ("/ifaces.zen".to_string(), IFACES.to_string()),
+        (
+            "/mcu.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "pool", "pin_request", "pin_solve")
+load("./ifaces.zen", "Gpio")
+P = pool("GPIO", provides = [Gpio], pins = ["PA5", "PA6", "PA7"])
+LED = io("LED", Gpio)
+reqs = [pin_request("LED", Gpio)]
+r1 = pin_solve([P], reqs)
+r2 = pin_solve([P], reqs)
+builtin.add_property("first", r1["assignment"]["LED"]["signals"]["PIN"]["pin"])
+builtin.add_property("second", r2["assignment"]["LED"]["signals"]["PIN"]["pin"])
+"#
+            .to_string(),
+        ),
+        (
+            "/som.zen".to_string(),
+            r#"
+load("./ifaces.zen", "Gpio")
+LED = io("LED", Gpio)
+Mcu = Module("./mcu.zen")
+Mcu(name = "U1", LED = LED)
+"#
+            .to_string(),
+        ),
+        (
+            "/test.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "at")
+load("./ifaces.zen", "Gpio")
+Som = Module("./som.zen")
+Som(name = "SOM", LED = at(Gpio("LED_NET"), "PA7"))
+"#
+            .to_string(),
+        ),
+    ]);
+    assert_ok(&result);
+    let pin = |k: &str| {
+        result
+            .output
+            .as_ref()
+            .unwrap()
+            .module_tree()
+            .values()
+            .filter_map(|m| m.properties().get(k).cloned())
+            .filter_map(|v| v.to_value().unpack_str().map(|s| s.to_owned()))
+            .next()
+            .unwrap_or_default()
+    };
+    assert_eq!(pin("first"), "PA7", "the forwarded at() applies");
+    assert_eq!(pin("second"), "PA7", "and still applies on a re-solve");
+}
