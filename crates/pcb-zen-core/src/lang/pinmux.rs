@@ -1050,12 +1050,35 @@ fn assign<'v>(reqs: &[RReq<'v>], all_combos: &[Vec<Combo>], part_of: &[usize]) -
         suffix_min[k] = suffix_min[k + 1] + all_combos[order[k]][0].cost;
     }
 
+    // Pads interned once: the conflict scan below runs up to the hard budget,
+    // so it must not allocate. `pads[ri][ci]` holds a combo's pad ids, which
+    // already carry the part a pin name belongs to.
+    let mut ids: HashMap<(usize, &str), usize> = HashMap::new();
+    let pads: Vec<Vec<Vec<usize>>> = all_combos
+        .iter()
+        .map(|combos| {
+            combos
+                .iter()
+                .map(|c| {
+                    let part = part_of[c.periph_idx];
+                    c.pins
+                        .iter()
+                        .map(|(_, p)| {
+                            let next = ids.len();
+                            *ids.entry((part, p.name.as_str())).or_insert(next)
+                        })
+                        .collect()
+                })
+                .collect()
+        })
+        .collect();
+    let mut used_pad = vec![false; ids.len()];
+
     let mut choice = vec![0usize; n];
     // chosen combo index per request (by original request index)
     let mut assigned: Vec<Option<usize>> = vec![None; n];
     let mut partial_cost = vec![0i64; n + 1];
     let mut used_inst: HashSet<usize> = HashSet::new();
-    let mut used_pin: HashSet<(usize, String)> = HashSet::new();
     let mut best: Option<(i64, Vec<usize>)> = None;
     let mut pos: usize = 0;
     let mut spent = 0usize;
@@ -1079,11 +1102,10 @@ fn assign<'v>(reqs: &[RReq<'v>], all_combos: &[Vec<Combo>], part_of: &[usize]) -
             // Keep searching for a cheaper solution: force a backtrack.
             pos -= 1;
             let back_ri = order[pos];
-            let back = &all_combos[back_ri][assigned[back_ri].unwrap()];
-            used_inst.remove(&back.periph_idx);
-            let back_part = part_of[back.periph_idx];
-            for (_, p) in &back.pins {
-                used_pin.remove(&(back_part, p.name.clone()));
+            let back_ci = assigned[back_ri].unwrap();
+            used_inst.remove(&all_combos[back_ri][back_ci].periph_idx);
+            for &pad in &pads[back_ri][back_ci] {
+                used_pad[pad] = false;
             }
             assigned[back_ri] = None;
             choice[pos] += 1;
@@ -1104,17 +1126,14 @@ fn assign<'v>(reqs: &[RReq<'v>], all_combos: &[Vec<Combo>], part_of: &[usize]) -
             }
             // Charged per check, not per node: this scan is where the time goes.
             spent += 1;
-            let part = part_of[c.periph_idx];
-            let clash = used_inst.contains(&c.periph_idx)
-                || c.pins
-                    .iter()
-                    .any(|(_, p)| used_pin.contains(&(part, p.name.clone())));
+            let clash =
+                used_inst.contains(&c.periph_idx) || pads[ri][ci].iter().any(|&pad| used_pad[pad]);
             if !clash {
                 choice[pos] = ci;
                 assigned[ri] = Some(ci);
                 used_inst.insert(c.periph_idx);
-                for (_, p) in &c.pins {
-                    used_pin.insert((part, p.name.clone()));
+                for &pad in &pads[ri][ci] {
+                    used_pad[pad] = true;
                 }
                 partial_cost[pos + 1] = partial_cost[pos] + c.cost;
                 placed = true;
@@ -1134,11 +1153,10 @@ fn assign<'v>(reqs: &[RReq<'v>], all_combos: &[Vec<Combo>], part_of: &[usize]) -
             }
             pos -= 1;
             let back_ri = order[pos];
-            let back = &all_combos[back_ri][assigned[back_ri].unwrap()];
-            used_inst.remove(&back.periph_idx);
-            let back_part = part_of[back.periph_idx];
-            for (_, p) in &back.pins {
-                used_pin.remove(&(back_part, p.name.clone()));
+            let back_ci = assigned[back_ri].unwrap();
+            used_inst.remove(&all_combos[back_ri][back_ci].periph_idx);
+            for &pad in &pads[back_ri][back_ci] {
+                used_pad[pad] = false;
             }
             assigned[back_ri] = None;
             choice[pos] += 1;
