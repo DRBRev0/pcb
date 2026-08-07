@@ -213,23 +213,17 @@ impl<'v> ContextValue<'v> {
             .insert(req.to_owned(), (instance, pins));
     }
 
-    /// Instances and pins claimed by requests other than `except`.
+    /// `(instance, pins)` claimed by requests other than `except`.
     pub(crate) fn pin_claims_excluding(
         &self,
         except: &std::collections::HashSet<String>,
-    ) -> (
-        std::collections::HashSet<String>,
-        std::collections::HashSet<String>,
-    ) {
-        let mut instances = std::collections::HashSet::new();
-        let mut pins = std::collections::HashSet::new();
-        for (req, (instance, req_pins)) in self.pin_claims.borrow().iter() {
-            if !except.contains(req) {
-                instances.insert(instance.clone());
-                pins.extend(req_pins.iter().cloned());
-            }
-        }
-        (instances, pins)
+    ) -> Vec<(String, Vec<String>)> {
+        self.pin_claims
+            .borrow()
+            .iter()
+            .filter(|(req, _)| !except.contains(*req))
+            .map(|(_, (instance, pins))| (instance.clone(), pins.clone()))
+            .collect()
     }
 
     /// Net a physical pin was already mapped to, for the whole module: a

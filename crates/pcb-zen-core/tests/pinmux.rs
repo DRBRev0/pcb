@@ -2211,3 +2211,247 @@ Leaf(name = "L", IO0 = at(Net("LED"), "PA9"))
         b.diagnostics
     );
 }
+
+const TWO_CHIPS: &str = r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin")
+load("./ifaces.zen", "Comparator")
+
+# Same part number twice, so both chips carry the same pin numbering.
+def quad(ref):
+    return [
+        peripheral(ref + ".A", provides = [Comparator], rebind = "none",
+            signals = {"INP": [pin("7")], "INN": [pin("6")], "OUT": [pin("1")]}),
+        peripheral(ref + ".B", provides = [Comparator], rebind = "none",
+            signals = {"INP": [pin("5")], "INN": [pin("4")], "OUT": [pin("2")]}),
+    ]
+"#;
+
+fn eval_two_chips(main: &str) -> WithDiagnostics<EvalOutput> {
+    eval_zen(vec![
+        ("/ifaces.zen".to_string(), IFACES.to_string()),
+        ("/chip.zen".to_string(), TWO_CHIPS.to_string()),
+        ("/test.zen".to_string(), main.to_string()),
+    ])
+}
+
+#[test]
+fn a_second_part_is_not_blocked_by_the_first_parts_pin_names() {
+    let result = eval_two_chips(
+        r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
+load("./chip.zen", "quad")
+load("./ifaces.zen", "Comparator")
+
+r1 = pin_solve(quad("U1"), [pin_request("OV", Comparator)])
+r2 = pin_solve(quad("U2"), [pin_request("UV", Comparator)])
+check(r1["assignment"]["OV"]["instance"] == "U1.A", "U1 must take its first unit")
+check(r2["assignment"]["UV"]["instance"] == "U2.A", "U2 must take its own first unit")
+"#,
+    );
+    assert_ok(&result);
+}
+
+#[test]
+fn a_fully_used_part_does_not_exhaust_a_second_one() {
+    let result = eval_two_chips(
+        r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
+load("./chip.zen", "quad")
+load("./ifaces.zen", "Comparator")
+
+pin_solve(quad("U1"), [pin_request("OV", Comparator), pin_request("UV", Comparator)])
+r2 = pin_solve(quad("U2"), [pin_request("TEMP", Comparator)])
+check(r2["assignment"]["TEMP"]["instance"] == "U2.A", "U2 must still be free")
+"#,
+    );
+    assert_ok(&result);
+}
+
+#[test]
+fn exclusivity_still_holds_within_one_part() {
+    let result = eval_two_chips(
+        r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
+load("./chip.zen", "quad")
+load("./ifaces.zen", "Comparator")
+
+U = quad("U1")
+r1 = pin_solve(U, [pin_request("OV", Comparator)])
+r2 = pin_solve(U, [pin_request("UV", Comparator)])
+check(r1["assignment"]["OV"]["instance"] == "U1.A", "first solve takes unit A")
+check(r2["assignment"]["UV"]["instance"] == "U1.B", "second must move to unit B")
+"#,
+    );
+    assert_ok(&result);
+}
+
+const TWO_SLOTS: &str = r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
+load("./ifaces.zen", "Gpio")
+PA = peripheral("PA", provides = [Gpio], rebind = "fixed",
+    signals = {"PIN": [pin("P1"), pin("P2")]})
+PB = peripheral("PB", provides = [Gpio], rebind = "fixed",
+    signals = {"PIN": [pin("P1"), pin("P2")]})
+A = io("A", Gpio)
+B = io("B", Gpio)
+res = pin_solve([PA, PB], [pin_request("B", Gpio), pin_request("A", Gpio)])
+builtin.add_property("A", res["assignment"]["A"]["signals"]["PIN"]["pin"])
+builtin.add_property("B", res["assignment"]["B"]["signals"]["PIN"]["pin"])
+"#;
+
+#[test]
+fn an_unconstrained_io_does_not_steal_a_siblings_at() {
+    // Both inputs carry the same net; only `A` is pinned.
+    let result = eval_zen(vec![
+        ("/ifaces.zen".to_string(), IFACES.to_string()),
+        ("/mcu.zen".to_string(), TWO_SLOTS.to_string()),
+        (
+            "/test.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "at")
+load("./ifaces.zen", "Gpio")
+Mcu = Module("./mcu.zen")
+n = Gpio("SHARED")
+Mcu(name = "U1", A = at(n, "P2"), B = n)
+"#
+            .to_string(),
+        ),
+    ]);
+    assert_ok(&result);
+    let pin = |k: &str| {
+        result
+            .output
+            .as_ref()
+            .unwrap()
+            .module_tree()
+            .values()
+            .filter_map(|m| m.properties().get(k).cloned())
+            .filter_map(|v| v.to_value().unpack_str().map(|s| s.to_owned()))
+            .next()
+            .unwrap_or_default()
+    };
+    assert_eq!(pin("A"), "P2", "A keeps the pin the caller named");
+    assert_eq!(pin("B"), "P1", "B was never constrained");
+}
+
+#[test]
+fn a_lock_naming_an_unknown_signal_is_rejected() {
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
+load("./ifaces.zen", "Uart")
+U = peripheral("U0", provides = [Uart], rebind = "fixed",
+    signals = {"TX": [pin("PA9")], "RX": [pin("PA10")]})
+pin_solve([U], [pin_request("COM", Uart, prefer = {"TXX": "PA9"}, lock = True)])
+"#,
+    );
+    assert_fails_with(
+        &result,
+        "pin constraint names signal `TXX`, which this request does not use (it uses `TX`, `RX`)",
+    );
+}
+
+#[test]
+fn a_lock_naming_a_signal_outside_uses_is_rejected() {
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
+load("./ifaces.zen", "Uart")
+U = peripheral("U0", provides = [Uart], rebind = "fixed",
+    signals = {"TX": [pin("PA9")], "RX": [pin("PA10")]})
+pin_solve([U], [pin_request("COM", Uart, uses = ["TX"], prefer = {"RX": "PA10"})])
+"#,
+    );
+    assert_fails_with(
+        &result,
+        "names signal `RX`, which this request does not use",
+    );
+}
+
+#[test]
+fn an_at_naming_an_unknown_signal_is_rejected() {
+    let result = eval_zen(vec![
+        ("/ifaces.zen".to_string(), IFACES.to_string()),
+        (
+            "/mcu.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
+load("./ifaces.zen", "Uart")
+U = peripheral("U0", provides = [Uart], rebind = "fixed",
+    signals = {"TX": [pin("PA9")], "RX": [pin("PA10")]})
+COM = io("COM", Uart)
+pin_solve([U], [pin_request("COM", Uart)])
+"#
+            .to_string(),
+        ),
+        (
+            "/test.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "at")
+load("./ifaces.zen", "Uart")
+Mcu = Module("./mcu.zen")
+Mcu(name = "U1", COM = at(Uart("BUS"), {"TXX": "PA9"}))
+"#
+            .to_string(),
+        ),
+    ]);
+    assert_fails_with(
+        &result,
+        "at() on input `COM`: pin constraint names signal `TXX`",
+    );
+}
+
+#[test]
+fn a_second_parts_pins_do_not_eat_the_firsts_spares() {
+    // Two chips, overlapping pin numbering. U2 taking its `B` must not strike
+    // `B` off U1's spare list in the merged property.
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "pool", "pin_request", "pin_solve")
+load("./ifaces.zen", "Gpio")
+P1 = pool("U1.GPIO", provides = [Gpio], pins = ["A", "B", "C"])
+P2 = pool("U2.GPIO", provides = [Gpio], pins = ["B", "D"])
+pin_solve([P1], [pin_request("L1", Gpio)])
+pin_solve([P2], [pin_request("L2", Gpio)])
+"#,
+    );
+    assert_ok(&result);
+    let swaps = json_property(&result, "swap_classes");
+    let u1 = swaps
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["pool"] == "U1.GPIO")
+        .expect("U1 class present");
+    let spares: Vec<&str> = u1["spare_pins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap())
+        .collect();
+    assert_eq!(spares, ["B", "C"], "U1 keeps both of its own spares");
+}
+
+#[test]
+fn a_second_parts_pins_do_not_eat_the_firsts_alternates() {
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
+load("./ifaces.zen", "Gpio")
+U1 = peripheral("U1.P", provides = [Gpio], rebind = "fixed",
+    signals = {"PIN": [pin("A"), pin("B")]})
+U2 = peripheral("U2.P", provides = [Gpio], rebind = "fixed",
+    signals = {"PIN": [pin("B")]})
+pin_solve([U1], [pin_request("L1", Gpio)])
+pin_solve([U2], [pin_request("L2", Gpio)])
+"#,
+    );
+    assert_ok(&result);
+    let a = json_property(&result, "pin_assignment");
+    let alts = &a["L1"]["alternates"]["PIN"];
+    assert_eq!(
+        alts.as_array().map(|v| v.len()),
+        Some(1),
+        "U1 keeps its own alternate, got {a}"
+    );
+}

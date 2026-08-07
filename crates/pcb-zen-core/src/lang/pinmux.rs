@@ -72,8 +72,9 @@ pub(crate) struct PinConstraints {
     entries: Vec<PinConstraintEntry>,
     by_net: HashMap<u64, Vec<usize>>,
     /// Credits left by solves that read an `at()` wrapper before its io()
-    /// bound: one credit pairs with exactly one later `record` on that net.
-    preconsumed: HashMap<u64, usize>,
+    /// bound, keyed by `(input, net)`: one credit pairs with exactly one later
+    /// `record` for that same input.
+    preconsumed: HashMap<(String, u64), usize>,
 }
 
 struct PinConstraintEntry {
@@ -98,12 +99,13 @@ impl PinConstraints {
         lock: PinLock,
         soft: bool,
     ) {
+        let key = |n: &u64| (input.clone(), *n);
         let consumed = nets
             .iter()
-            .any(|n| self.preconsumed.get(n).is_some_and(|c| *c > 0));
+            .any(|n| self.preconsumed.get(&key(n)).is_some_and(|c| *c > 0));
         if consumed {
             for n in nets {
-                if let Some(c) = self.preconsumed.get_mut(n) {
+                if let Some(c) = self.preconsumed.get_mut(&key(n)).filter(|c| **c > 0) {
                     *c -= 1;
                 }
             }
@@ -129,26 +131,50 @@ impl PinConstraints {
         self.preconsumed.clear();
     }
 
-    fn preconsume(&mut self, nets: &[u64]) {
-        for n in nets {
-            *self.preconsumed.entry(*n).or_default() += 1;
+    /// Settle `input`'s constraint for a solve that read it off the wrapper:
+    /// claim the entry when its io() already bound, else leave a credit for the
+    /// record still to come. Exactly one of the two, never both.
+    fn settle(&mut self, nets: &[u64], solver: &[String], input: &str) {
+        if self.claim(nets, solver, input).is_none() {
+            self.preconsume(input, nets);
         }
     }
 
-    /// Claim the constraint riding on any of `nets` that `solver` is entitled
-    /// to: the closest enclosing instance wins, so a nested solve still sees a
-    /// constraint applied above it without stealing a sibling's.
-    fn claim(&mut self, nets: &[u64], solver: &[String]) -> Option<(PinLock, bool)> {
-        let idx = nets
+    fn preconsume(&mut self, input: &str, nets: &[u64]) {
+        for n in nets {
+            *self.preconsumed.entry((input.to_owned(), *n)).or_default() += 1;
+        }
+    }
+
+    /// Claim the constraint for `input` of the module at `solver`. An entry
+    /// owned by that very module must name the same io() input — sibling
+    /// inputs often share a net and must not trade constraints. Entries owned
+    /// higher up have no such name to match, so the closest one wins and
+    /// forwarded constraints keep reaching nested solves.
+    fn claim(&mut self, nets: &[u64], solver: &[String], input: &str) -> Option<(PinLock, bool)> {
+        let mut ancestor: Option<usize> = None;
+        for i in nets
             .iter()
             .filter_map(|n| self.by_net.get(n))
             .flatten()
             .copied()
-            .filter(|i| {
-                let e = &self.entries[*i];
-                !e.consumed && solver.starts_with(&e.owner)
-            })
-            .max_by_key(|i| self.entries[*i].owner.len())?;
+        {
+            let e = &self.entries[i];
+            if e.consumed || !solver.starts_with(&e.owner) {
+                continue;
+            }
+            if e.owner.len() == solver.len() {
+                if e.input == input {
+                    ancestor = Some(i);
+                    break;
+                }
+                continue;
+            }
+            if ancestor.is_none_or(|b| self.entries[b].owner.len() < e.owner.len()) {
+                ancestor = Some(i);
+            }
+        }
+        let idx = ancestor?;
         let e = &mut self.entries[idx];
         e.consumed = true;
         Some((e.lock.clone(), e.soft))
@@ -1073,6 +1099,23 @@ impl PinLock {
                 .any(|(_, ps)| ps.iter().any(|p| p == pin))
     }
 
+    /// Every per-signal entry must name a signal the request actually uses,
+    /// or the requirement would quietly evaporate at combo-check time.
+    fn check_signals(&self, ctx: &str, uses: &[String]) -> anyhow::Result<()> {
+        for (sig, _) in &self.by_signal {
+            if !uses.iter().any(|u| u == sig) {
+                return Err(anyhow::anyhow!(
+                    "{ctx}: pin constraint names signal `{sig}`, which this request does not use (it uses {})",
+                    uses.iter()
+                        .map(|s| format!("`{s}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn names(&self) -> Vec<String> {
         let mut out = self.any.clone();
         for (s, ps) in &self.by_signal {
@@ -1647,6 +1690,7 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                 (PinLock { any, by_signal }, lock)
             }
         };
+        pref.check_signals(&format!("pin_request `{name}`"), &uses_vals)?;
         let prefer_alloc: Vec<Value> = pref.any.iter().map(|s| heap.alloc(s.as_str())).collect();
         let by_signal_alloc: Vec<(Value, Value)> = pref
             .by_signal
@@ -1807,16 +1851,14 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                 collect_net_ids(value, &mut nets);
                 let mut store = store.lock().unwrap();
                 let constraint = match raw {
-                    // Claim covers an io() that already bound, preconsume one
-                    // that binds after this solve.
                     Some(c) => {
-                        store.claim(&nets, &solver);
-                        store.preconsume(&nets);
+                        store.settle(&nets, &solver, &r.name);
                         Some(c)
                     }
-                    None => store.claim(&nets, &solver),
+                    None => store.claim(&nets, &solver, &r.name),
                 };
                 if let Some((pins, soft)) = constraint {
+                    pins.check_signals(&format!("pin_solve: at() on input `{}`", r.name), &r.uses)?;
                     r.prefer = pins;
                     r.lock = !soft;
                 }
@@ -1867,16 +1909,22 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
         // Pin/instance exclusivity spans every pin_solve of the module:
         // candidates claimed by another solve's requests are unavailable
         // (a re-solved request releases its own claims, so `previous=` can
-        // widen an earlier solve). The claimed sets also seed the reported
-        // residual freedom below, so free/alternate/spare listings match the
-        // exclusivity the solver enforces.
-        let (claimed_instances, claimed_pins) = eval
-            .context_value()
-            .map(|ctx| {
-                let current: HashSet<String> = reqs.iter().map(|r| r.name.clone()).collect();
-                ctx.pin_claims_excluding(&current)
-            })
-            .unwrap_or_default();
+        // widen an earlier solve). Only claims on a peripheral of *this* table
+        // count: pin names belong to a part, so another part's `7` is not ours.
+        // The claimed sets also seed the reported residual freedom below, so
+        // free/alternate/spare listings match the exclusivity enforced here.
+        let mut claimed_instances: HashSet<String> = HashSet::new();
+        let mut claimed_pins: HashSet<String> = HashSet::new();
+        if let Some(ctx) = eval.context_value() {
+            let ours: HashSet<&str> = periphs.iter().map(|p| p.name.as_str()).collect();
+            let current: HashSet<String> = reqs.iter().map(|r| r.name.clone()).collect();
+            for (instance, pins) in ctx.pin_claims_excluding(&current) {
+                if ours.contains(instance.as_str()) {
+                    claimed_instances.insert(instance);
+                    claimed_pins.extend(pins);
+                }
+            }
+        }
         if !(claimed_instances.is_empty() && claimed_pins.is_empty()) {
             for (i, combos) in all_combos.iter_mut().enumerate() {
                 combos.retain(|c| {
@@ -2168,6 +2216,11 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
         let mut property_assignment = assignment_json.clone();
         let mut property_swaps = swap_json.clone();
         if let Some(ctx) = eval.context_value() {
+            // Pin and unit names belong to a part. A prior entry built on
+            // silicon this solve never touched keeps its freedom verbatim.
+            let ours: HashSet<&str> = periphs.iter().map(|p| p.name.as_str()).collect();
+            let our_pools: HashSet<&str> =
+                periphs.iter().filter_map(|p| p.pool.as_deref()).collect();
             let prior = |key: &str| {
                 ctx.module()
                     .properties()
@@ -2183,8 +2236,16 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                     .expect("assignment is an object");
                 for (k, v) in prev_obj {
                     cur.entry(k.clone()).or_insert_with(|| {
-                        // Prior alternates net of pins this solve claimed.
+                        // Prior alternates net of pins this solve claimed, but
+                        // only when the entry sits on a part of this table.
                         let mut v = v.clone();
+                        let mine = v
+                            .get("instance")
+                            .and_then(|i| i.as_str())
+                            .is_some_and(|i| ours.contains(i));
+                        if !mine {
+                            return v;
+                        }
                         if let Some(alts) = v.get_mut("alternates").and_then(|a| a.as_object_mut())
                         {
                             for list in alts.values_mut() {
@@ -2241,15 +2302,16 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                             cur.2.sort();
                             continue;
                         }
-                        // Pool untouched by this solve: keep, net of the pins
-                        // this solve claimed.
+                        // Pool this solve did not place on: keep it, net of the
+                        // pins this solve claimed only if it is the same part.
+                        let mine = our_pools.contains(pool);
                         let spares: Vec<String> = prior_class
                             .get("spare_pins")
                             .and_then(|s| s.as_array())
                             .map(|s| {
                                 s.iter()
                                     .filter_map(|p| p.as_str())
-                                    .filter(|n| !used_pins.contains(*n))
+                                    .filter(|n| !mine || !used_pins.contains(*n))
                                     .map(str::to_owned)
                                     .collect()
                             })
@@ -2291,15 +2353,16 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                             cur.1.sort();
                             continue;
                         }
-                        // Cluster untouched by this solve: keep, net of the
-                        // units this solve occupied.
+                        // Cluster this solve did not place on: same rule, the
+                        // units must belong to silicon this table knows.
+                        let mine = prior_units.iter().any(|u| ours.contains(u.as_str()));
                         let spares: Vec<String> = prior_class
                             .get("spare_units")
                             .and_then(|s| s.as_array())
                             .map(|s| {
                                 s.iter()
                                     .filter_map(|u| u.as_str())
-                                    .filter(|n| !assigned_instances.contains(*n))
+                                    .filter(|n| !mine || !assigned_instances.contains(*n))
                                     .map(str::to_owned)
                                     .collect()
                             })
@@ -2486,6 +2549,59 @@ mod tests {
     /// Inline because the scenario is not reachable from `.zen`: whether a
     /// second constraint on the same net is recorded before or after the early
     /// solve depends on child-evaluation order, which a design cannot control.
+    /// The credit is per `(input, net)`, so `B` keeps its own obligation.
+    /// A credit spent on one net must not subtract from a sibling net already
+    /// at zero: `consumed` is decided by any net, the decrement is per net.
+    /// Settling an entry that already exists must not also leave a credit: the
+    /// stray one would absolve a sibling instance's constraint on the same net.
+    #[test]
+    fn settling_an_existing_entry_leaves_no_stray_credit() {
+        let lock = PinLock {
+            any: vec!["P1".to_owned()],
+            by_signal: Vec::new(),
+        };
+        let mut c = PinConstraints::default();
+        // Instance A: its io() bound before the solve, so the entry is there.
+        c.record(
+            "IO0".into(),
+            "a.zen".into(),
+            vec!["A".into()],
+            &[9],
+            lock.clone(),
+            false,
+        );
+        c.settle(&[9], &["A".to_owned()], "IO0");
+        // Instance B, same input name and net, nothing ever applies it.
+        c.record(
+            "IO0".into(),
+            "b.zen".into(),
+            vec!["B".into()],
+            &[9],
+            lock,
+            false,
+        );
+        let left = c.unconsumed_hard();
+        assert_eq!(
+            left.len(),
+            1,
+            "B's constraint must still be reported, got {left:?}"
+        );
+    }
+
+    #[test]
+    fn spending_a_credit_never_underflows_a_zero_net() {
+        let lock = PinLock {
+            any: vec!["P1".to_owned()],
+            by_signal: Vec::new(),
+        };
+        let mut c = PinConstraints::default();
+        c.preconsume("X", &[1, 2]);
+        c.record("X".into(), "m".into(), vec![], &[1, 2], lock.clone(), false);
+        // Net 1 gets a fresh credit; net 2 is still at zero.
+        c.preconsume("X", &[1]);
+        c.record("X".into(), "m".into(), vec![], &[1, 2], lock, false);
+    }
+
     #[test]
     fn a_preconsume_credit_absolves_one_later_entry_only() {
         let lock = |pin: &str| PinLock {
@@ -2495,7 +2611,7 @@ mod tests {
         let owner = |seg: &str| vec![seg.to_owned()];
 
         let mut c = PinConstraints::default();
-        c.preconsume(&[5]);
+        c.preconsume("A", &[5]);
         c.record(
             "A".into(),
             "a.zen".into(),
