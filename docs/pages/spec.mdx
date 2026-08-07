@@ -370,7 +370,7 @@ resource cluster (an MCU USART, one comparator of a dual package).
 | `signals` | yes | Signal name → list of `pin()` candidates (bare strings allowed); every signal of every provided interface needs at least one candidate |
 | `rebind` | yes | What a later swap costs: `"none"` (gate swap), `"firmware"` (a constant to regenerate), `"fixed"` (never movable) |
 | `attrs` | no | Capability attributes, validated against the interfaces' vocabulary |
-| `unless` | no | The peripheral is unavailable when this key is truthy in `pin_solve(config=...)`; its exclusive pads are then left out of the tie-off `pin_map` produces |
+| `unless` | no | The peripheral is unavailable when this key is truthy in `pin_solve(config=...)`; its exclusive pads are then left out of the tie-off `pin_map` produces. A part is configured once: an axis that flips between two solves of the same part is an error |
 | `part` | no | Component these pads belong to; peripherals sharing a `part` share a pin namespace |
 
 **`pool(name, provides, pins, rebind="firmware")`** — sugar for N
@@ -411,9 +411,11 @@ connection itself: `Mcu(IO0 = at(led_net, "PA8"))`. The wrapper is
 transparent: the inner value flows as if passed directly and the constraint
 reaches the `pin_request` of the same name as the `io()` input it annotates.
 Hard by default (unsatisfiable → build error); `soft = True` is a preference
-the solver may fall back from. A pin name answers for one component, so a
-constrained net that reaches two solves is an error rather than a race: give
-each side its own `at()`.
+the solver may fall back from — it falls back to what the `pin_request` itself
+asked for, so a wish never voids a `lock = True` the module set, it only
+chooses among the pins that lock allows. A pin name answers for one component,
+so a constrained net that reaches two solves is an error rather than a race:
+give each side its own `at()`.
 
 A name or list of names must be claimed *in full* — every pin listed ends up
 on some signal of the request, whatever the signal count, so

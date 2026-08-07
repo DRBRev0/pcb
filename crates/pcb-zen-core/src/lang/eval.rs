@@ -1536,11 +1536,10 @@ impl EvalContext {
         if self.config.source_path.is_none() {
             return anyhow::anyhow!("source_path not set on Context before eval()").into();
         }
-        // A root is a design boundary: elaboration state starts empty here
-        // whatever config the caller reused, so one design's `at()` constraints
-        // never surface as another's errors. Loads and children keep theirs —
-        // their module path is not empty.
-        if self.config.module_path.segments.is_empty() {
+        // Elaboration state starts empty at a design boundary, whatever config
+        // the caller reused, so one design's `at()` constraints never surface
+        // as another's errors. Loads and children keep theirs.
+        if self.config.module_path.is_root() {
             self.config.pin_constraints = Arc::default();
             self.config.interface_ids = Arc::default();
         }
@@ -1692,7 +1691,7 @@ impl EvalContext {
                         .collect();
                     // Process pending children after parent is frozen
                     let module_path = extra.module.path().clone();
-                    let is_root = module_path.segments.is_empty();
+                    let is_root = module_path.is_root();
 
                     if self.config.build_circuit || is_root {
                         self.session
@@ -1740,8 +1739,26 @@ impl EvalContext {
                     diagnostics.extend(extra.diagnostics().iter().cloned());
 
                     // Every solve in the tree has run by now, so a hard
-                    // constraint still unclaimed is one nothing ever wanted.
+                    // constraint still unclaimed is one nothing ever wanted,
+                    // and one several solves wanted is reported once, here,
+                    // rather than by whichever of them lost the race.
                     if is_root {
+                        for (module, input, span, who) in
+                            self.config.pin_constraints.lock().unwrap().contended()
+                        {
+                            diagnostics.push(
+                                Diagnostic::categorized(
+                                    &module,
+                                    &format!(
+                                        "at() pin constraint on input `{input}` is wanted by the solves of `{}`: a pin name answers for one component, so give each its own at()",
+                                        who.join("`, `")
+                                    ),
+                                    "pinmux.contended_at",
+                                    EvalSeverity::Error,
+                                )
+                                .with_span(span),
+                            );
+                        }
                         for (module, input, span) in self
                             .config
                             .pin_constraints

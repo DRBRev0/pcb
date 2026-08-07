@@ -31,6 +31,10 @@ use crate::lang::interface::{
 use crate::lang::net::{FrozenNetType, FrozenNetValue, NetType, NetValue};
 
 const REBIND_VALUES: [&str; 3] = ["none", "firmware", "fixed"];
+/// Module properties `pin_solve` writes and merges across solves. User code
+/// records its own data elsewhere, so the merge always reads back what it
+/// wrote.
+pub(crate) const RESULT_PROPERTIES: [&str; 2] = ["pin_assignment", "swap_classes"];
 const PINMAP_CAP: usize = 512;
 /// In conflict checks, not search nodes: a node scans up to `PINMAP_CAP`
 /// combos per providing instance.
@@ -85,8 +89,6 @@ pub(crate) struct PinConstraints {
 enum Ambiguity {
     /// Several inputs' constraints ride the net reaching this input.
     Entries { input: String, names: String },
-    /// Another solve holds the one constraint on this net.
-    Contended { input: String, holder: String },
 }
 
 /// What claiming a caller constraint for one io() input yielded.
@@ -96,6 +98,9 @@ enum Claimed {
     No,
     /// Several inputs' constraints ride the net; the solve reports it.
     Ambiguous,
+    /// Another solve holds it. Recorded on the entry and reported at the
+    /// root, so this solve neither errors nor earns a credit.
+    Contended,
 }
 
 struct PinConstraintEntry {
@@ -113,6 +118,10 @@ struct PinConstraintEntry {
     /// it again, so re-solving a request keeps its pin while a sibling still
     /// cannot steal it.
     claimant: Option<Vec<String>>,
+    /// Solves that wanted it once taken. Children elaborate in parallel, so
+    /// the contention is reported at the root, from the `at()` site, rather
+    /// than by whichever solve happened to lose the race.
+    contested: Vec<Vec<String>>,
 }
 
 impl PinConstraints {
@@ -149,6 +158,7 @@ impl PinConstraints {
             lock,
             soft,
             claimant,
+            contested: Vec::new(),
         });
         for n in nets {
             self.by_net.entry(*n).or_default().push(idx);
@@ -161,7 +171,7 @@ impl PinConstraints {
     fn settle(&mut self, nets: &[u64], solver: &[String], input: &str) {
         // Only an entry that truly is not there earns a credit: an ambiguity
         // is reported, and crediting it would absolve a sibling's constraint.
-        if matches!(self.claim(nets, solver, input), Claimed::No) {
+        if matches!(self.claim(nets, solver, input, &mut |_| true), Claimed::No) {
             self.preconsume(solver, input, nets);
         }
     }
@@ -181,9 +191,15 @@ impl PinConstraints {
     /// higher up have no such name to match, so the closest one wins and
     /// forwarded constraints keep reaching nested solves. A second solve
     /// wanting one already taken is reported, never served first-come.
-    fn claim(&mut self, nets: &[u64], solver: &[String], input: &str) -> Claimed {
+    fn claim(
+        &mut self,
+        nets: &[u64],
+        solver: &[String],
+        input: &str,
+        usable: &mut dyn FnMut(&PinLock) -> bool,
+    ) -> Claimed {
         let mut eligible: Vec<usize> = Vec::new();
-        let mut held: Option<String> = None;
+        let mut held: Vec<usize> = Vec::new();
         for i in nets
             .iter()
             .filter_map(|n| self.by_net.get(n))
@@ -194,33 +210,29 @@ impl PinConstraints {
             if !solver.starts_with(&e.owner) {
                 continue;
             }
-            // Same module: only this very io() input's entry.
-            if e.owner.len() == solver.len() && e.input != input {
+            // Same module: only this very io() input's entry. Owned higher
+            // up there is no name to pair with, so the pins decide.
+            if e.owner.len() == solver.len() {
+                if e.input != input {
+                    continue;
+                }
+            } else if !usable(&e.lock) {
                 continue;
             }
             match e.claimant.as_deref() {
                 // Another solve got here first. Children elaborate in
                 // parallel, so leaving it at that would hand the pin to
                 // whichever ran first.
-                Some(c) if c != solver => held = Some(c.join(".")),
+                Some(c) if c != solver => held.push(i),
                 _ => eligible.push(i),
             }
         }
-        let contended = |input: &str, held: Option<String>| {
-            held.map(|holder| Ambiguity::Contended {
-                input: input.to_owned(),
-                holder,
-            })
-        };
+
         // Closest enclosing owner wins; among equals the matching input name
         // decides. Entries are appended by parallel child evaluations, so a
         // remaining tie is genuinely ambiguous rather than order-dependent.
         let Some(depth) = eligible.iter().map(|i| self.entries[*i].owner.len()).max() else {
-            self.ambiguous = contended(input, held);
-            return match self.ambiguous {
-                Some(_) => Claimed::Ambiguous,
-                None => Claimed::No,
-            };
+            return self.contend(held, solver);
         };
         eligible.retain(|i| self.entries[*i].owner.len() == depth);
         if eligible.iter().any(|i| self.entries[*i].input == input) {
@@ -242,11 +254,7 @@ impl PinConstraints {
             return Claimed::Ambiguous;
         }
         let Some(&idx) = eligible.first() else {
-            self.ambiguous = contended(input, held);
-            return match self.ambiguous {
-                Some(_) => Claimed::Ambiguous,
-                None => Claimed::No,
-            };
+            return self.contend(held, solver);
         };
         // The group is one declaration recorded several times; claiming all of
         // it keeps the duplicates from being reported as never consumed.
@@ -257,12 +265,56 @@ impl PinConstraints {
         Claimed::Yes(e.lock.clone(), e.soft)
     }
 
+    /// Note that `solver` wanted constraints another solve holds.
+    fn contend(&mut self, held: Vec<usize>, solver: &[String]) -> Claimed {
+        if held.is_empty() {
+            return Claimed::No;
+        }
+        for i in held {
+            let e = &mut self.entries[i];
+            if !e.contested.iter().any(|c| c == solver) {
+                e.contested.push(solver.to_vec());
+            }
+        }
+        Claimed::Contended
+    }
+
     fn take_ambiguous(&mut self) -> Option<Ambiguity> {
         self.ambiguous.take()
     }
 
     /// Hard constraints no solve claimed, as `(module, input, span)`, sorted.
     #[allow(clippy::type_complexity)]
+    /// Constraints more than one solve wanted, with every contender sorted:
+    /// the winner depends on child-evaluation order, the report must not.
+    pub(crate) fn contended(
+        &self,
+    ) -> Vec<(
+        String,
+        String,
+        Option<starlark::codemap::ResolvedSpan>,
+        Vec<String>,
+    )> {
+        let mut out: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|e| !e.contested.is_empty())
+            .map(|e| {
+                let mut who: Vec<String> = e
+                    .claimant
+                    .iter()
+                    .chain(e.contested.iter())
+                    .map(|p| p.join("."))
+                    .collect();
+                who.sort();
+                who.dedup();
+                (e.module.clone(), e.input.clone(), e.span, who)
+            })
+            .collect();
+        out.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        out
+    }
+
     pub(crate) fn unconsumed_hard(
         &self,
     ) -> Vec<(String, String, Option<starlark::codemap::ResolvedSpan>)> {
@@ -485,14 +537,22 @@ impl RPeriph<'_> {
         self.signals.iter().find(|(s, _)| s == name).map(|(_, p)| p)
     }
 
-    /// Provides-set key for cluster swap grouping (sorted nominal ids).
-    fn provides_key(&self) -> String {
+    /// Provides-set key for cluster swap grouping.
+    fn provides_key(&self) -> ProvidesKey {
         let mut ids: Vec<String> = self.provides_ids.iter().map(|i| format!("{i:?}")).collect();
         ids.sort();
-        ids.join(",")
+        ProvidesKey(ids.join(","))
     }
 }
 
+/// Which capabilities a peripheral provides, as one comparable value. Built
+/// from `TypeInstanceId`s, minted per build: it tells clusters apart within a
+/// solve and means nothing outside it, so it is opaque — neither serializable
+/// nor orderable, which keeps it out of emitted data and of sort keys.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ProvidesKey(String);
+
+#[derive(Clone)]
 struct RReq<'v> {
     name: String,
     iface_id: TypeInstanceId,
@@ -502,6 +562,9 @@ struct RReq<'v> {
     instance: Option<String>,
     prefer: PinLock,
     lock: bool,
+    /// A caller's soft `at()` when the request is locked: it picks among the
+    /// pins the module made mandatory instead of voiding them.
+    soft_prefer: PinLock,
     where_fn: Option<Value<'v>>,
     direction: Option<String>,
     /// Serve this request only when the module input of the same name was
@@ -509,6 +572,22 @@ struct RReq<'v> {
     if_connected: bool,
     /// Value bound on the request itself (dict-of-roles pattern).
     bind: Option<Value<'v>>,
+}
+
+impl RReq<'_> {
+    /// How much this request would rather have `pin`: what the module asked
+    /// for, and what the caller wished on top of it. Cumulative, so a wish
+    /// still decides among pins the module allows equally.
+    fn bias(&self, pin: &str) -> i64 {
+        let mut b = 0;
+        if self.prefer.mentions(pin) {
+            b -= 10;
+        }
+        if self.soft_prefer.mentions(pin) {
+            b -= 10;
+        }
+        b
+    }
 }
 
 #[derive(Clone)]
@@ -736,6 +815,7 @@ fn parse_rreq<'v>(v: Value<'v>, heap: Heap<'v>, ids: &InterfaceIds) -> anyhow::R
         lock: dict_get(&d, heap, "lock")
             .map(|v| v.to_bool())
             .unwrap_or(false),
+        soft_prefer: PinLock::default(),
         where_fn: dict_get(&d, heap, "where").filter(|v| !v.is_none()),
         direction: dict_get_str(&d, heap, "direction"),
         if_connected: dict_get(&d, heap, "if_connected")
@@ -783,9 +863,8 @@ fn combos_for_request<'v>(
     config: &SmallMap<String, Value<'v>>,
     previous: &HashMap<String, PrevAssign>,
     eval: &mut Evaluator<'v, '_, '_>,
-) -> anyhow::Result<(Vec<Combo>, Vec<(String, String)>, bool)> {
+) -> anyhow::Result<(Vec<Combo>, Vec<(String, String)>, Vec<String>)> {
     let mut out: Vec<Combo> = Vec::new();
-    let mut any_truncated = false;
     let mut capped_periphs: Vec<String> = Vec::new();
     let mut rejects: Vec<(String, String)> = Vec::new();
     let prev = previous.get(&req.name);
@@ -887,9 +966,9 @@ fn combos_for_request<'v>(
                 }
             }
         }
-        if !req.prefer.is_empty() {
+        if !(req.prefer.is_empty() && req.soft_prefer.is_empty()) {
             for (_, cands) in cand_lists.iter_mut() {
-                cands.sort_by_key(|c| !req.prefer.mentions(&c.name));
+                cands.sort_by_key(|c| req.bias(&c.name));
             }
         }
 
@@ -915,7 +994,6 @@ fn combos_for_request<'v>(
             pinmaps = next;
         }
         if truncated {
-            any_truncated = true;
             capped_periphs.push(p.name.clone());
         }
 
@@ -946,9 +1024,7 @@ fn combos_for_request<'v>(
                 if c.strap {
                     cost += 50;
                 }
-                if req.prefer.mentions(&c.name) {
-                    cost -= 10;
-                }
+                cost += req.bias(&c.name);
                 if let Some(prev) = prev
                     && prev.pins.get(sig) == Some(&c.name)
                 {
@@ -990,17 +1066,6 @@ fn combos_for_request<'v>(
         }
     }
 
-    if !capped_periphs.is_empty() {
-        warn_at_call_site(
-            eval,
-            format!(
-                "pin_solve: request `{}`: pin combinations capped at {PINMAP_CAP} for `{}`; the assignment may be suboptimal",
-                req.name,
-                capped_periphs.join("`, `")
-            ),
-        );
-    }
-
     out.sort_by(|a, b| {
         (a.cost, &periphs[a.periph_idx].name, &a.key).cmp(&(
             b.cost,
@@ -1008,7 +1073,7 @@ fn combos_for_request<'v>(
             &b.key,
         ))
     });
-    Ok((out, rejects, any_truncated))
+    Ok((out, rejects, capped_periphs))
 }
 
 enum AssignOutcome {
@@ -1513,6 +1578,15 @@ pub(crate) fn unwrap_pin_at<'v>(
                     lock,
                     soft,
                 );
+            }
+            // The constraint now lives in the store, so the module keeps the
+            // value the caller meant to connect. A solve that runs before this
+            // io() still reads the wrapper off the input, as it must.
+            // The constraint now lives in the store, so the module keeps the
+            // value the caller meant to connect. A solve that runs before this
+            // io() still reads the wrapper off the input, as it must.
+            if let Some(ctx) = eval.context_value() {
+                ctx.module_mut().add_input(name.to_owned(), inner);
             }
             inner
         }
@@ -2156,13 +2230,35 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
             }
         }
 
+        let prev_map = match previous {
+            NoneOr::Other(v) => {
+                let parsed = parse_previous(v, heap);
+                let provided_entries = DictRef::from_value(v)
+                    .map(|d| d.iter().count())
+                    .unwrap_or(1);
+                if parsed.is_empty() && provided_entries > 0 {
+                    warn_at_call_site(
+                        eval,
+                        "pin_solve: previous= contains no usable assignment entry; pass the `assignment` dict of a prior solve".to_owned(),
+                    );
+                }
+                parsed
+            }
+            NoneOr::None => HashMap::new(),
+        };
+
         // `at()` constraints override request-side prefer/lock. A request
         // pairs with the io() input of its name; the constraint rides on the
-        // input's nets.
+        // input's nets. Read the inputs first so the claims below, which need
+        // the evaluator to weigh candidates, do not hold the module borrow.
         let store = eval.eval_context().map(|c| c.pin_constraints());
-        if let (Some(ctx), Some(store)) = (eval.context_value(), store) {
-            let solver: Vec<String> = ctx.module().path().segments.clone();
-            for r in reqs.iter_mut() {
+        let mut solver: Vec<String> = Vec::new();
+        // (request, the nets it rides, its own at() when it carries one)
+        type Ride = (usize, Vec<u64>, Option<(PinLock, bool)>);
+        let mut rides: Vec<Ride> = Vec::new();
+        if let Some(ctx) = eval.context_value() {
+            solver = ctx.module().path().segments.clone();
+            for (i, r) in reqs.iter().enumerate() {
                 // A config() of the request's name is not a connection. A role
                 // carries its own value, so that name cannot mislead it.
                 if r.bind.is_none() && configs.contains(&r.name) {
@@ -2185,64 +2281,73 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                 };
                 let mut nets = Vec::new();
                 collect_net_ids(value, &mut nets);
+                rides.push((i, nets, raw));
+            }
+        }
+        if let Some(store) = store {
+            for (i, nets, raw) in rides {
                 let mut store = store.lock().unwrap();
                 let constraint = match raw {
                     Some(c) => {
-                        store.settle(&nets, &solver, &r.name);
+                        store.settle(&nets, &solver, &reqs[i].name);
                         Some(c)
                     }
-                    None => match store.claim(&nets, &solver, &r.name) {
-                        Claimed::Yes(pins, soft) => Some((pins, soft)),
-                        Claimed::No | Claimed::Ambiguous => None,
-                    },
+                    None => {
+                        // An ancestor's constraint names an input of its own
+                        // namespace, so only the pins pair it with a request:
+                        // one that has no candidate on them must leave it to
+                        // the request that has.
+                        let mut usable = |lock: &PinLock| {
+                            let mut probe = reqs[i].clone();
+                            probe.prefer = lock.clone();
+                            probe.lock = true;
+                            combos_for_request(&probe, &periphs, &config, &prev_map, eval)
+                                .map(|(combos, _, _)| !combos.is_empty())
+                                .unwrap_or(false)
+                        };
+                        match store.claim(&nets, &solver, &reqs[i].name, &mut usable) {
+                            Claimed::Yes(pins, soft) => Some((pins, soft)),
+                            Claimed::No | Claimed::Ambiguous | Claimed::Contended => None,
+                        }
+                    }
                 };
-                if let Some(bad) = store.take_ambiguous() {
-                    return Err(match bad {
-                        Ambiguity::Entries { input, names } => anyhow::anyhow!(
-                            "pin_solve: at() constraints on `{names}` all ride the net reaching \
-                             input `{input}`; name the io() inputs apart so each constraint has \
-                             one owner"
-                        ),
-                        Ambiguity::Contended { input, holder } => anyhow::anyhow!(
-                            "pin_solve: the at() constraint on the net reaching input `{input}` \
-                             is already held by `{holder}`; a pin name answers for one component, \
-                             so give each side its own at()"
-                        ),
-                    });
+                if let Some(Ambiguity::Entries { input, names }) = store.take_ambiguous() {
+                    return Err(anyhow::anyhow!(
+                        "pin_solve: at() constraints on `{names}` all ride the net reaching input \
+                         `{input}`; name the io() inputs apart so each constraint has one owner"
+                    ));
                 }
                 if let Some((pins, soft)) = constraint {
+                    let r = &mut reqs[i];
                     pins.check_signals(&format!("pin_solve: at() on input `{}`", r.name), &r.uses)?;
-                    r.prefer = pins;
-                    r.lock = !soft;
+                    if soft && r.lock && !r.prefer.is_empty() {
+                        // The module made its pins mandatory; a wish picks
+                        // among them rather than voiding them.
+                        r.soft_prefer = pins;
+                    } else {
+                        r.prefer = pins;
+                        r.lock = !soft;
+                    }
                 }
             }
         }
-
-        let prev_map = match previous {
-            NoneOr::Other(v) => {
-                let parsed = parse_previous(v, heap);
-                let provided_entries = DictRef::from_value(v)
-                    .map(|d| d.iter().count())
-                    .unwrap_or(1);
-                if parsed.is_empty() && provided_entries > 0 {
-                    warn_at_call_site(
-                        eval,
-                        "pin_solve: previous= contains no usable assignment entry; pass the `assignment` dict of a prior solve".to_owned(),
-                    );
-                }
-                parsed
-            }
-            NoneOr::None => HashMap::new(),
-        };
 
         // Candidate combos per request, with reasoned rejections.
         let mut all_combos: Vec<Vec<Combo>> = Vec::new();
         let mut truncated_reqs: Vec<String> = Vec::new();
         for r in &reqs {
-            let (combos, rejects, truncated) =
+            let (combos, rejects, capped) =
                 combos_for_request(r, &periphs, &config, &prev_map, eval)?;
-            if truncated {
+            if !capped.is_empty() {
                 truncated_reqs.push(r.name.clone());
+                warn_at_call_site(
+                    eval,
+                    format!(
+                        "pin_solve: request `{}`: pin combinations capped at {PINMAP_CAP} for `{}`; the assignment may be suboptimal",
+                        r.name,
+                        capped.join("`, `")
+                    ),
+                );
             }
             if combos.is_empty() {
                 let detail = rejects
@@ -2271,6 +2376,31 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
         // share the module's single anonymous one, so pads keep colliding
         // across solves exactly as they did before parts existed.
         let scopes: Vec<String> = part_names.clone();
+        // Whether a gated peripheral is there belongs to the design, not to
+        // one solve: an axis that said one thing already cannot say another,
+        // or which pads the component exposes would depend on solve order.
+        if let Some(ctx) = eval.context_value() {
+            for p in &periphs {
+                let Some(axis) = p.unless.as_deref() else {
+                    continue;
+                };
+                let on = config_truthy(&config, axis);
+                let part = &scopes[p.part_idx];
+                if let Some(before) = ctx.record_config_axis(part, axis, on)
+                    && before != on
+                {
+                    let whose = if part.is_empty() {
+                        "this part".to_owned()
+                    } else {
+                        format!("`{part}`")
+                    };
+                    return Err(anyhow::anyhow!(
+                        "pin_solve: config axis `{axis}` was {before} for {whose} in an earlier \
+                         solve and is {on} here; a part is configured once"
+                    ));
+                }
+            }
+        }
         let mut claimed_instances: HashSet<(String, String)> = HashSet::new();
         let mut claimed_pads: HashSet<(usize, String)> = HashSet::new();
         if let Some(ctx) = eval.context_value() {
@@ -2489,12 +2619,12 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
         // (part, unit names, members as (request, unit), spare units)
         type ClusterClass = (String, HashSet<String>, Vec<(String, String)>, Vec<String>);
         // Members grouped by (part, class key).
-        type Grouped = Vec<((String, String), Vec<(String, String)>)>;
+        type Grouped<K> = Vec<((String, K), Vec<(String, String)>)>;
         let mut pool_classes: Vec<PoolClass> = Vec::new();
         let mut cluster_classes: Vec<ClusterClass> = Vec::new();
         {
             // Keyed by part too: two components may hold a pool of one name.
-            let mut by_pool: Grouped = Vec::new();
+            let mut by_pool: Grouped<String> = Vec::new();
             for (i, r) in reqs.iter().enumerate() {
                 // A lock with pins removes the request from the swap freedom;
                 // a bare lock=True constrains nothing and swaps normally.
@@ -2538,7 +2668,7 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                 pool_classes.push((part, pool, rebind, members, spares));
             }
 
-            let mut by_cluster: Grouped = Vec::new();
+            let mut by_cluster: Grouped<ProvidesKey> = Vec::new();
             for (i, r) in reqs.iter().enumerate() {
                 if r.lock && !r.prefer.is_empty() {
                     continue;
@@ -2637,8 +2767,8 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
         if let Some(ctx) = eval.context_value() {
             // Pin and unit names belong to a part. A prior entry built on
             // silicon this solve never touched keeps its freedom verbatim.
-            // These names are pin_solve's own. A value it cannot read would be
-            // dropped without a word, so say so instead.
+            // Belt and braces with the builtin's own refusal: a value this
+            // solve cannot read would be dropped without a word.
             let prior = |key: &str, object: bool| -> anyhow::Result<Option<serde_json::Value>> {
                 let module = ctx.module();
                 let Some(v) = module.properties().get(key) else {
@@ -2848,12 +2978,9 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
             heap.alloc(serde_json::to_string_pretty(&property_swaps).unwrap_or_default()),
         );
 
-        // Candidate pins no request claimed, in this solve or any earlier one:
-        // the component wires them as intentionally open (or reuses them),
-        // without re-listing them.
-        // Pads no request claimed, per part, for `pin_map` to tie off. Kept
-        // cumulative: a module may solve one part over several tables, and an
-        // earlier table's unclaimed pads are still the component's to wire.
+        // Every pad this part exposes, per part, for `pin_map` to tie off what
+        // no request holds. Kept cumulative and whole: a module may solve one
+        // part over several tables, and a re-solve hands pads back.
         if let Some(ctx) = eval.context_value() {
             for (i, _) in part_names.iter().enumerate() {
                 let exposed = periphs
@@ -2870,15 +2997,14 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                     .flat_map(|(_, cands)| cands.iter())
                     .map(|c| c.name.clone());
                 let mut v: Vec<String> = ctx
-                    .free_pads(&scopes[i])
+                    .exposed_pads(&scopes[i])
                     .into_iter()
                     .chain(exposed)
-                    .filter(|n| !used_pads.contains(&(i, n.clone())))
                     .collect::<HashSet<_>>()
                     .into_iter()
                     .collect();
                 v.sort();
-                ctx.record_free_pads(scopes[i].clone(), v);
+                ctx.record_exposed_pads(scopes[i].clone(), v);
             }
         }
 
@@ -2936,7 +3062,7 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
             if v.is_empty() {
                 v = eval
                     .context_value()
-                    .map(|ctx| ctx.free_pad_scopes())
+                    .map(|ctx| ctx.exposed_pad_scopes())
                     .unwrap_or_default();
             }
             v
@@ -3063,13 +3189,14 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                 ),
             );
         }
-        // Pads this part exposes that no request took are intentionally open,
+        // Pads this part exposes that no request holds are intentionally open,
         // so one call yields the component's whole pin table.
         if let Some(scope) = want_part
             && let Some(ctx) = eval.context_value()
         {
-            for pad in ctx.free_pads(scope) {
-                if seen.insert(pad.clone()) {
+            let held = ctx.claimed_pins(scope);
+            for pad in ctx.exposed_pads(scope) {
+                if !held.contains(&pad) && seen.insert(pad.clone()) {
                     let open = crate::lang::net::alloc_open_net(eval);
                     out.push((heap.alloc(pad.as_str()), open));
                 }
@@ -3200,7 +3327,10 @@ mod tests {
         record(&mut c, "LED", "som.zen", som.clone(), 9, "PA7");
         record(&mut c, "LED", "som.zen", som, 9, "PA7");
 
-        assert!(matches!(c.claim(&[9], &leaf, "LED"), Claimed::Yes(..)));
+        assert!(matches!(
+            c.claim(&[9], &leaf, "LED", &mut |_| true),
+            Claimed::Yes(..)
+        ));
         let left = c.unconsumed_hard();
         assert!(left.is_empty(), "got {left:?}");
     }
@@ -3216,15 +3346,15 @@ mod tests {
         let mut c = PinConstraints::default();
         record(&mut c, "LED", "som.zen", som, 9, "PA7");
         let took = |c: &mut PinConstraints, who: &[String]| {
-            matches!(c.claim(&[9], who, "LED"), Claimed::Yes(..))
+            matches!(c.claim(&[9], who, "LED", &mut |_| true), Claimed::Yes(..))
         };
         assert!(took(&mut c, &leaf), "first solve takes it");
         assert!(!took(&mut c, &other), "a sibling may not");
-        assert!(
-            matches!(c.take_ambiguous(), Some(Ambiguity::Contended { .. })),
-            "and is told rather than left to solve unconstrained"
-        );
         assert!(took(&mut c, &leaf), "the same solve may take it again");
+        // Both are named, sorted, whichever of them ran first.
+        let contended = c.contended();
+        assert_eq!(contended.len(), 1, "got {contended:?}");
+        assert_eq!(contended[0].3, ["SOM.U1", "SOM.U2"], "got {contended:?}");
         assert!(c.unconsumed_hard().is_empty());
     }
 
@@ -3241,7 +3371,10 @@ mod tests {
         record(&mut c, "B", "som.zen", som, 9, "PA2");
 
         assert!(
-            matches!(c.claim(&[9], &leaf, "LED"), Claimed::Ambiguous),
+            matches!(
+                c.claim(&[9], &leaf, "LED", &mut |_| true),
+                Claimed::Ambiguous
+            ),
             "ambiguous, no guess"
         );
         let Some(Ambiguity::Entries { input, names }) = c.take_ambiguous() else {

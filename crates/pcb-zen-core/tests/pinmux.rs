@@ -945,6 +945,13 @@ fn reserved_interface_kwargs_misuse_mentions_reservation() {
 
     let result = eval_with_fixtures("B = interface(X = Net, implies = Net)\n");
     assert_fails_with(&result, "reserved for capability metadata");
+
+    // A field slipped into the container form is caught by its own contents.
+    let result = eval_with_fixtures("C = interface(X = Net, attrs = {\"a\": Net})\n");
+    assert_fails_with(&result, "must map to a physical value type");
+
+    let result = eval_with_fixtures("D = interface(X = Net, implies = [Net])\n");
+    assert_fails_with(&result, "entries must be interface types");
 }
 
 #[test]
@@ -1045,6 +1052,232 @@ Mcu(name = "M1", IO0 = at(Net("LED"), "PA10", soft = True))
         ),
     ]);
     assert_ok(&result);
+}
+
+#[test]
+fn a_factory_built_capability_is_fresh_per_binding() {
+    // An interface() minted inside a helper is keyed to the module that binds
+    // it, so two callers hold two capabilities. The solve says so instead of
+    // quietly failing to match.
+    let result = eval_zen(vec![
+        (
+            "/mk.zen".to_string(),
+            "def mk():\n    return interface(PIN = Net)\n".to_string(),
+        ),
+        (
+            "/chip.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "pool")
+load("./mk.zen", "mk")
+Cap = mk()
+PERIPHS = [pool("GPIO", provides = [Cap], pins = ["PA0", "PA1"])]
+"#
+            .to_string(),
+        ),
+        (
+            "/test.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "pin_request", "pin_solve")
+load("./mk.zen", "mk")
+load("./chip.zen", "PERIPHS")
+Cap = mk()
+r = pin_solve(PERIPHS, [pin_request("A", Cap)])
+"#
+            .to_string(),
+        ),
+    ]);
+    assert_fails_with(
+        &result,
+        "provides a different Cap — capability types are per interface() declaration",
+    );
+}
+
+#[test]
+fn an_unnamed_factory_capability_stands_on_its_own() {
+    // No top-level binding to key on, so each interface() call is its own
+    // capability — two widths from one helper never pass for each other.
+    let result = eval_zen(vec![
+        (
+            "/mk.zen".to_string(),
+            "def mk(n):\n    return interface(PIN = Net, width = field(int, default = n))\n"
+                .to_string(),
+        ),
+        (
+            "/test.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "pool", "pin_request", "pin_solve")
+load("./mk.zen", "mk")
+CAPS = [mk(8), mk(16)]
+P = [pool("GPIO", provides = [CAPS[0]], pins = ["PA0", "PA1"])]
+r = pin_solve(P, [pin_request("A", CAPS[1])])
+"#
+            .to_string(),
+        ),
+    ]);
+    assert_fails_with(&result, "capability types are per interface() declaration");
+}
+
+/// The module makes a pin mandatory; the caller only wishes for another.
+fn soft_over_lock(arg: &str, module: &str) -> WithDiagnostics<EvalOutput> {
+    eval_zen(vec![
+        ("/ifaces.zen".to_string(), IFACES.to_string()),
+        ("/mcu.zen".to_string(), module.to_string()),
+        (
+            "/test.zen".to_string(),
+            format!(
+                r#"
+load("@stdlib/pinmux.zen", "at")
+load("./ifaces.zen", "Gpio", "Uart")
+Mcu = Module("/mcu.zen")
+Mcu(name = "U1", {arg})
+"#
+            ),
+        ),
+    ])
+}
+
+fn solved_pin(result: &WithDiagnostics<EvalOutput>) -> String {
+    assert_ok(result);
+    result
+        .output
+        .as_ref()
+        .and_then(|o| {
+            o.module_tree()
+                .values()
+                .filter_map(|m| m.properties().get("led"))
+                .filter_map(|v| v.to_value().unpack_str().map(|s| s.to_owned()))
+                .next()
+        })
+        .unwrap_or_default()
+}
+
+const LOCKED_GPIO: &str = r#"
+load("@stdlib/pinmux.zen", "pool", "pin_request", "pin_solve")
+load("./ifaces.zen", "Gpio")
+P = pool("GPIO", provides = [Gpio], pins = ["PA5", "PA6"])
+LED = io(Gpio)
+res = pin_solve([P], [pin_request("LED", Gpio, prefer = ["PA6"], lock = True)])
+builtin.add_property("led", res["assignment"]["LED"]["signals"]["PIN"]["pin"])
+"#;
+
+#[test]
+fn a_soft_at_cannot_void_a_lock_the_module_set() {
+    // A wish must not achieve what a hard at() could not: PA6 is mandatory,
+    // so wishing elsewhere drops the wish, never the requirement.
+    let none = soft_over_lock("LED = Gpio(\"L\")", LOCKED_GPIO);
+    assert_eq!(solved_pin(&none), "PA6", "the module's own pin");
+
+    let absent = soft_over_lock("LED = at(Gpio(\"L\"), \"PA9\", soft = True)", LOCKED_GPIO);
+    assert_eq!(
+        solved_pin(&absent),
+        "PA6",
+        "a wish for a pad the part lacks"
+    );
+
+    let elsewhere = soft_over_lock("LED = at(Gpio(\"L\"), \"PA5\", soft = True)", LOCKED_GPIO);
+    assert_eq!(
+        solved_pin(&elsewhere),
+        "PA6",
+        "a wish for another of its pads"
+    );
+
+    // A hard at() still overrides, as documented.
+    let hard = soft_over_lock("LED = at(Gpio(\"L\"), \"PA5\")", LOCKED_GPIO);
+    assert_eq!(solved_pin(&hard), "PA5", "a hard caller at() wins");
+}
+
+const LOCKED_UART: &str = r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
+load("./ifaces.zen", "Uart")
+U = peripheral("U", provides = [Uart], rebind = "fixed",
+    signals = {"TX": [pin("PA5"), pin("PA6")], "RX": [pin("PA7")]})
+LED = io(Uart)
+res = pin_solve([U], [pin_request("LED", Uart, prefer = {"TX": ["PA5", "PA6"]}, lock = True)])
+builtin.add_property("led", res["assignment"]["LED"]["signals"]["TX"]["pin"])
+"#;
+
+#[test]
+fn a_soft_at_still_chooses_within_the_locked_pins() {
+    // Both pads are mandatory-set members, so the wish is what decides.
+    let none = soft_over_lock("LED = Uart(\"L\")", LOCKED_UART);
+    assert_eq!(solved_pin(&none), "PA5");
+
+    let wish = soft_over_lock(
+        "LED = at(Uart(\"L\"), {\"TX\": [\"PA6\"]}, soft = True)",
+        LOCKED_UART,
+    );
+    assert_eq!(solved_pin(&wish), "PA6", "the wish picks among them");
+}
+
+#[test]
+fn an_io_that_consumed_an_at_records_the_bare_value() {
+    // Once io() has handed the constraint to the store, the module keeps what
+    // the caller meant to connect — a PinAt left here would reach anything
+    // that reads module inputs.
+    let result = eval_zen(vec![
+        ("/ifaces.zen".to_string(), IFACES.to_string()),
+        (
+            "/mcu.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "pool", "pin_request", "pin_solve")
+load("./ifaces.zen", "Gpio")
+P = pool("GPIO", provides = [Gpio], pins = ["PA0", "PA1"])
+LED = io(Gpio)
+builtin.add_property("kind", str(type(LED)))
+res = pin_solve([P], [pin_request("LED", Gpio)])
+builtin.add_property("led", res["assignment"]["LED"]["signals"]["PIN"]["pin"])
+"#
+            .to_string(),
+        ),
+        (
+            "/test.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "at")
+load("./ifaces.zen", "Gpio")
+Mcu = Module("/mcu.zen")
+Mcu(name = "U1", LED = at(Gpio("L"), "PA1"))
+"#
+            .to_string(),
+        ),
+    ]);
+    let inputs: Vec<String> = result
+        .output
+        .as_ref()
+        .map(|o| {
+            o.module_tree()
+                .values()
+                .flat_map(|m| {
+                    m.inputs()
+                        .iter()
+                        .map(|(k, v)| format!("{k}:{}", v.to_value().get_type()))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_ok(&result);
+    assert_eq!(inputs, ["LED:InterfaceValue"], "got {inputs:?}");
+}
+
+#[test]
+fn a_part_cannot_be_configured_two_ways() {
+    // The tie-off list carries pads across solves, so an axis that flipped
+    // would make the component's pin table depend on which solve ran last.
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve", "pin_map")
+load("./ifaces.zen", "Gpio")
+A = peripheral("A", provides = [Gpio], rebind = "fixed",
+    signals = {"PIN": [pin("PA0")]}, unless = "wifi")
+B = peripheral("B", provides = [Gpio], rebind = "fixed", signals = {"PIN": [pin("PA1")]})
+r1 = pin_solve([A, B], [pin_request("X", Gpio, instance = "B")], config = {"wifi": False})
+r2 = pin_solve([A, B], [], config = {"wifi": True})
+"#,
+    );
+    assert_fails_with(
+        &result,
+        "config axis `wifi` was false for this part in an earlier solve",
+    );
 }
 
 #[test]
@@ -1901,6 +2134,70 @@ Mcu(name = "U1", debug_uart = at(Uart("BUS"), ["PA9", "PA10"]))
 }
 
 #[test]
+fn a_forwarded_at_goes_to_the_request_that_can_take_it() {
+    // The pinned rail reaches both requests, but only the GPIO one has PA7.
+    // Claiming by declaration order would lock the ADC to a pad it has no
+    // candidate for and fail a design that has an answer.
+    let result = eval_zen(vec![
+        ("/ifaces.zen".to_string(), IFACES.to_string()),
+        (
+            "/mcu.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
+load("./ifaces.zen", "Gpio", "AdcIn")
+G = peripheral("G", provides = [Gpio], rebind = "fixed",
+    signals = {"PIN": [pin("PA5"), pin("PA7")]})
+A = peripheral("A", provides = [AdcIn], rebind = "fixed", signals = {"IN": [pin("PA1")]})
+ADC = io(AdcIn)
+LED = io(Gpio)
+res = pin_solve([G, A], [pin_request("ADC", AdcIn), pin_request("LED", Gpio)])
+builtin.add_property("led", res["assignment"]["LED"]["signals"]["PIN"]["pin"])
+builtin.add_property("adc", res["assignment"]["ADC"]["signals"]["IN"]["pin"])
+"#
+            .to_string(),
+        ),
+        (
+            "/som.zen".to_string(),
+            r#"
+load("./ifaces.zen", "Gpio", "AdcIn")
+RAIL = io(Gpio)
+Mcu = Module("./mcu.zen")
+Mcu(name = "U1", LED = RAIL, ADC = AdcIn(IN = RAIL.PIN))
+"#
+            .to_string(),
+        ),
+        (
+            "/test.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "at")
+load("./ifaces.zen", "Gpio")
+Som = Module("./som.zen")
+Som(name = "SOM", RAIL = at(Gpio("RAIL_NET"), "PA7"))
+"#
+            .to_string(),
+        ),
+    ]);
+    assert_ok(&result);
+    let props: Vec<String> = result
+        .output
+        .as_ref()
+        .map(|o| {
+            o.module_tree()
+                .values()
+                .flat_map(|m| {
+                    ["led", "adc"].iter().filter_map(move |p| {
+                        m.properties()
+                            .get(*p)
+                            .and_then(|v| v.to_value().unpack_str().map(|s| format!("{p}={s}")))
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(props, ["led=PA7", "adc=PA1"], "got {props:?}");
+}
+
+#[test]
 fn a_forwarded_at_wanted_by_two_children_is_reported() {
     // Both children solve on the pinned net. Children elaborate in parallel,
     // so first-come-wins would hand the pin to a different one each build.
@@ -1940,7 +2237,13 @@ Som(name = "SOM", LED = at(Gpio("LED_NET"), "PA7"))
             .to_string(),
         ),
     ]);
-    assert_fails_with(&result, "already held by");
+    assert_fails_with(
+        &result,
+        "is wanted by the solves of `SOM.U1`, `SOM.U2`: a pin name answers for one component",
+    );
+    // The report hangs off the at() itself, not off whichever solve lost.
+    let t = diag_text(&result);
+    assert!(t.contains("pinmux.contended_at"), "got {t}");
 }
 
 #[test]
@@ -3030,6 +3333,18 @@ r = pin_solve([P], [pin_request("A", Gpio)])
 "#,
     );
     assert_fails_with(&result, "written by pin_solve");
+
+    // ...and after it, where the merge would have kept no trace at all.
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "pool", "pin_request", "pin_solve")
+load("./ifaces.zen", "Gpio")
+P = pool("GPIO", provides = [Gpio], pins = ["PA0", "PA1"])
+r = pin_solve([P], [pin_request("A", Gpio)])
+builtin.add_property("swap_classes", "mine")
+"#,
+    );
+    assert_fails_with(&result, "written by pin_solve");
 }
 
 #[test]
@@ -3202,6 +3517,29 @@ pin_solve([P2], [pin_request("B", Gpio)])
 
 m = pin_map(r1["assignment"], {"A": Net("NA")})
 check(sorted(m.keys()) == ["PA0", "PA1"], "U1 keeps only its own, got " + str(sorted(m.keys())))
+"#,
+    );
+    assert_ok(&result);
+}
+
+#[test]
+fn a_pad_a_resolve_gave_back_is_tied_off_again() {
+    // R moves from P1's table to P2's. Nobody holds PA0 any more, and the
+    // component still has to wire it, though the later table never named it.
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve", "pin_map")
+load("./ifaces.zen", "Gpio")
+P1 = peripheral("P1", part = "U1", provides = [Gpio], rebind = "fixed",
+    signals = {"PIN": [pin("PA0"), pin("PA1")]})
+P2 = peripheral("P2", part = "U1", provides = [Gpio], rebind = "fixed",
+    signals = {"PIN": [pin("PA2"), pin("PA3")]})
+r1 = pin_solve([P1], [pin_request("R", Gpio)])
+r2 = pin_solve([P2], [pin_request("R", Gpio)])
+
+m = pin_map(r2["assignment"], {"R": Net("NA")}, part = "U1")
+check(sorted(m.keys()) == ["PA0", "PA1", "PA2", "PA3"],
+      "the whole pin table of U1, got " + str(sorted(m.keys())))
 "#,
     );
     assert_ok(&result);

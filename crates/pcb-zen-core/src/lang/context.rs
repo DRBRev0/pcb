@@ -100,10 +100,17 @@ pub struct ContextValue<'v> {
     #[allocative(skip)]
     #[serde(skip)]
     if_connected_served: RefCell<std::collections::HashSet<String>>,
-    /// Pads no request claimed, per part scope, for `pin_map` to tie off.
+    /// Every pad a part exposes, per part scope. Kept whole rather than net
+    /// of the claims: a re-solve releases pads, and what is free is only
+    /// known when `pin_map` asks.
     #[allocative(skip)]
     #[serde(skip)]
-    free_pads: RefCell<std::collections::HashMap<String, Vec<String>>>,
+    exposed_pads: RefCell<std::collections::HashMap<String, Vec<String>>>,
+    /// Truthiness each `unless` axis had for a part, so a design says once
+    /// whether a gated peripheral is there.
+    #[allocative(skip)]
+    #[serde(skip)]
+    config_axes: RefCell<std::collections::HashMap<(String, String), bool>>,
     /// Net (id, name) each physical pin has been mapped to by `pin_map`,
     /// keyed by `(part scope, pin)`: two components may share pin names.
     #[allocative(skip)]
@@ -196,7 +203,8 @@ impl<'v> ContextValue<'v> {
             pending_children: RefCell::new(Vec::new()),
             pin_claims: RefCell::new(std::collections::HashMap::new()),
             if_connected_served: RefCell::new(std::collections::HashSet::new()),
-            free_pads: RefCell::new(std::collections::HashMap::new()),
+            exposed_pads: RefCell::new(std::collections::HashMap::new()),
+            config_axes: RefCell::new(std::collections::HashMap::new()),
             mapped_pins: RefCell::new(std::collections::HashMap::new()),
         }
     }
@@ -282,23 +290,41 @@ impl<'v> ContextValue<'v> {
         v
     }
 
-    pub(crate) fn record_free_pads(&self, scope: String, pads: Vec<String>) {
-        self.free_pads.borrow_mut().insert(scope, pads);
+    pub(crate) fn record_exposed_pads(&self, scope: String, pads: Vec<String>) {
+        self.exposed_pads.borrow_mut().insert(scope, pads);
     }
 
     /// Every part scope a `pin_solve` has run over in this module, sorted.
-    pub(crate) fn free_pad_scopes(&self) -> Vec<String> {
-        let mut v: Vec<String> = self.free_pads.borrow().keys().cloned().collect();
+    pub(crate) fn exposed_pad_scopes(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.exposed_pads.borrow().keys().cloned().collect();
         v.sort();
         v
     }
 
-    pub(crate) fn free_pads(&self, scope: &str) -> Vec<String> {
-        self.free_pads
+    pub(crate) fn exposed_pads(&self, scope: &str) -> Vec<String> {
+        self.exposed_pads
             .borrow()
             .get(scope)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Pads a live claim holds in `scope`. A superseded solve's pads are not
+    /// among them, so they are free to be tied off again.
+    pub(crate) fn claimed_pins(&self, scope: &str) -> std::collections::HashSet<String> {
+        self.pin_claims
+            .borrow()
+            .values()
+            .filter(|c| c.scope == scope)
+            .flat_map(|c| c.pins.iter().cloned())
+            .collect()
+    }
+
+    /// Record what `axis` meant for `scope`, returning what it meant before.
+    pub(crate) fn record_config_axis(&self, scope: &str, axis: &str, on: bool) -> Option<bool> {
+        self.config_axes
+            .borrow_mut()
+            .insert((scope.to_owned(), axis.to_owned()), on)
     }
 
     pub(crate) fn record_pin_map(&self, scope: String, pin: String, net: (u64, String)) {
