@@ -213,7 +213,6 @@ impl PinConstraints {
         self.ambiguous.take()
     }
 
-    /// Hard constraints no solve claimed, as `(module, input)`, sorted.
     /// Hard constraints no solve claimed, as `(module, input, span)`, sorted.
     #[allow(clippy::type_complexity)]
     pub(crate) fn unconsumed_hard(
@@ -1278,8 +1277,7 @@ fn parse_pin_spec<'v>(ctx: &str, v: Value<'v>, heap: Heap<'v>) -> anyhow::Result
     Ok((any, Vec::new()))
 }
 
-/// `(inner, lock, soft)` of an `at()` wrapper (mutable or frozen), if `v` is one.
-/// `(inner, lock, soft, site, span)` of an `at()` wrapper.
+/// `(inner, lock, soft, site, span)` of an `at()` wrapper, if `v` is one.
 #[allow(clippy::type_complexity)]
 fn unpack_pin_at_full<'v>(
     v: Value<'v>,
@@ -1316,6 +1314,7 @@ fn unpack_pin_at_full<'v>(
     })
 }
 
+/// `(inner, lock, soft)` of an `at()` wrapper, dropping its call site.
 fn unpack_pin_at<'v>(v: Value<'v>) -> Option<(Value<'v>, PinLock, bool)> {
     if let Some(w) = v.downcast_ref::<PinAt<'v>>() {
         Some((
@@ -2072,6 +2071,14 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
             })
             .unwrap_or_default();
         reqs.retain(|r| !r.if_connected || connected.contains(&r.name));
+        // A config() declared after this solve is not in `configs` yet, so the
+        // gate may have read one as a connection; the module records what it
+        // served and the check runs once its signature is complete.
+        if let Some(ctx) = eval.context_value() {
+            for r in reqs.iter().filter(|r| r.if_connected) {
+                ctx.record_if_connected(&r.name);
+            }
+        }
 
         // `at()` constraints override request-side prefer/lock. A request
         // pairs with the io() input of its name; the constraint rides on the
@@ -2722,10 +2729,12 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
         // Candidate pins no request claimed, in this solve or any earlier one:
         // the component wires them as intentionally open (or reuses them),
         // without re-listing them.
-        // Pads no request claimed, recorded per part for `pin_map` to tie off.
+        // Pads no request claimed, per part, for `pin_map` to tie off. Kept
+        // cumulative: a module may solve one part over several tables, and an
+        // earlier table's unclaimed pads are still the component's to wire.
         if let Some(ctx) = eval.context_value() {
             for (i, _) in part_names.iter().enumerate() {
-                let mut v: Vec<String> = periphs
+                let exposed = periphs
                     .iter()
                     .filter(|p| p.part_idx == i)
                     // A pad only reachable through a disabled peripheral is not
@@ -2737,7 +2746,11 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                     })
                     .flat_map(|p| p.signals.iter())
                     .flat_map(|(_, cands)| cands.iter())
-                    .map(|c| c.name.clone())
+                    .map(|c| c.name.clone());
+                let mut v: Vec<String> = ctx
+                    .free_pads(&scopes[i])
+                    .into_iter()
+                    .chain(exposed)
                     .filter(|n| !used_pads.contains(&(i, n.clone())))
                     .collect::<HashSet<_>>()
                     .into_iter()

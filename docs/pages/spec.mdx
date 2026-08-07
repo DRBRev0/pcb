@@ -390,7 +390,7 @@ demand: the interface type *is* the request.
 | `prefer` | no | Pins the solver favors: a name/list of names, or a `{signal: name-or-list}` dict |
 | `lock` | no | Make `prefer` mandatory instead of preferred |
 | `direction` | no | `"input"` or `"output"`; `"output"` excludes `input_only` pins |
-| `if_connected` | no | Serve the request only when the caller connected the module input of the same name; pair with `io(Iface, optional = True)`. A `config()` of that name does not count as a connection, provided it is declared before the `pin_solve` |
+| `if_connected` | no | Serve the request only when the caller connected the module input of the same name; pair with `io(Iface, optional = True)`. A `config()` of that name does not count as a connection; declare it above the `pin_solve` or the build reports the collision |
 | `bind` | no | The connected value, carried on the request itself (dict-of-roles pattern) |
 
 **`pin_solve(peripherals, requests, config={}, previous=None)`** — solve the

@@ -1589,6 +1589,39 @@ impl EvalContext {
 
             match eval_result {
                 Ok(_) => {
+                    // `if_connected` reads the caller's inputs, which include
+                    // config values; one declared after the solve was not yet
+                    // known to be a config. The signature is complete now.
+                    if let Some(ctx) = module
+                        .extra_value()
+                        .and_then(|e| e.downcast_ref::<ContextValue>())
+                    {
+                        let path = self
+                            .config
+                            .source_path
+                            .clone()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned();
+                        for name in ctx.if_connected_served() {
+                            if ctx
+                                .module()
+                                .signature()
+                                .iter()
+                                .any(|p| p.is_config && p.name == name)
+                            {
+                                diagnostics.push(Diagnostic::categorized(
+                                    &path,
+                                    &format!(
+                                        "pin_request `{name}` was served because the caller passed `{name}`, but that input is a config(), not a connection — declare the config() above the pin_solve, or rename one of them"
+                                    ),
+                                    "pinmux.if_connected_config",
+                                    EvalSeverity::Error,
+                                ));
+                            }
+                        }
+                    }
+
                     let frozen_module = {
                         let _span = info_span!("freeze_module").entered();
                         module

@@ -2832,3 +2832,97 @@ Mcu(name = "U1", gpio = {"LED": at(Gpio("L"), "PA8"), "TYPO": at(Gpio("T"), "PA1
         "at() pin constraint on input `TYPO` was never consumed",
     );
 }
+
+#[test]
+fn free_pads_accumulate_across_solves_of_one_part() {
+    // Two tables, one anonymous part: the second solve must not erase the
+    // first table's unclaimed pads, or they end up wired nowhere.
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve", "pin_map")
+load("./ifaces.zen", "Gpio")
+P1 = peripheral("P1", provides = [Gpio], rebind = "fixed",
+    signals = {"PIN": [pin("PA0"), pin("PA1")]})
+P2 = peripheral("P2", provides = [Gpio], rebind = "fixed",
+    signals = {"PIN": [pin("PB0"), pin("PB1")]})
+r1 = pin_solve([P1], [pin_request("A", Gpio)])
+pin_solve([P2], [pin_request("B", Gpio)])
+
+m = pin_map(r1["assignment"], {"A": Net("NA")})
+check("PA1" in m, "P1's own unclaimed pad survives the second solve")
+check(not ("PB0" in m), "a pad the second solve claimed is not tied off")
+"#,
+    );
+    assert_ok(&result);
+}
+
+#[test]
+fn declared_parts_keep_their_free_pads_apart() {
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve", "pin_map")
+load("./ifaces.zen", "Gpio")
+P1 = peripheral("P1", part = "U1", provides = [Gpio], rebind = "fixed",
+    signals = {"PIN": [pin("PA0"), pin("PA1")]})
+P2 = peripheral("P2", part = "U2", provides = [Gpio], rebind = "fixed",
+    signals = {"PIN": [pin("PB0"), pin("PB1")]})
+r1 = pin_solve([P1], [pin_request("A", Gpio)])
+pin_solve([P2], [pin_request("B", Gpio)])
+
+m = pin_map(r1["assignment"], {"A": Net("NA")})
+check(sorted(m.keys()) == ["PA0", "PA1"], "U1 keeps only its own, got " + str(sorted(m.keys())))
+"#,
+    );
+    assert_ok(&result);
+}
+
+#[test]
+fn a_named_part_solved_over_two_subsets_keeps_every_pad() {
+    // One component, two tables: pads reachable only through the table absent
+    // from the later solve must still reach the component's pin dict.
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve", "pin_map")
+load("./ifaces.zen", "Gpio")
+P1 = peripheral("P1", part = "U1", provides = [Gpio], rebind = "fixed",
+    signals = {"PIN": [pin("PA0"), pin("PA1")]})
+P2 = peripheral("P2", part = "U1", provides = [Gpio], rebind = "fixed",
+    signals = {"PIN": [pin("PA2"), pin("PA3")]})
+r1 = pin_solve([P1], [pin_request("A", Gpio)])
+pin_solve([P2], [pin_request("B", Gpio)])
+
+m = pin_map(r1["assignment"], {"A": Net("NA")})
+check(sorted(m.keys()) == ["PA0", "PA1", "PA3"],
+      "every unclaimed pad of U1 is tied off, got " + str(sorted(m.keys())))
+"#,
+    );
+    assert_ok(&result);
+}
+
+#[test]
+fn if_connected_rejects_a_config_declared_after_the_solve() {
+    // `configs` only knows declarations seen so far, so the gate can read a
+    // later config as a connection — caught once the signature is complete.
+    let result = eval_zen(vec![
+        ("/ifaces.zen".to_string(), IFACES.to_string()),
+        (
+            "/mcu.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "pool", "pin_request", "pin_solve")
+load("./ifaces.zen", "Gpio")
+P = pool("GPIO", provides = [Gpio], pins = ["PA0"])
+pin_solve([P], [pin_request("gpio", Gpio, if_connected = True)])
+gpio = config("gpio", str)
+"#
+            .to_string(),
+        ),
+        (
+            "/test.zen".to_string(),
+            "Mcu = Module(\"./mcu.zen\")\nMcu(name = \"U1\", gpio = \"hello\")\n".to_string(),
+        ),
+    ]);
+    assert_fails_with(
+        &result,
+        "was served because the caller passed `gpio`, but that input is a config()",
+    );
+}

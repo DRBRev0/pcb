@@ -96,6 +96,10 @@ pub struct ContextValue<'v> {
     #[allocative(skip)]
     #[serde(skip)]
     pin_claims: RefCell<std::collections::HashMap<String, PinClaim>>,
+    /// Requests served by the `if_connected` gate, for the post-eval check.
+    #[allocative(skip)]
+    #[serde(skip)]
+    if_connected_served: RefCell<std::collections::HashSet<String>>,
     /// Pads no request claimed, per part scope, for `pin_map` to tie off.
     #[allocative(skip)]
     #[serde(skip)]
@@ -191,6 +195,7 @@ impl<'v> ContextValue<'v> {
             diagnostics: RefCell::new(Vec::new()),
             pending_children: RefCell::new(Vec::new()),
             pin_claims: RefCell::new(std::collections::HashMap::new()),
+            if_connected_served: RefCell::new(std::collections::HashSet::new()),
             free_pads: RefCell::new(std::collections::HashMap::new()),
             mapped_pins: RefCell::new(std::collections::HashMap::new()),
         }
@@ -251,6 +256,20 @@ impl<'v> ContextValue<'v> {
             .borrow()
             .get(&(scope.to_owned(), pin.to_owned()))
             .cloned()
+    }
+
+    /// Requests `if_connected` served because the caller supplied an input of
+    /// that name, checked against the finished signature once it is complete.
+    pub(crate) fn record_if_connected(&self, name: &str) {
+        self.if_connected_served
+            .borrow_mut()
+            .insert(name.to_owned());
+    }
+
+    pub(crate) fn if_connected_served(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.if_connected_served.borrow().iter().cloned().collect();
+        v.sort();
+        v
     }
 
     pub(crate) fn record_free_pads(&self, scope: String, pads: Vec<String>) {
