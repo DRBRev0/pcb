@@ -18,10 +18,18 @@ and this project adheres to Semantic Versioning (https://semver.org/spec/v2.0.0.
 - Added `interface(attrs = {...})` to declare the capability-attribute vocabulary peripheral attrs are validated against; the stdlib interfaces now declare `clk_max`/`baud_max`/`bitrate_max`/`vio` where applicable.
 - Added the stdlib single-signal capability interfaces `AdcIn` and `GpioPin` for ADC inputs and GPIO pools.
 - `pin_solve` now warns when a request's pin-combination enumeration hits the internal cap on wide pin matrices, since the chosen assignment may then be suboptimal.
+- `fab-panel create` now automatically balances copper in the gutters between placed assembly panels.
+
+### Fixed
+
+- Pad shapes with padstack offsets now land at the correct position on rotated pads across all IPC-2581 outputs.
+
+## [0.4.22] - 2026-08-04
 
 ### Changed
 
 - `pcb doc` now renders Markdown list items as styled bullets instead of literal hyphens.
+- Removed API authentication via AWS credentials.
 
 ### Fixed
 
@@ -1491,7 +1499,8 @@ Tvs(package="DO-214AA", direction="Unidirectional", reverse_standoff_voltage="24
 - Error on invalid type passed to `io()`
 - Format the auto-generated component .zen files
 
-[Unreleased]: https://github.com/diodeinc/pcb/compare/v0.4.21...HEAD
+[Unreleased]: https://github.com/diodeinc/pcb/compare/v0.4.22...HEAD
+[0.4.22]: https://github.com/diodeinc/pcb/compare/v0.4.21...v0.4.22
 [0.4.21]: https://github.com/diodeinc/pcb/compare/v0.4.20...v0.4.21
 [0.4.20]: https://github.com/diodeinc/pcb/compare/v0.4.19...v0.4.20
 [0.4.19]: https://github.com/diodeinc/pcb/compare/v0.4.18...v0.4.19
