@@ -286,13 +286,13 @@ fn builtin_methods(methods: &mut MethodsBuilder) {
         #[starlark(require = pos)] value: Value<'v>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<NoneType> {
-        crate::lang::module::warn_legacy_module_dnp_add_property(eval, &name);
         if crate::lang::pinmux::RESULT_PROPERTIES.contains(&name.as_str()) {
             return Err(starlark::Error::new_other(anyhow::anyhow!(
                 "module property `{name}` is written by pin_solve; record your own data under \
                  another name"
             )));
         }
+        crate::lang::module::warn_legacy_module_dnp_add_property(eval, &name);
         eval.add_property(&name, value);
         Ok(NoneType)
     }

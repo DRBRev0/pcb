@@ -1278,6 +1278,37 @@ r2 = pin_solve([A, B], [], config = {"wifi": True})
         &result,
         "config axis `wifi` was false for this part in an earlier solve",
     );
+
+    // …even when the later table leaves the gated peripheral out but still
+    // speaks about its axis.
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
+load("./ifaces.zen", "Gpio")
+A = peripheral("A", provides = [Gpio], rebind = "fixed",
+    signals = {"PIN": [pin("PA0")]}, unless = "wifi")
+B = peripheral("B", provides = [Gpio], rebind = "fixed", signals = {"PIN": [pin("PA1")]})
+pin_solve([A, B], [pin_request("X", Gpio, instance = "B")], config = {"wifi": False})
+pin_solve([B], [], config = {"wifi": True})
+"#,
+    );
+    assert_fails_with(&result, "config axis `wifi` was false for this part");
+
+    // Said the same way twice, the gated pad stays out of the tie-off.
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve", "pin_map")
+load("./ifaces.zen", "Gpio")
+A = peripheral("A", provides = [Gpio], rebind = "fixed",
+    signals = {"PIN": [pin("PA0")]}, unless = "wifi")
+B = peripheral("B", provides = [Gpio], rebind = "fixed", signals = {"PIN": [pin("PA1")]})
+r1 = pin_solve([A, B], [pin_request("X", Gpio, instance = "B")], config = {"wifi": True})
+r2 = pin_solve([A, B], [], config = {"wifi": True})
+m = pin_map(r1["assignment"], {"X": Net("N")})
+check(sorted(m.keys()) == ["PA1"], "the wifi pad stays out, got " + str(sorted(m.keys())))
+"#,
+    );
+    assert_ok(&result);
 }
 
 #[test]
@@ -1616,6 +1647,75 @@ builtin.add_property("led", res["assignment"]["LED"]["signals"]["PIN"]["pin"])
     assert_eq!(pin(&soft), "PA6", "the lock stands against a wish");
     let hard = solve("at(Gpio(\"D\"), \"PA5\")");
     assert_eq!(pin(&hard), "PA5", "a hard bound at() still overrides");
+}
+
+#[test]
+fn a_forwarded_at_on_a_taken_pad_is_reported_not_forced() {
+    // An earlier solve holds PA7, so no request here can honour the pinned
+    // pad. Judging one "usable" would lock it into an infeasible solve and
+    // blame the request; the constraint is what could not be met.
+    let result = eval_zen(vec![
+        ("/ifaces.zen".to_string(), IFACES.to_string()),
+        (
+            "/mcu.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pool", "pin_request", "pin_solve")
+load("./ifaces.zen", "Gpio", "AdcIn")
+G = pool("GPIO", provides = [Gpio], pins = ["PA5", "PA7"])
+A = peripheral("A", provides = [AdcIn], rebind = "fixed",
+    signals = {"IN": [pin("PA1"), pin("PA2")]})
+first = pin_solve([G, A], [pin_request("PRE", Gpio, prefer = ["PA7"], lock = True)])
+ADC = io(AdcIn)
+LED = io(Gpio)
+res = pin_solve([G, A], [pin_request("ADC", AdcIn), pin_request("LED", Gpio)])
+builtin.add_property("led", res["assignment"]["LED"]["signals"]["PIN"]["pin"])
+"#
+            .to_string(),
+        ),
+        (
+            "/som.zen".to_string(),
+            r#"
+load("./ifaces.zen", "Gpio", "AdcIn")
+RAIL = io(Gpio)
+Mcu = Module("./mcu.zen")
+Mcu(name = "U1", LED = RAIL, ADC = AdcIn(IN = RAIL.PIN))
+"#
+            .to_string(),
+        ),
+        (
+            "/test.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "at")
+load("./ifaces.zen", "Gpio")
+Som = Module("./som.zen")
+Som(name = "SOM", RAIL = at(Gpio("RAIL_NET"), "PA7"))
+"#
+            .to_string(),
+        ),
+    ]);
+    assert_fails_with(&result, "was never consumed");
+}
+
+#[test]
+fn an_at_on_a_component_pin_says_where_it_belongs() {
+    // The wrapper only means something on a module input; a pin sees a value
+    // it cannot read, and the message says so rather than naming a type.
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "at")
+Component(
+    name = "R1",
+    footprint = File("@kicad-footprints/Resistor_SMD.pretty/R_0402_1005Metric.kicad_mod"),
+    pin_defs = {"P1": "1", "P2": "2"},
+    pins = {"P1": at(Net("LED"), "PA10"), "P2": Net("GND")},
+    skip_bom = True,
+)
+"#,
+    );
+    assert_fails_with(
+        &result,
+        "at() constrains a module input, not a component pin",
+    );
 }
 
 #[test]
@@ -2374,6 +2474,32 @@ pin_solve(P, [pin_request("C", Uart2)])
 }
 
 #[test]
+fn a_shared_request_name_keeps_the_remap_guard() {
+    // Same shape as the guard above, but a second component also has a request
+    // named `COM`. The name no longer answers for one part — the entry does.
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "pin_map", "pin_request", "pin_solve", "pool")
+load("./stm32.zen", "PERIPHS")
+load("./ifaces.zen", "Uart", "Gpio")
+
+OTHER = pool("GPIO", part = "U2", provides = [Gpio], pins = ["PB0", "PB1"])
+BUS = Uart("BUS")
+LED = Net("LED")
+
+r1 = pin_solve(PERIPHS, [pin_request("COM", Uart, instance = "USART1")])
+r2 = pin_solve(PERIPHS, [pin_request("COM", Uart, instance = "USART2")])
+r3 = pin_solve(PERIPHS, [pin_request("LED", Gpio, prefer = ["PA9"], lock = True)])
+r4 = pin_solve([OTHER], [pin_request("COM", Gpio)])
+
+pin_map(r3["assignment"], {"LED": LED})
+pin_map(r1["assignment"], {"COM": BUS})
+"#,
+    );
+    assert_fails_with(&result, "already mapped to net `LED` in this module");
+}
+
+#[test]
 fn superseded_assignment_cannot_remap_a_pin() {
     // Re-solving `COM` releases its claims, so a later solve may take PA9 —
     // mapping the stale result would put two nets on it.
@@ -2481,10 +2607,9 @@ fn a_forwarded_at_goes_to_the_request_that_can_take_it() {
         (
             "/mcu.zen".to_string(),
             r#"
-load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pool", "pin_request", "pin_solve")
 load("./ifaces.zen", "Gpio", "AdcIn")
-G = peripheral("G", provides = [Gpio], rebind = "fixed",
-    signals = {"PIN": [pin("PA5"), pin("PA7")]})
+G = pool("GPIO", provides = [Gpio], pins = ["PA5", "PA7"])
 A = peripheral("A", provides = [AdcIn], rebind = "fixed", signals = {"IN": [pin("PA1")]})
 ADC = io(AdcIn)
 LED = io(Gpio)

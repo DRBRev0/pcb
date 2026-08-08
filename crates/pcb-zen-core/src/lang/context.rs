@@ -326,6 +326,16 @@ impl<'v> ContextValue<'v> {
             .collect()
     }
 
+    /// Axes this part has already settled, whatever table named them.
+    pub(crate) fn config_axes_for(&self, scope: &str) -> Vec<String> {
+        self.config_axes
+            .borrow()
+            .keys()
+            .filter(|(s, _)| s == scope)
+            .map(|(_, axis)| axis.clone())
+            .collect()
+    }
+
     /// Record what `axis` meant for `scope`, returning what it meant before.
     pub(crate) fn record_config_axis(&self, scope: &str, axis: &str, on: bool) -> Option<bool> {
         self.config_axes

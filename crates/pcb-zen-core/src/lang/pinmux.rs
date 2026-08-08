@@ -2331,6 +2331,29 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
         // pairs with the io() input of its name; the constraint rides on the
         // input's nets. Read the inputs first so the claims below, which need
         // the evaluator to weigh candidates, do not hold the module borrow.
+        let scopes: Vec<String> = part_names.clone();
+        let mut claimed_instances: HashSet<(String, String)> = HashSet::new();
+        let mut claimed_pads: HashSet<(usize, String)> = HashSet::new();
+        if let Some(ctx) = eval.context_value() {
+            // A peripheral is identified by its part and its name: two chips
+            // may legitimately name a resource alike.
+            let ours: HashSet<(&str, &str)> = periphs
+                .iter()
+                .map(|p| (scopes[p.part_idx].as_str(), p.name.as_str()))
+                .collect();
+            let current: HashSet<String> = reqs.iter().map(|r| r.name.clone()).collect();
+            for claim in ctx.pin_claims_excluding(&current, &scopes) {
+                // A pad belongs to the part, not to the peripheral that took
+                // it: another table of the same part still owns it.
+                if let Some(part) = scopes.iter().position(|s| *s == claim.scope) {
+                    claimed_pads.extend(claim.pins.iter().map(|p| (part, p.clone())));
+                }
+                // An instance is only ours to reserve when this table has it.
+                if ours.contains(&(claim.scope.as_str(), claim.instance.as_str())) {
+                    claimed_instances.insert((claim.scope, claim.instance));
+                }
+            }
+        }
         let store = eval.eval_context().map(|c| c.pin_constraints());
         let mut solver: Vec<String> = Vec::new();
         // (request, the nets it rides, its own at() when it carries one)
@@ -2385,9 +2408,25 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                             let mut probe = reqs[i].clone();
                             probe.prefer = lock;
                             probe.lock = true;
-                            if combos_for_request(&probe, &periphs, &config, &prev_map, eval)
-                                .is_ok_and(|(combos, _, _)| !combos.is_empty())
-                            {
+                            // Weighed against the same candidates the solve will
+                            // see, earlier solves' claims included, or a pad
+                            // already taken would look like a fit.
+                            let fits =
+                                combos_for_request(&probe, &periphs, &config, &prev_map, eval)
+                                    .map(|(combos, _, _)| {
+                                        combos.iter().any(|c| {
+                                            let p = &periphs[c.periph_idx];
+                                            !claimed_instances.contains(&(
+                                                scopes[p.part_idx].clone(),
+                                                p.name.clone(),
+                                            )) && !c.pins.iter().any(|(_, pin)| {
+                                                claimed_pads
+                                                    .contains(&(p.part_idx, pin.name.clone()))
+                                            })
+                                        })
+                                    })
+                                    .unwrap_or(false);
+                            if fits {
                                 usable.insert(idx);
                             }
                         }
@@ -2462,51 +2501,41 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
         // A part names its own pad namespace; peripherals declaring no part
         // share the module's single anonymous one, so pads keep colliding
         // across solves exactly as they did before parts existed.
-        let scopes: Vec<String> = part_names.clone();
         // Whether a gated peripheral is there belongs to the design, not to
         // one solve: an axis that said one thing already cannot say another,
         // or which pads the component exposes would depend on solve order.
         if let Some(ctx) = eval.context_value() {
-            for p in &periphs {
-                let Some(axis) = p.unless.as_deref() else {
-                    continue;
-                };
-                let on = config_truthy(&config, axis);
-                let part = &scopes[p.part_idx];
-                if let Some(before) = ctx.record_config_axis(part, axis, on)
-                    && before != on
-                {
-                    let whose = if part.is_empty() {
-                        "this part".to_owned()
-                    } else {
-                        format!("`{part}`")
-                    };
-                    return Err(anyhow::anyhow!(
-                        "pin_solve: config axis `{axis}` was {before} for {whose} in an earlier \
-                         solve and is {on} here; a part is configured once"
-                    ));
-                }
-            }
-        }
-        let mut claimed_instances: HashSet<(String, String)> = HashSet::new();
-        let mut claimed_pads: HashSet<(usize, String)> = HashSet::new();
-        if let Some(ctx) = eval.context_value() {
-            // A peripheral is identified by its part and its name: two chips
-            // may legitimately name a resource alike.
-            let ours: HashSet<(&str, &str)> = periphs
-                .iter()
-                .map(|p| (scopes[p.part_idx].as_str(), p.name.as_str()))
-                .collect();
-            let current: HashSet<String> = reqs.iter().map(|r| r.name.clone()).collect();
-            for claim in ctx.pin_claims_excluding(&current, &scopes) {
-                // A pad belongs to the part, not to the peripheral that took
-                // it: another table of the same part still owns it.
-                if let Some(part) = scopes.iter().position(|s| *s == claim.scope) {
-                    claimed_pads.extend(claim.pins.iter().map(|p| (part, p.clone())));
-                }
-                // An instance is only ours to reserve when this table has it.
-                if ours.contains(&(claim.scope.as_str(), claim.instance.as_str())) {
-                    claimed_instances.insert((claim.scope, claim.instance));
+            for (part_idx, part) in scopes.iter().enumerate() {
+                // Axes this table's peripherals name, plus any this part has
+                // already settled and this call speaks about — a later table
+                // may omit the gated peripheral yet still configure it.
+                let mut axes: Vec<String> = periphs
+                    .iter()
+                    .filter(|p| p.part_idx == part_idx)
+                    .filter_map(|p| p.unless.clone())
+                    .collect();
+                axes.extend(
+                    ctx.config_axes_for(part)
+                        .into_iter()
+                        .filter(|axis| config.get(axis.as_str()).is_some()),
+                );
+                axes.sort();
+                axes.dedup();
+                for axis in axes {
+                    let on = config_truthy(&config, &axis);
+                    if let Some(before) = ctx.record_config_axis(part, &axis, on)
+                        && before != on
+                    {
+                        let whose = if part.is_empty() {
+                            "this part".to_owned()
+                        } else {
+                            format!("`{part}`")
+                        };
+                        return Err(anyhow::anyhow!(
+                            "pin_solve: config axis `{axis}` was {before} for {whose} in an \
+                             earlier solve and is {on} here; a part is configured once"
+                        ));
+                    }
                 }
             }
         }
@@ -3248,9 +3277,11 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                 // Across calls too: a request re-solved by a later pin_solve
                 // releases its claims, so a superseded assignment can still
                 // hand this pin to a different net.
+                // The entry names the part it was solved on, so the guard holds
+                // even when two components share a request name.
                 if let Some(id) = net_identity(net)
+                    && let Some(scope) = scope_of(req_name).or_else(|| want_part.map(str::to_owned))
                     && let Some(ctx) = eval.context_value()
-                    && let Some(scope) = ctx.pin_claim_scope(req_name)
                 {
                     if let Some(prev) = ctx.pin_map_net(&scope, &pin_name)
                         && prev.0 != id.0
