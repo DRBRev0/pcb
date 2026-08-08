@@ -618,6 +618,19 @@ struct RReq<'v> {
 }
 
 impl RReq<'_> {
+    /// Pins `signal` may take when the request is locked: its own list, else
+    /// the bare list once it names as many pins as there are signals — with
+    /// pads exclusive, covering them all is the same requirement.
+    fn allowed(&self, signal: &str) -> Option<&[String]> {
+        if !self.lock {
+            return None;
+        }
+        let covering = !self.prefer.any.is_empty() && self.prefer.any.len() == self.uses.len();
+        self.prefer
+            .allowed(signal)
+            .or_else(|| covering.then_some(self.prefer.any.as_slice()))
+    }
+
     /// How much this request would rather have `pin`: what the module asked
     /// for, and what the caller wished on top of it. Cumulative, so a wish
     /// still decides among pins the module allows equally.
@@ -990,13 +1003,9 @@ fn combos_for_request<'v>(
         // matrix can still truncate away a feasible combination — the `capped`
         // warning covers that case.
         let mut starved: Option<(String, Vec<String>)> = None;
-        if req.lock {
-            let covering = !req.prefer.any.is_empty() && req.prefer.any.len() == req.uses.len();
+        {
             for (sig, cands) in cand_lists.iter_mut() {
-                let allowed: Option<&[String]> = req
-                    .prefer
-                    .allowed(sig)
-                    .or_else(|| covering.then_some(req.prefer.any.as_slice()));
+                let allowed: Option<&[String]> = req.allowed(sig);
                 if let Some(allowed) = allowed {
                     *cands = cands
                         .iter()
@@ -2664,11 +2673,13 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                 }
                 // Same filters the candidates went through, or the alternates
                 // would offer a pad this request could not have taken.
+                let allowed = r.allowed(sig);
                 let free: Vec<serde_json::Value> = periph
                     .signal(sig)
                     .map(|cands| {
                         cands
                             .iter()
+                            .filter(|c| allowed.is_none_or(|a| a.contains(&c.name)))
                             .filter(|c| !(r.direction.as_deref() == Some("output") && c.input_only))
                             .filter(|c| !used_pads.contains(&(periph.part_idx, c.name.clone())))
                             .map(|c| serde_json::Value::String(c.name.clone()))
