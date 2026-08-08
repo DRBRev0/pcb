@@ -106,6 +106,11 @@ pub struct ContextValue<'v> {
     #[allocative(skip)]
     #[serde(skip)]
     exposed_pads: RefCell<std::collections::HashMap<String, Vec<String>>>,
+    /// Open net each unclaimed pad was tied to, per `(part scope, pin)`, so
+    /// two `pin_map` calls for one part hand back the same net.
+    #[allocative(skip)]
+    #[serde(skip)]
+    tied_off: RefCell<SmallMap<(String, String), Value<'v>>>,
     /// Truthiness each `unless` axis had for a part, so a design says once
     /// whether a gated peripheral is there.
     #[allocative(skip)]
@@ -204,6 +209,7 @@ impl<'v> ContextValue<'v> {
             pin_claims: RefCell::new(std::collections::HashMap::new()),
             if_connected_served: RefCell::new(std::collections::HashSet::new()),
             exposed_pads: RefCell::new(std::collections::HashMap::new()),
+            tied_off: RefCell::new(SmallMap::new()),
             config_axes: RefCell::new(std::collections::HashMap::new()),
             mapped_pins: RefCell::new(std::collections::HashMap::new()),
         }
@@ -325,6 +331,20 @@ impl<'v> ContextValue<'v> {
         self.config_axes
             .borrow_mut()
             .insert((scope.to_owned(), axis.to_owned()), on)
+    }
+
+    /// The open net a pad was already tied to, if this module tied it.
+    pub(crate) fn tied_off_net(&self, scope: &str, pin: &str) -> Option<Value<'v>> {
+        self.tied_off
+            .borrow()
+            .get(&(scope.to_owned(), pin.to_owned()))
+            .copied()
+    }
+
+    pub(crate) fn record_tie_off(&self, scope: &str, pin: &str, net: Value<'v>) {
+        self.tied_off
+            .borrow_mut()
+            .insert((scope.to_owned(), pin.to_owned()), net);
     }
 
     pub(crate) fn record_pin_map(&self, scope: String, pin: String, net: (u64, String)) {

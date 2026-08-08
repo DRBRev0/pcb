@@ -170,11 +170,31 @@ impl PinConstraints {
     /// Settle `input`'s constraint for a solve that read it off the wrapper:
     /// claim the entry when its io() already bound, else leave a credit for the
     /// record still to come. Exactly one of the two, never both.
+    ///
+    /// Only this module's own entry for this input answers here. A constraint
+    /// owned higher up rides the same net but belongs to whoever claims it,
+    /// and what it is doing says nothing about whether ours was recorded.
     fn settle(&mut self, nets: &[u64], solver: &[String], input: &str) {
-        // Only an entry that truly is not there earns a credit: an ambiguity
-        // is reported, and crediting it would absolve a sibling's constraint.
-        if matches!(self.claim(nets, solver, input, None), Claimed::No) {
+        let mine: Vec<usize> = nets
+            .iter()
+            .filter_map(|n| self.by_net.get(n))
+            .flatten()
+            .copied()
+            .filter(|i| {
+                let e = &self.entries[*i];
+                e.owner == solver
+                    && e.input == input
+                    && e.claimant.as_deref().is_none_or(|c| c == solver)
+            })
+            .collect();
+        if mine.is_empty() {
+            // The credit is keyed on this module, this input and this net, so
+            // only the record of this very declaration can spend it.
             self.preconsume(solver, input, nets);
+            return;
+        }
+        for i in mine {
+            self.entries[i].claimant = Some(solver.to_vec());
         }
     }
 
@@ -2354,10 +2374,6 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                 let constraint = match raw {
                     Some(c) => {
                         store.settle(&nets, &solver, &reqs[i].name);
-                        // The wrapper on this very connection says what to do,
-                        // so a tie among constraints riding the net is not this
-                        // request's to report.
-                        store.take_ambiguous();
                         Some(c)
                     }
                     None => {
@@ -3277,15 +3293,34 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
         }
         // Pads this part exposes that no request holds are intentionally open,
         // so one call yields the component's whole pin table.
-        if let Some(scope) = want_part
-            && let Some(ctx) = eval.context_value()
-        {
-            let held = ctx.claimed_pins(scope);
-            for pad in ctx.exposed_pads(scope) {
-                if !held.contains(&pad) && seen.insert(pad.clone()) {
-                    let open = crate::lang::net::alloc_open_net(eval);
-                    out.push((heap.alloc(pad.as_str()), open));
-                }
+        if let Some(scope) = want_part {
+            let free: Vec<String> = eval
+                .context_value()
+                .map(|ctx| {
+                    let held = ctx.claimed_pins(scope);
+                    ctx.exposed_pads(scope)
+                        .into_iter()
+                        .filter(|pad| !held.contains(pad) && seen.insert(pad.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for pad in free {
+                // The same pad answers with the same net however many calls
+                // map this part, so two dicts merge without contradicting.
+                let open = match eval
+                    .context_value()
+                    .and_then(|ctx| ctx.tied_off_net(scope, &pad))
+                {
+                    Some(net) => net,
+                    None => {
+                        let net = crate::lang::net::alloc_open_net(eval);
+                        if let Some(ctx) = eval.context_value() {
+                            ctx.record_tie_off(scope, &pad, net);
+                        }
+                        net
+                    }
+                };
+                out.push((heap.alloc(pad.as_str()), open));
             }
         }
         Ok(heap.alloc(AllocDict(out)))
@@ -3382,10 +3417,37 @@ mod tests {
         );
     }
 
-    /// An ambiguity is reported, never credited: the credit would absolve the
-    /// constraint the module is about to record.
+    /// A constraint another solve holds is not this input's, so its own entry
+    /// is still to come and must keep its credit.
     #[test]
-    fn an_ambiguous_settle_leaves_no_credit() {
+    fn a_contended_settle_still_credits() {
+        let som = path(&["SOM"]);
+        let leaf = path(&["SOM", "U1"]);
+        let other = path(&["SOM", "U2"]);
+        let mut c = PinConstraints::default();
+        record(&mut c, "RAIL", "som.zen", som, 9, "PA1");
+        assert!(matches!(
+            c.claim(&[9], &other, "RAIL", None),
+            Claimed::Yes(..)
+        ));
+
+        // U1 solves before its own io() records: the ancestor entry is taken,
+        // so nothing here is U1's to claim.
+        c.settle(&[9], &leaf, "IO");
+        record(&mut c, "IO", "u1.zen", leaf, 9, "PA2");
+
+        let left = c.unconsumed_hard();
+        assert!(
+            !left.iter().any(|(_, input, _)| input == "IO"),
+            "U1's own constraint was honoured, got {left:?}"
+        );
+    }
+
+    /// Constraints owned higher up, however tangled among themselves, do not
+    /// cost a module the credit for the wrapper it read off its own input —
+    /// the credit is keyed on that module, that input and that net.
+    #[test]
+    fn an_ancestor_tie_does_not_cost_the_module_its_credit() {
         let som = path(&["SOM"]);
         let leaf = path(&["SOM", "U1"]);
         let mut c = PinConstraints::default();
@@ -3393,14 +3455,14 @@ mod tests {
         record(&mut c, "B", "som.zen", som, 9, "PA2");
 
         c.settle(&[9], &leaf, "IO");
-        c.take_ambiguous().expect("ambiguity reported");
         record(&mut c, "IO", "u1.zen", leaf, 9, "PA3");
 
         let left = c.unconsumed_hard();
         assert!(
-            left.iter().any(|(_, input, _)| input == "IO"),
-            "the module\'s own constraint still stands, got {left:?}"
+            !left.iter().any(|(_, input, _)| input == "IO"),
+            "the solve read it off the wrapper, got {left:?}"
         );
+        assert_eq!(left.len(), 2, "the ancestors' two remain, got {left:?}");
     }
 
     /// Re-evaluation records one declaration twice; the claim takes the whole

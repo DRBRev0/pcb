@@ -1445,6 +1445,145 @@ m = pin_map(r["assignment"], {})
 }
 
 #[test]
+fn mapping_a_part_twice_yields_the_same_table() {
+    // Mapping in several calls is legitimate, so a second call must repeat the
+    // first: same pads, and the tie-offs reuse the nets the first call minted.
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "pool", "pin_request", "pin_solve", "pin_map")
+load("./ifaces.zen", "Gpio")
+P = pool("GPIO", provides = [Gpio], pins = ["PA0", "PA1", "PA2"])
+r = pin_solve([P], [pin_request("A", Gpio)])
+BUS = Gpio("N")
+m1 = pin_map(r["assignment"], {"A": BUS})
+m2 = pin_map(r["assignment"], {"A": BUS})
+check(sorted(m1.keys()) == sorted(m2.keys()), "both calls yield the same table")
+check(sorted(m1.keys()) == ["PA0", "PA1", "PA2"], "and it is the whole table")
+"#,
+    );
+    assert_ok(&result);
+}
+
+#[test]
+fn a_locked_list_as_long_as_the_signals_is_claimed_in_full() {
+    // As many pins as signals, so "every pin ends up on some signal" and "each
+    // signal takes one of these" are the same requirement: pads are exclusive.
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
+load("./ifaces.zen", "Uart")
+U = peripheral("U", provides = [Uart], rebind = "fixed",
+    signals = {"TX": [pin("PA9"), pin("PB6")], "RX": [pin("PA10")]})
+res = pin_solve([U], [pin_request("A", Uart, prefer = ["PA9", "PB6"], lock = True)])
+"#,
+    );
+    // RX reaches neither pin, so the second one could never be used at all.
+    assert_fails_with(
+        &result,
+        "signal `RX` has no candidate among the locked pins `PA9`, `PB6`",
+    );
+
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
+load("./ifaces.zen", "Uart")
+U = peripheral("U", provides = [Uart], rebind = "fixed",
+    signals = {"TX": [pin("PA9"), pin("PB6")], "RX": [pin("PA10"), pin("PB6")]})
+res = pin_solve([U], [pin_request("A", Uart, prefer = ["PA9", "PB6"], lock = True)])
+sig = res["assignment"]["A"]["signals"]
+check(sorted([sig["TX"]["pin"], sig["RX"]["pin"]]) == ["PA9", "PB6"],
+      "both locked pins are used, got " + str(sig))
+"#,
+    );
+    assert_ok(&result);
+}
+
+#[test]
+fn a_list_borne_at_is_not_claimed_by_a_like_named_request() {
+    // The list shape reaches no request, and the request named like the config
+    // cannot pair with it either — so it is reported, never quietly applied.
+    let result = eval_zen(vec![
+        ("/ifaces.zen".to_string(), IFACES.to_string()),
+        (
+            "/mcu.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "pool", "pin_request", "pin_solve")
+load("./ifaces.zen", "Gpio")
+P = pool("GPIO", provides = [Gpio], pins = ["PA0", "PA1"])
+led_list = config("led", list, optional = True)
+LED = io(Gpio)
+res = pin_solve([P], [pin_request("led", Gpio)])
+builtin.add_property("led_pin", res["assignment"]["led"]["signals"]["PIN"]["pin"])
+"#
+            .to_string(),
+        ),
+        (
+            "/test.zen".to_string(),
+            r#"
+load("@stdlib/pinmux.zen", "at")
+load("./ifaces.zen", "Gpio")
+Mcu = Module("/mcu.zen")
+Mcu(name = "U1", led = [at(Gpio("L"), "PA1")], LED = Gpio("M"))
+"#
+            .to_string(),
+        ),
+    ]);
+    assert_fails_with(
+        &result,
+        "at() pin constraint on input `led` was never consumed",
+    );
+    let pin: Vec<String> = result
+        .output
+        .as_ref()
+        .map(|o| {
+            o.module_tree()
+                .values()
+                .filter_map(|m| m.properties().get("led_pin"))
+                .filter_map(|v| v.to_value().unpack_str().map(|s| s.to_owned()))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        pin,
+        ["PA0"],
+        "the request solved unconstrained, got {pin:?}"
+    );
+}
+
+#[test]
+fn three_solves_keep_one_class_per_pool() {
+    // The third solve places elsewhere, so the pool's class rides along
+    // whole rather than splitting off a second one.
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "pool", "pin_request", "pin_solve")
+load("./ifaces.zen", "Gpio", "AdcIn")
+P = pool("GPIO", provides = [Gpio], pins = ["PA0", "PA1", "PA2", "PA3"])
+Q = pool("ADC", provides = [AdcIn], pins = ["PB0", "PB1"])
+a = pin_solve([P, Q], [pin_request("A", Gpio)])
+b = pin_solve([P, Q], [pin_request("B", Gpio)])
+c = pin_solve([P, Q], [pin_request("C", AdcIn)])
+"#,
+    );
+    assert_ok(&result);
+
+    let swaps = json_property(&result, "swap_classes");
+    let classes = swaps.as_array().unwrap();
+    let mut pools: Vec<&str> = classes
+        .iter()
+        .map(|c| c["pool"].as_str().unwrap())
+        .collect();
+    pools.sort();
+    assert_eq!(pools, ["ADC", "GPIO"], "one class per pool, got {swaps}");
+    let gpio = classes.iter().find(|c| c["pool"] == "GPIO").unwrap();
+    assert_eq!(
+        gpio["members"].as_array().unwrap().len(),
+        2,
+        "both requests in it, got {swaps}"
+    );
+}
+
+#[test]
 fn a_role_named_like_a_config_still_gets_its_at() {
     // Role names come from caller data and may collide with a config() name;
     // the role carries its own value, so the collision must not disarm it.

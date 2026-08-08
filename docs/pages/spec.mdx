@@ -385,7 +385,7 @@ demand: the interface type *is* the request.
 | `name` | yes | Request name; keys the result and pairs with the `io()` input of the same name (`if_connected`, caller `at()`) |
 | `Iface` | yes | Requested interface type; any provider, direct or through `implies`, can serve it |
 | `uses` | no | Signals that consume pins (default: all of the interface's signals) |
-| `where` | no | Predicate over the provider's attrs: `lambda a: a["baud_max"] >= "1MHz"` |
+| `where` | no | Predicate over the provider's attrs: `lambda a: a["baud_max"] >= "1MHz"`. The solver may weigh a candidate more than once, so keep it pure |
 | `instance` | no | Restrict to a named peripheral or pool |
 | `prefer` | no | Pins the solver favors: a name/list of names, or a `{signal: name-or-list}` dict |
 | `lock` | no | Make `prefer` mandatory instead of preferred |
