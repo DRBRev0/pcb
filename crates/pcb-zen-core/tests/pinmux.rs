@@ -1734,6 +1734,23 @@ check(alts["RX"] == ["PB7"], "the free one keeps its own, got " + str(alts))
 "#,
     );
     assert_ok(&result);
+
+    // A bare list shorter than the signal count restricts nothing per signal,
+    // but must be claimed in full — so TX cannot leave PA9 either.
+    let result = eval_with_fixtures(
+        r#"
+load("@stdlib/pinmux.zen", "peripheral", "pin", "pin_request", "pin_solve")
+load("./ifaces.zen", "Uart")
+U = peripheral("U", provides = [Uart], rebind = "fixed",
+    signals = {"TX": [pin("PA9"), pin("PB6")], "RX": [pin("PA10"), pin("PB7")]})
+res = pin_solve([U], [pin_request("A", Uart, prefer = ["PA9"], lock = True)])
+check(res["assignment"]["A"]["signals"]["TX"]["pin"] == "PA9", "TX holds the locked pin")
+alts = res["assignment"]["A"]["alternates"]
+check("TX" not in alts, "leaving PA9 would drop it, got " + str(alts))
+check(alts["RX"] == ["PB7"], "RX is free, got " + str(alts))
+"#,
+    );
+    assert_ok(&result);
 }
 
 #[test]

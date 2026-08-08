@@ -631,6 +631,13 @@ impl RReq<'_> {
             .or_else(|| covering.then_some(self.prefer.any.as_slice()))
     }
 
+    /// Whether the lock holds `pin` where it is: a bare list must be claimed
+    /// in full, so the signal sitting on one of its pins cannot move without
+    /// dropping it.
+    fn pinned_by_lock(&self, pin: &str) -> bool {
+        self.lock && self.prefer.any.iter().any(|p| p == pin)
+    }
+
     /// How much this request would rather have `pin`: what the module asked
     /// for, and what the caller wished on top of it. Cumulative, so a wish
     /// still decides among pins the module allows equally.
@@ -2674,18 +2681,24 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                 // Same filters the candidates went through, or the alternates
                 // would offer a pad this request could not have taken.
                 let allowed = r.allowed(sig);
-                let free: Vec<serde_json::Value> = periph
-                    .signal(sig)
-                    .map(|cands| {
-                        cands
-                            .iter()
-                            .filter(|c| allowed.is_none_or(|a| a.contains(&c.name)))
-                            .filter(|c| !(r.direction.as_deref() == Some("output") && c.input_only))
-                            .filter(|c| !used_pads.contains(&(periph.part_idx, c.name.clone())))
-                            .map(|c| serde_json::Value::String(c.name.clone()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let free: Vec<serde_json::Value> = if r.pinned_by_lock(&p.name) {
+                    Vec::new()
+                } else {
+                    periph
+                        .signal(sig)
+                        .map(|cands| {
+                            cands
+                                .iter()
+                                .filter(|c| allowed.is_none_or(|a| a.contains(&c.name)))
+                                .filter(|c| {
+                                    !(r.direction.as_deref() == Some("output") && c.input_only)
+                                })
+                                .filter(|c| !used_pads.contains(&(periph.part_idx, c.name.clone())))
+                                .map(|c| serde_json::Value::String(c.name.clone()))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
                 if !free.is_empty() {
                     alternates.insert(sig.clone(), serde_json::Value::Array(free));
                 }
