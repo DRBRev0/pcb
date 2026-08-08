@@ -1584,6 +1584,41 @@ c = pin_solve([P, Q], [pin_request("C", AdcIn)])
 }
 
 #[test]
+fn a_bound_soft_at_cannot_void_the_requests_own_lock() {
+    // Whichever path delivers the connection, a wish chooses among the pins
+    // the request made mandatory rather than replacing them.
+    let solve = |bind: &str| {
+        eval_with_fixtures(&format!(
+            r#"
+load("@stdlib/pinmux.zen", "pool", "pin_request", "pin_solve", "at")
+load("./ifaces.zen", "Gpio")
+P = pool("GPIO", provides = [Gpio], pins = ["PA5", "PA6"])
+res = pin_solve([P], [pin_request("LED", Gpio, prefer = ["PA6"], lock = True, bind = {bind})])
+builtin.add_property("led", res["assignment"]["LED"]["signals"]["PIN"]["pin"])
+"#
+        ))
+    };
+    let pin = |r: &WithDiagnostics<EvalOutput>| {
+        assert_ok(r);
+        r.output
+            .as_ref()
+            .and_then(|o| {
+                o.module_tree()
+                    .values()
+                    .filter_map(|m| m.properties().get("led"))
+                    .filter_map(|v| v.to_value().unpack_str().map(|s| s.to_owned()))
+                    .next()
+            })
+            .unwrap_or_default()
+    };
+
+    let soft = solve("at(Gpio(\"D\"), \"PA5\", soft = True)");
+    assert_eq!(pin(&soft), "PA6", "the lock stands against a wish");
+    let hard = solve("at(Gpio(\"D\"), \"PA5\")");
+    assert_eq!(pin(&hard), "PA5", "a hard bound at() still overrides");
+}
+
+#[test]
 fn a_role_named_like_a_config_still_gets_its_at() {
     // Role names come from caller data and may collide with a config() name;
     // the role carries its own value, so the collision must not disarm it.

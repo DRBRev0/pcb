@@ -2073,15 +2073,14 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
     ) -> anyhow::Result<Value<'v>> {
         let heap = eval.heap();
         // bind= carries the connected value on the request itself (the
-        // dict-of-roles pattern). An at() wrapper contributes its pin
-        // constraint here and the inner value flows on.
-        let (bind_val, bind_pins, bind_soft) = match bind {
-            NoneOr::Other(v) => match unpack_pin_at(v) {
-                Some((inner, pins, soft)) => (Some(inner), Some(pins), soft),
-                None => (Some(v), None, false),
-            },
-            NoneOr::None => (None, None, false),
+        // dict-of-roles pattern). A wrapper rides along untouched — pin_solve
+        // weighs it against what the request asked for — while validation
+        // below looks at the value it wraps.
+        let bound = match bind {
+            NoneOr::Other(v) => Some(v),
+            NoneOr::None => None,
         };
+        let bind_val = bound.map(|v| unpack_pin_at(v).map(|(inner, _, _)| inner).unwrap_or(v));
         // Validate the bound value early, with the role name in the message —
         // otherwise a bad dict entry only surfaces at Component() as
         // "Pin 'PAx' must be connected to a Net", naming the solved pin
@@ -2143,20 +2142,17 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
             ));
         }
         let uses_alloc: Vec<Value> = uses_vals.iter().map(|s| heap.alloc(s.as_str())).collect();
-        // The caller's at() constraint overrides request-side prefer/lock
-        // defaults — the same precedence as the io()-recorded constraints in
-        // pin_solve, whichever path delivers the connection.
-        let (pref, lock) = match &bind_pins {
-            Some(pins) => (pins.clone(), !bind_soft),
-            None => {
-                let (any, by_signal) = match prefer {
-                    NoneOr::Other(v) => {
-                        parse_pin_spec(&format!("pin_request `{name}`: prefer"), v, heap)?
-                    }
-                    NoneOr::None => (Vec::new(), Vec::new()),
-                };
-                (PinLock { any, by_signal }, lock)
-            }
+        // A bound at() rides on the value and is weighed by pin_solve like any
+        // other, so the request keeps what it asked for: one rule decides how
+        // a wish and a lock compose, whichever path delivers the connection.
+        let (pref, lock) = {
+            let (any, by_signal) = match prefer {
+                NoneOr::Other(v) => {
+                    parse_pin_spec(&format!("pin_request `{name}`: prefer"), v, heap)?
+                }
+                NoneOr::None => (Vec::new(), Vec::new()),
+            };
+            (PinLock { any, by_signal }, lock)
         };
         pref.check_signals(&format!("pin_request `{name}`"), &uses_vals)?;
         let prefer_alloc: Vec<Value> = pref.any.iter().map(|s| heap.alloc(s.as_str())).collect();
@@ -2201,7 +2197,7 @@ fn pinmux_methods(methods: &mut MethodsBuilder) {
                 },
             ),
             (heap.alloc("if_connected"), Value::new_bool(if_connected)),
-            (heap.alloc("bind"), bind_val.unwrap_or_else(Value::new_none)),
+            (heap.alloc("bind"), bound.unwrap_or_else(Value::new_none)),
         ];
         Ok(heap.alloc(AllocDict(pairs)))
     }
